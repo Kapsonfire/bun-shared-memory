@@ -1,2 +1,2 @@
-export { Shared, SharedRef } from "./shared.ts";
-export type { SharedOptions } from "./shared.ts";
+export { Shared } from "./shared.ts";
+export type { SharedRef, SharedOptions } from "./shared.ts";

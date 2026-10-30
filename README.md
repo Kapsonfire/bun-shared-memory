@@ -21,16 +21,27 @@ import { Shared } from "shared-memory";
 
 // Get a wrapper to a named value in shared memory.
 // If it doesn't exist, create it with the provided initial value.
-const user = Shared<User>("user-1", { name: "Alice", age: 30 });
+const user = Shared<User>("user-1", { name: "Alice", age: 30, tags: ["a"] });
 
-// Read the current value
-const value = user.read();
+// Access object properties directly via getters/setters
+user.name;        // "Alice"
+user.name = "Bob"; // writes to shared memory
+user.age = 31;
 
-// Write a new value (must keep the same object shape)
-user.write({ name: "Alice", age: 31 });
+// Arrays are proxied too: index access and mutating methods work
+user.tags.push("b");
+user.tags[0] = "x";
+user.tags.pop();
 
-// Atomically update using a transform
-user.update((u) => ({ ...u, age: u.age + 1 }));
+// Top-level arrays work the same way
+const arr = Shared<number[]>("arr-1", [1, 2, 3]);
+arr.push(4);
+arr[0] = 99;
+
+// Primitives use read()/write()/update()
+const counter = Shared<number>("counter-1", 0);
+counter.write(42);
+counter.update((n) => n + 1);
 
 // Or create it with a loader function (sync or async)
 const user2 = await Shared<User>("user-2", async () => {

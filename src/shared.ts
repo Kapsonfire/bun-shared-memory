@@ -1,4 +1,4 @@
-import { deserialize, encodedSize, serialize } from "./serialization.ts";
+import { deserialize, serialize } from "./serialization.ts";
 
 /**
  * Header layout of a shared value slot (in bytes):
@@ -21,16 +21,25 @@ function objectKeys(value: unknown): string[] | null {
   return null;
 }
 
+/** Array methods that mutate the array in place. */
+const MUTATING_METHODS = new Set([
+  "push",
+  "pop",
+  "shift",
+  "unshift",
+  "splice",
+  "sort",
+  "reverse",
+  "fill",
+  "copyWithin",
+]);
+
 /**
- * A reference to a value stored in shared memory.
- *
- * All reads and writes are synchronized with an Atomics-based lock so that
- * multiple workers can safely access the same value.
- *
- * If the value is an object, its shape (set of properties) is fixed at
- * creation time: properties may not be added or removed afterwards.
+ * Internal implementation of a shared value. Holds the buffer and provides
+ * synchronized read/write/update access. This is wrapped in a Proxy to expose
+ * direct property access.
  */
-export class SharedRef<T> {
+class SharedRefImpl<T> {
   readonly key: string;
   readonly buffer: SharedArrayBuffer;
   private readonly lockView: Int32Array;
@@ -63,12 +72,10 @@ export class SharedRef<T> {
   private validateShape(value: T): void {
     const keys = objectKeys(value);
     if (this.shape === null) {
-      // First write: capture the shape.
       this.shape = keys;
       return;
     }
     if (keys === null) {
-      // The value is no longer an object but the shape was fixed as an object.
       throw new TypeError(
         `Value for key "${this.key}" was created as an object and must remain an object`,
       );
@@ -140,6 +147,150 @@ export class SharedRef<T> {
   }
 }
 
+/** Create a proxy for an array property of a shared object. */
+function createArrayProxy<T>(
+  impl: SharedRefImpl<T>,
+  prop: string | symbol,
+): unknown[] {
+  return new Proxy([] as unknown[], {
+    get(_target, arrProp) {
+      const current = (impl.read() as Record<string | symbol, unknown>)[prop];
+      if (!Array.isArray(current)) {
+        throw new TypeError(`Property "${String(prop)}" is not an array`);
+      }
+      if (arrProp === "length") return current.length;
+      if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
+        return current[Number(arrProp)];
+      }
+      if (typeof arrProp === "symbol") {
+        if (arrProp === Symbol.iterator) {
+          return current[Symbol.iterator].bind(current);
+        }
+        return (current as unknown as Record<symbol, unknown>)[arrProp];
+      }
+      if (MUTATING_METHODS.has(arrProp)) {
+        const methodName = arrProp as string;
+        return (...args: unknown[]) => {
+          let result: unknown;
+          impl.update((value) => {
+            const arr = (value as Record<string | symbol, unknown>)[prop] as unknown[];
+            result = (arr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!(...args);
+            (value as Record<string | symbol, unknown>)[prop] = arr;
+            return value;
+          });
+          return result;
+        };
+      }
+      const method = (current as unknown as Record<string, unknown>)[arrProp];
+      if (typeof method === "function") {
+        return method.bind(current);
+      }
+      return method;
+    },
+    set(_target, arrProp, val) {
+      impl.update((value) => {
+        const arr = (value as Record<string | symbol, unknown>)[prop] as unknown[];
+        (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
+        (value as Record<string | symbol, unknown>)[prop] = arr;
+        return value;
+      });
+      return true;
+    },
+  });
+}
+
+/** Create the proxy that exposes direct property access to a shared value. */
+function createSharedRefProxy<T>(impl: SharedRefImpl<T>): SharedRef<T> {
+  return new Proxy(impl, {
+    get(target, prop, receiver) {      if (prop === "read") return target.read.bind(target);
+      if (prop === "write") return target.write.bind(target);
+      if (prop === "update") return target.update.bind(target);
+      if (prop === "key") return target.key;
+      if (prop === "buffer") return target.buffer;
+      if (prop === Symbol.toPrimitive) return () => target.read();
+
+      const value = target.read();
+      if (Array.isArray(value)) {
+        if (prop === "length") return value.length;
+        if (typeof prop === "string" && /^\d+$/.test(prop)) {
+          return value[Number(prop)];
+        }
+        if (typeof prop === "symbol") {
+          if (prop === Symbol.iterator) {
+            return value[Symbol.iterator].bind(value);
+          }
+          return (value as unknown as Record<symbol, unknown>)[prop];
+        }
+        if (MUTATING_METHODS.has(prop)) {
+          const methodName = prop as string;
+          return (...args: unknown[]) => {
+            let result: unknown;
+            target.update((v) => {
+              const arr = v as unknown[];
+              result = (arr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!(...args);
+              return arr as T;
+            });
+            return result;
+          };
+        }
+        const method = (value as unknown as Record<string, unknown>)[prop];
+        if (typeof method === "function") return method.bind(value);
+        return method;
+      }
+
+      // Object value: property access.
+      const propValue = (value as Record<string | symbol, unknown>)[prop];
+      if (Array.isArray(propValue)) {
+        return createArrayProxy(target, prop);
+      }
+      return propValue;
+    },
+    set(target, prop, val) {
+      const value = target.read();
+      if (Array.isArray(value)) {
+        (value as unknown as Record<string | symbol, unknown>)[prop] = val;
+        target.write(value);
+        return true;
+      }
+      (value as Record<string | symbol, unknown>)[prop] = val;
+      target.write(value);
+      return true;
+    },
+    deleteProperty() {
+      throw new TypeError(
+        "Shared values have a fixed shape: properties may not be added or removed",
+      );
+    },
+  }) as unknown as SharedRef<T>;
+}
+
+/**
+ * A reference to a value stored in shared memory.
+ *
+ * Exposes direct property access to the shared value. For objects, properties
+ * are accessed directly (e.g. `user.name`). For arrays, index access and
+ * mutating methods (push, pop, splice, ...) work directly. All access is
+ * synchronized with an Atomics-based lock.
+ *
+ * The full value can also be read/written via `read()`, `write()`, and
+ * `update()`.
+ */
+export type SharedRef<T> = T extends object
+  ? T & {
+      read(): T;
+      write(value: T): void;
+      update(fn: (current: T) => T): T;
+      readonly key: string;
+      readonly buffer: SharedArrayBuffer;
+    }
+  : {
+      read(): T;
+      write(value: T): void;
+      update(fn: (current: T) => T): T;
+      readonly key: string;
+      readonly buffer: SharedArrayBuffer;
+    };
+
 /** Options for creating a shared value. */
 export interface SharedOptions {
   /** Size in bytes of the shared slot. Defaults to 64 KiB. */
@@ -180,7 +331,8 @@ export function Shared<T>(
 
   const size = options.size ?? DEFAULT_SLOT_SIZE;
   const buffer = new SharedArrayBuffer(HEADER_SIZE + size);
-  const ref = new SharedRef<T>(key, buffer);
+  const impl = new SharedRefImpl<T>(key, buffer);
+  const ref = createSharedRefProxy(impl);
   registry.set(key, ref as SharedRef<unknown>);
 
   if (typeof initialOrLoader === "function") {
