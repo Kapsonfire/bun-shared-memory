@@ -104,6 +104,27 @@ user.tags.push("b"); // appends to ArrayTable, updates DataTable ref
 [4..7]   element count (Int32)
 ```
 
+## Synchronization
+
+All shared-memory operations are protected by a re-entrant `Atomics`-based
+`Mutex` (`src/mutex.ts`). The mutex uses a single Int32 cell in a
+`SharedArrayBuffer`:
+
+- `lock()` claims the cell with `Atomics.compareExchange` (0 → 1), falling
+  back to `Atomics.wait` so a thread sleeps instead of busy-spinning while
+  the lock is held elsewhere.
+- `unlock()` stores 0 and calls `Atomics.notify` to wake one waiter.
+- Re-entrancy is tracked per-thread via a module-level depth map, so a locked
+  operation may safely call another locked operation (e.g. `updateValue`
+  calling `readValue`/`writeValue`).
+
+Logical operations (`readValue`, `writeValue`, `updateValue`, `mutateValue`)
+each acquire the lock once, so read-modify-write sequences (array `push`,
+property assignment, `update`) are atomic across workers.
+
+`Notifier` (`src/notifier.ts`) wraps `Atomics.wait`/`Atomics.notify` for
+user-facing worker-to-worker signaling.
+
 ## Open Questions
 
 - **Index Table keying**: Currently a linear scan comparing stored key strings directly (O(n) lookup). A hash table could improve lookup for many keys — future optimization.

@@ -1,4 +1,5 @@
 import { GrowableBuffer } from "./growable-buffer.ts";
+import { Mutex } from "./mutex.ts";
 
 /**
  * The 4-buffer shared memory architecture.
@@ -134,6 +135,8 @@ export class SharedMemory {
   readonly dataTable: GrowableBuffer;
   readonly stringTable: GrowableBuffer;
   readonly arrayTable: GrowableBuffer;
+  /** Cross-worker mutex protecting all read/write operations. */
+  readonly lock: Mutex;
 
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
@@ -141,6 +144,7 @@ export class SharedMemory {
   constructor(options?: {
     initialSize?: number;
     maxByteLength?: number;
+    lock?: Mutex;
   }) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
     const max = options?.maxByteLength ?? DEFAULT_MAX;
@@ -148,6 +152,12 @@ export class SharedMemory {
     this.dataTable = new GrowableBuffer(initial, max);
     this.stringTable = new GrowableBuffer(initial, max);
     this.arrayTable = new GrowableBuffer(initial, max);
+    this.lock = options?.lock ?? new Mutex();
+  }
+
+  /** Run `fn` while holding the shared lock. */
+  withLock<T>(fn: () => T): T {
+    return this.lock.withLock(fn);
   }
 
   // ---------------------------------------------------------------------------

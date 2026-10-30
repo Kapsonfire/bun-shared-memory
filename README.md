@@ -6,7 +6,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
 
-🚧 **M3 — 4-buffer shared memory**: `Shared<T>` API backed by a growable 4-buffer architecture (Index Table, DataTable, append-only StringTable, ArrayTable) using `SharedArrayBuffer`.
+🚧 **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
 
 ## Data Types
 
@@ -47,6 +47,44 @@ counter.update((n) => n + 1);
 const user2 = await Shared<User>("user-2", async () => {
   return await fetchUser();
 });
+```
+
+## Synchronization
+
+All shared-memory reads and writes are protected by an `Atomics`-based mutex, so concurrent access from multiple workers is safe.
+
+### Mutex
+
+A re-entrant cross-worker mutex. Share the same buffer across workers.
+
+```ts
+import { Mutex } from "shared-memory";
+
+const mutex = new Mutex();
+// pass mutex.buffer to other workers, then:
+mutex.lock();
+try {
+  // critical section
+} finally {
+  mutex.unlock();
+}
+// or
+mutex.withLock(() => {
+  // critical section
+});
+```
+
+### Notifier
+
+A cross-worker notification primitive built on `Atomics.wait`/`Atomics.notify`.
+
+```ts
+import { Notifier } from "shared-memory";
+
+const notifier = new Notifier();
+// pass notifier.buffer to other workers, then:
+notifier.wait();      // block until notified
+notifier.notify(1);   // wake one waiting worker
 ```
 
 ## Development
