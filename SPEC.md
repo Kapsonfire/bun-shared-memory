@@ -33,14 +33,12 @@ Bun supports worker threads, but passing data between them typically requires st
 > This is a preliminary sketch and subject to change.
 
 ```ts
-// Create a shared memory region
-const shared = new SharedMemory<MyType>({ size: 1024 });
+// Get a wrapper to user-1 in shared memory. If it doesn't exist, create it with the provided initial value.
+const user = Shared<User>('user-1', { name: 'Alice', age: 30 });
 
-// Write data
-shared.write({ foo: "bar", count: 42 });
+const user2 = Shared<User>('user-1', loader); // Get a wrapper to user-1 in shared memory. If it doesn't exist, create it with the provided loader function. The loader function may be async
 
-// In a worker, read data
-const value = shared.read();
+
 ```
 
 ## Milestones

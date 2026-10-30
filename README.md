@@ -6,22 +6,30 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
 
-🚧 **M1 — Foundation** (in progress): Project scaffolding and basic `SharedArrayBuffer` wrapper.
+🚧 **M2 — Typed data**: `Shared<T>` API with serialization of primitives and structured objects.
 
 ## Usage
 
 ```ts
-import { SharedMemory } from "shared-memory";
+import { Shared } from "shared-memory";
 
-// Create a shared memory region
-const shared = new SharedMemory(1024);
+// Get a wrapper to a named value in shared memory.
+// If it doesn't exist, create it with the provided initial value.
+const user = Shared<User>("user-1", { name: "Alice", age: 30 });
 
-// Typed access
-const view = shared.view(Uint8Array);
-view[0] = 42;
+// Read the current value
+const value = user.read();
 
-// Pass the raw buffer to a worker
-const buffer = shared.raw;
+// Write a new value
+user.write({ name: "Alice", age: 31 });
+
+// Atomically update using a transform
+user.update((u) => ({ ...u, age: u.age + 1 }));
+
+// Or create it with a loader function (sync or async)
+const user2 = await Shared<User>("user-2", async () => {
+  return await fetchUser();
+});
 ```
 
 ## Development
