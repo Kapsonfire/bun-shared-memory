@@ -2,62 +2,119 @@
  * Serialization helpers for encoding/decoding values into a byte buffer
  * that can be stored in shared memory.
  *
+ * Allowed value types:
+ *   - primitives: number, string, boolean
+ *   - bigint
+ *   - arrays of the above (mixed arrays allowed)
+ *   - objects with a fixed shape (values are primitives, bigints, or arrays)
+ *
+ * Not allowed: null, undefined, nested objects, nested arrays.
+ *
  * Format (little-endian):
- *   - null        -> 0x00
  *   - boolean     -> 0x01 + 1 byte
  *   - number      -> 0x02 + 8 bytes (float64)
  *   - bigint      -> 0x03 + 8 bytes (int64)
  *   - string      -> 0x04 + 4 bytes length + utf8 bytes
  *   - array       -> 0x05 + 4 bytes count + elements
  *   - object      -> 0x06 + 4 bytes count + (key, value) pairs
- *   - undefined   -> 0x07
  */
 
-const TYPE_NULL = 0x00;
 const TYPE_BOOLEAN = 0x01;
 const TYPE_NUMBER = 0x02;
 const TYPE_BIGINT = 0x03;
 const TYPE_STRING = 0x04;
 const TYPE_ARRAY = 0x05;
 const TYPE_OBJECT = 0x06;
-const TYPE_UNDEFINED = 0x07;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** A primitive value that can be stored in shared memory. */
+export type Primitive = number | string | boolean | bigint;
+
+/** A value that can be stored in shared memory. */
+export type SharedValue =
+  | Primitive
+  | Primitive[]
+  | { [key: string]: Primitive | Primitive[] };
+
+function isPrimitive(v: unknown): v is Primitive {
+  return (
+    typeof v === "number" ||
+    typeof v === "string" ||
+    typeof v === "boolean" ||
+    typeof v === "bigint"
+  );
+}
+
+function assertValid(value: unknown, path: string): void {
+  if (isPrimitive(value)) return;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      if (!isPrimitive(value[i])) {
+        throw new TypeError(
+          `Invalid value at ${path}[${i}]: arrays may only contain primitives and bigints (got ${typeof value[i]})`,
+        );
+      }
+    }
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (isPrimitive(v)) continue;
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) {
+          if (!isPrimitive(v[i])) {
+            throw new TypeError(
+              `Invalid value at ${path}.${k}[${i}]: arrays may only contain primitives and bigints (got ${typeof v[i]})`,
+            );
+          }
+        }
+        continue;
+      }
+      throw new TypeError(
+        `Invalid value at ${path}.${k}: only primitives, bigints, and arrays of these are allowed (got ${typeof v})`,
+      );
+    }
+    return;
+  }
+  throw new TypeError(
+    `Invalid value at ${path}: only primitives, bigints, and arrays of these are allowed (got ${typeof value})`,
+  );
+}
+
 /** Compute the number of bytes needed to serialize a value. */
 export function encodedSize(value: unknown): number {
-  switch (typeof value) {
-    case "boolean":
-      return 2;
-    case "number":
-      return 9;
-    case "bigint":
-      return 9;
-    case "string":
-      return 5 + encoder.encode(value).byteLength;
-    case "undefined":
-      return 1;
-    case "object": {
-      if (value === null) return 1;
-      if (Array.isArray(value)) {
-        let size = 5;
-        for (const item of value) size += encodedSize(item);
-        return size;
-      }
-      let size = 5;
-      for (const [k, v] of Object.entries(value)) {
-        size += 4 + encoder.encode(k).byteLength + encodedSize(v);
-      }
-      return size;
+  if (isPrimitive(value)) {
+    switch (typeof value) {
+      case "boolean":
+        return 2;
+      case "number":
+        return 9;
+      case "bigint":
+        return 9;
+      case "string":
+        return 5 + encoder.encode(value).byteLength;
     }
-    default:
-      throw new TypeError(`Cannot serialize value of type ${typeof value}`);
   }
+  if (Array.isArray(value)) {
+    let size = 5;
+    for (const item of value) size += encodedSize(item);
+    return size;
+  }
+  if (value !== null && typeof value === "object") {
+    let size = 5;
+    for (const [k, v] of Object.entries(value)) {
+      size += 4 + encoder.encode(k).byteLength + encodedSize(v);
+    }
+    return size;
+  }
+  throw new TypeError(`Cannot serialize value of type ${typeof value}`);
 }
 
 /** Serialize a value into a Uint8Array. */
 export function serialize(value: unknown): Uint8Array {
+  assertValid(value, "$");
   const size = encodedSize(value);
   const out = new Uint8Array(size);
   const view = new DataView(out.buffer);
@@ -91,14 +148,9 @@ export function serialize(value: unknown): Uint8Array {
         offset += bytes.byteLength;
         break;
       }
-      case "undefined": {
-        out[offset++] = TYPE_UNDEFINED;
-        break;
-      }
       case "object": {
         if (v === null) {
-          out[offset++] = TYPE_NULL;
-          break;
+          throw new TypeError("Cannot serialize null");
         }
         if (Array.isArray(v)) {
           out[offset++] = TYPE_ARRAY;
@@ -138,8 +190,6 @@ export function deserialize(bytes: Uint8Array): unknown {
   const read = (): unknown => {
     const type = bytes[offset++];
     switch (type) {
-      case TYPE_NULL:
-        return null;
       case TYPE_BOOLEAN:
         return bytes[offset++] === 1;
       case TYPE_NUMBER: {
@@ -179,8 +229,6 @@ export function deserialize(bytes: Uint8Array): unknown {
         }
         return obj;
       }
-      case TYPE_UNDEFINED:
-        return undefined;
       default:
         throw new Error(`Unknown type tag ${type} at offset ${offset - 1}`);
     }

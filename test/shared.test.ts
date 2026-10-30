@@ -27,35 +27,82 @@ describe("Shared", () => {
     expect(s.read()).toBe("world");
   });
 
-  test("supports nested objects and arrays", () => {
-    const data = Shared("data-1", {
-      list: [1, 2, 3],
-      nested: { a: true, b: null },
-    });
-    expect(data.read()).toEqual({
-      list: [1, 2, 3],
-      nested: { a: true, b: null },
-    });
-  });
-
-  test("supports booleans, bigint, and undefined", () => {
+  test("supports booleans and bigint", () => {
     const b = Shared("bool-1", true);
     expect(b.read()).toBe(true);
 
     const bi = Shared("big-1", 123n);
     expect(bi.read()).toBe(123n);
+  });
 
-    const u = Shared("undef-1", undefined);
-    expect(u.read()).toBeUndefined();
+  test("supports arrays of primitives", () => {
+    const arr = Shared("arr-1", [1, 2, 3]);
+    expect(arr.read()).toEqual([1, 2, 3]);
+    arr.write([4, 5]);
+    expect(arr.read()).toEqual([4, 5]);
+  });
+
+  test("supports mixed arrays", () => {
+    const mixed = Shared("mixed-1", [1, "a", true, 2n]);
+    expect(mixed.read()).toEqual([1, "a", true, 2n]);
+  });
+
+  test("supports objects with primitive and array values", () => {
+    const data = Shared("data-1", {
+      count: 3,
+      tags: ["x", "y"],
+      active: true,
+    });
+    expect(data.read()).toEqual({
+      count: 3,
+      tags: ["x", "y"],
+      active: true,
+    });
+  });
+
+  test("allows changing values of existing object properties", () => {
+    const user = Shared("user-3", { name: "Alice", age: 30 });
+    user.write({ name: "Alice", age: 31 });
+    expect(user.read()).toEqual({ name: "Alice", age: 31 });
+  });
+
+  test("rejects adding a property to a fixed-shape object", () => {
+    const user = Shared("user-4", { name: "Alice", age: 30 });
+    expect(() =>
+      user.write({ name: "Alice", age: 30, email: "a@b.c" } as never),
+    ).toThrow(TypeError);
+  });
+
+  test("rejects removing a property from a fixed-shape object", () => {
+    const user = Shared("user-5", { name: "Alice", age: 30 });
+    expect(() => user.write({ name: "Alice" } as never)).toThrow(TypeError);
+  });
+
+  test("rejects replacing an object with a non-object", () => {
+    const user = Shared("user-6", { name: "Alice" });
+    expect(() => user.write(42 as never)).toThrow(TypeError);
+  });
+
+  test("rejects nested objects", () => {
+    expect(() => Shared("bad-1", { nested: { a: 1 } })).toThrow(TypeError);
+  });
+
+  test("rejects null and undefined values", () => {
+    expect(() => Shared("bad-2", null as never)).toThrow(TypeError);
+    expect(() => Shared("bad-3", undefined as never)).toThrow(TypeError);
+  });
+
+  test("rejects nested arrays", () => {
+    expect(() => Shared("bad-4", [[1, 2]])).toThrow(TypeError);
   });
 
   test("creates a shared value from a sync loader", async () => {
-    const user = await Shared("user-3", () => ({ name: "Carol", age: 25 }));
+    const user = await Shared("user-7", () => ({ name: "Carol", age: 25 }));
     expect(user.read()).toEqual({ name: "Carol", age: 25 });
   });
 
   test("creates a shared value from an async loader", async () => {
-    const user = await Shared("user-4", async () => {
+    const user = await Shared("user-8", async () => {
       await Bun.sleep(1);
       return { name: "Dave", age: 40 };
     });
@@ -67,6 +114,13 @@ describe("Shared", () => {
     const result = counter.update((n) => n + 1);
     expect(result).toBe(1);
     expect(counter.read()).toBe(1);
+  });
+
+  test("update enforces fixed shape", () => {
+    const user = Shared("user-9", { name: "Alice", age: 30 });
+    expect(() =>
+      user.update((u) => ({ ...u, email: "a@b.c" }) as never),
+    ).toThrow(TypeError);
   });
 
   test("throws when a value exceeds the slot size", () => {

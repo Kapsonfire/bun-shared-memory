@@ -13,11 +13,22 @@ const HEADER_SIZE = 8;
 /** Maximum size of a single shared value slot. */
 const DEFAULT_SLOT_SIZE = 64 * 1024; // 64 KiB
 
+/** Extract the fixed set of keys of an object, or null if not an object. */
+function objectKeys(value: unknown): string[] | null {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return Object.keys(value).sort();
+  }
+  return null;
+}
+
 /**
  * A reference to a value stored in shared memory.
  *
  * All reads and writes are synchronized with an Atomics-based lock so that
  * multiple workers can safely access the same value.
+ *
+ * If the value is an object, its shape (set of properties) is fixed at
+ * creation time: properties may not be added or removed afterwards.
  */
 export class SharedRef<T> {
   readonly key: string;
@@ -25,6 +36,7 @@ export class SharedRef<T> {
   private readonly lockView: Int32Array;
   private readonly lengthView: Int32Array;
   private readonly dataView: Uint8Array;
+  private shape: string[] | null = null;
 
   constructor(key: string, buffer: SharedArrayBuffer) {
     this.key = key;
@@ -47,6 +59,34 @@ export class SharedRef<T> {
     Atomics.notify(this.lockView, 0, 1);
   }
 
+  /** Validate that a value conforms to the fixed object shape, if any. */
+  private validateShape(value: T): void {
+    const keys = objectKeys(value);
+    if (this.shape === null) {
+      // First write: capture the shape.
+      this.shape = keys;
+      return;
+    }
+    if (keys === null) {
+      // The value is no longer an object but the shape was fixed as an object.
+      throw new TypeError(
+        `Value for key "${this.key}" was created as an object and must remain an object`,
+      );
+    }
+    if (keys.length !== this.shape.length) {
+      throw new TypeError(
+        `Value for key "${this.key}" has a fixed shape: properties may not be added or removed`,
+      );
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] !== this.shape[i]) {
+        throw new TypeError(
+          `Value for key "${this.key}" has a fixed shape: properties may not be added or removed`,
+        );
+      }
+    }
+  }
+
   /** Read the current value from shared memory. */
   read(): T {
     this.lock();
@@ -61,6 +101,7 @@ export class SharedRef<T> {
 
   /** Write a new value to shared memory. */
   write(value: T): void {
+    this.validateShape(value);
     const bytes = serialize(value);
     if (bytes.byteLength > this.dataView.byteLength) {
       throw new RangeError(
@@ -83,6 +124,7 @@ export class SharedRef<T> {
       const length = Atomics.load(this.lengthView, 0);
       const current = deserialize(this.dataView.subarray(0, length)) as T;
       const next = fn(current);
+      this.validateShape(next);
       const bytes = serialize(next);
       if (bytes.byteLength > this.dataView.byteLength) {
         throw new RangeError(

@@ -22,6 +22,13 @@ Bun supports worker threads, but passing data between them typically requires st
 - Zero-copy reads/writes where possible.
 - Type-safe with full TypeScript typings.
 
+## Data Type Constraints
+
+- **Allowed value types**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these.
+- **Mixed arrays** are allowed (e.g. `[1, "a", true, 2n]`).
+- **Objects** have a **fixed shape**: once an object is created in shared memory, its properties may not be added or removed. Only the values of existing properties may change.
+- Nested objects, `null`, and `undefined` are **not** supported as values.
+
 ## Non-Goals (Initial Scope)
 
 - No distributed/shared memory across processes (only threads within a single process).

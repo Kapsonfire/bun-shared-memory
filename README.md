@@ -6,7 +6,13 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
 
-🚧 **M2 — Typed data**: `Shared<T>` API with serialization of primitives and structured objects.
+🚧 **M2 — Typed data**: `Shared<T>` API with serialization of primitives, bigints, and arrays.
+
+## Data Types
+
+- **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
+- **Objects** have a **fixed shape**: once created, properties may not be added or removed — only their values can change.
+- **Not allowed**: nested objects, nested arrays, `null`, `undefined`.
 
 ## Usage
 
@@ -20,7 +26,7 @@ const user = Shared<User>("user-1", { name: "Alice", age: 30 });
 // Read the current value
 const value = user.read();
 
-// Write a new value
+// Write a new value (must keep the same object shape)
 user.write({ name: "Alice", age: 31 });
 
 // Atomically update using a transform
