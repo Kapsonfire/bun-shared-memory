@@ -6,7 +6,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
 
-🚧 **M2 — Typed data**: `Shared<T>` API with serialization of primitives, bigints, and arrays.
+🚧 **M3 — 4-buffer shared memory**: `Shared<T>` API backed by a growable 4-buffer architecture (Index Table, DataTable, append-only StringTable, ArrayTable) using `SharedArrayBuffer`.
 
 ## Data Types
 

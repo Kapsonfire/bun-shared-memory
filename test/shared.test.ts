@@ -149,9 +149,4 @@ describe("Shared", () => {
     expect(result).toBe(1);
     expect(counter.read()).toBe(1);
   });
-
-  test("throws when a value exceeds the slot size", () => {
-    const small = Shared("small-1", "x", { size: 8 });
-    expect(() => small.write("a".repeat(100))).toThrow(RangeError);
-  });
 });

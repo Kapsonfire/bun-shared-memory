@@ -1,25 +1,15 @@
-import { deserialize, serialize } from "./serialization.ts";
-
-/**
- * Header layout of a shared value slot (in bytes):
- *   [0..3]   lock (Int32) — 0 = unlocked, 1 = locked
- *   [4..7]   data length (Int32) — number of valid data bytes
- *   [8..]    serialized data
- */
-const HEADER_LOCK = 0;
-const HEADER_LENGTH = 4;
-const HEADER_SIZE = 8;
-
-/** Maximum size of a single shared value slot. */
-const DEFAULT_SLOT_SIZE = 64 * 1024; // 64 KiB
-
-/** Extract the fixed set of keys of an object, or null if not an object. */
-function objectKeys(value: unknown): string[] | null {
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    return Object.keys(value).sort();
-  }
-  return null;
-}
+import {
+  SharedMemory,
+  arrayRefSlot,
+  bigintSlot,
+  booleanSlot,
+  decodeSlot,
+  numberSlot,
+  stringRefSlot,
+  type ArrayRef,
+  type StringRef,
+  type ValueSlot,
+} from "./memory.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -34,234 +24,49 @@ const MUTATING_METHODS = new Set([
   "copyWithin",
 ]);
 
-/**
- * Internal implementation of a shared value. Holds the buffer and provides
- * synchronized read/write/update access. This is wrapped in a Proxy to expose
- * direct property access.
- */
-class SharedRefImpl<T> {
-  readonly key: string;
-  readonly buffer: SharedArrayBuffer;
-  private readonly lockView: Int32Array;
-  private readonly lengthView: Int32Array;
-  private readonly dataView: Uint8Array;
-  private shape: string[] | null = null;
+type Primitive = number | string | boolean | bigint;
 
-  constructor(key: string, buffer: SharedArrayBuffer) {
-    this.key = key;
-    this.buffer = buffer;
-    this.lockView = new Int32Array(buffer, HEADER_LOCK, 1);
-    this.lengthView = new Int32Array(buffer, HEADER_LENGTH, 1);
-    this.dataView = new Uint8Array(buffer, HEADER_SIZE);
-  }
-
-  /** Acquire the lock, blocking until it is available. */
-  private lock(): void {
-    while (Atomics.compareExchange(this.lockView, 0, 0, 1) !== 0) {
-      Atomics.wait(this.lockView, 0, 1);
-    }
-  }
-
-  /** Release the lock and wake any waiters. */
-  private unlock(): void {
-    Atomics.store(this.lockView, 0, 0);
-    Atomics.notify(this.lockView, 0, 1);
-  }
-
-  /** Validate that a value conforms to the fixed object shape, if any. */
-  private validateShape(value: T): void {
-    const keys = objectKeys(value);
-    if (this.shape === null) {
-      this.shape = keys;
-      return;
-    }
-    if (keys === null) {
-      throw new TypeError(
-        `Value for key "${this.key}" was created as an object and must remain an object`,
-      );
-    }
-    if (keys.length !== this.shape.length) {
-      throw new TypeError(
-        `Value for key "${this.key}" has a fixed shape: properties may not be added or removed`,
-      );
-    }
-    for (let i = 0; i < keys.length; i++) {
-      if (keys[i] !== this.shape[i]) {
-        throw new TypeError(
-          `Value for key "${this.key}" has a fixed shape: properties may not be added or removed`,
-        );
-      }
-    }
-  }
-
-  /** Read the current value from shared memory. */
-  read(): T {
-    this.lock();
-    try {
-      const length = Atomics.load(this.lengthView, 0);
-      const bytes = this.dataView.subarray(0, length);
-      return deserialize(bytes) as T;
-    } finally {
-      this.unlock();
-    }
-  }
-
-  /** Write a new value to shared memory. */
-  write(value: T): void {
-    this.validateShape(value);
-    const bytes = serialize(value);
-    if (bytes.byteLength > this.dataView.byteLength) {
-      throw new RangeError(
-        `Value for key "${this.key}" is too large: ${bytes.byteLength} bytes exceeds slot capacity of ${this.dataView.byteLength} bytes`,
-      );
-    }
-    this.lock();
-    try {
-      this.dataView.set(bytes);
-      Atomics.store(this.lengthView, 0, bytes.byteLength);
-    } finally {
-      this.unlock();
-    }
-  }
-
-  /** Atomically update the value using a transform function. */
-  update(fn: (current: T) => T): T {
-    this.lock();
-    try {
-      const length = Atomics.load(this.lengthView, 0);
-      const current = deserialize(this.dataView.subarray(0, length)) as T;
-      const next = fn(current);
-      this.validateShape(next);
-      const bytes = serialize(next);
-      if (bytes.byteLength > this.dataView.byteLength) {
-        throw new RangeError(
-          `Updated value for key "${this.key}" is too large: ${bytes.byteLength} bytes exceeds slot capacity of ${this.dataView.byteLength} bytes`,
-        );
-      }
-      this.dataView.set(bytes);
-      Atomics.store(this.lengthView, 0, bytes.byteLength);
-      return next;
-    } finally {
-      this.unlock();
-    }
-  }
-}
-
-/** Create a proxy for an array property of a shared object. */
-function createArrayProxy<T>(
-  impl: SharedRefImpl<T>,
-  prop: string | symbol,
-): unknown[] {
-  return new Proxy([] as unknown[], {
-    get(_target, arrProp) {
-      const current = (impl.read() as Record<string | symbol, unknown>)[prop];
-      if (!Array.isArray(current)) {
-        throw new TypeError(`Property "${String(prop)}" is not an array`);
-      }
-      if (arrProp === "length") return current.length;
-      if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-        return current[Number(arrProp)];
-      }
-      if (typeof arrProp === "symbol") {
-        if (arrProp === Symbol.iterator) {
-          return current[Symbol.iterator].bind(current);
-        }
-        return (current as unknown as Record<symbol, unknown>)[arrProp];
-      }
-      if (MUTATING_METHODS.has(arrProp)) {
-        const methodName = arrProp as string;
-        return (...args: unknown[]) => {
-          let result: unknown;
-          impl.update((value) => {
-            const arr = (value as Record<string | symbol, unknown>)[prop] as unknown[];
-            result = (arr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!(...args);
-            (value as Record<string | symbol, unknown>)[prop] = arr;
-            return value;
-          });
-          return result;
-        };
-      }
-      const method = (current as unknown as Record<string, unknown>)[arrProp];
-      if (typeof method === "function") {
-        return method.bind(current);
-      }
-      return method;
-    },
-    set(_target, arrProp, val) {
-      impl.update((value) => {
-        const arr = (value as Record<string | symbol, unknown>)[prop] as unknown[];
-        (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
-        (value as Record<string | symbol, unknown>)[prop] = arr;
-        return value;
-      });
-      return true;
-    },
-  });
-}
-
-/** Create the proxy that exposes direct property access to a shared value. */
-function createSharedRefProxy<T>(impl: SharedRefImpl<T>): SharedRef<T> {
-  return new Proxy(impl, {
-    get(target, prop, receiver) {      if (prop === "read") return target.read.bind(target);
-      if (prop === "write") return target.write.bind(target);
-      if (prop === "update") return target.update.bind(target);
-      if (prop === "key") return target.key;
-      if (prop === "buffer") return target.buffer;
-      if (prop === Symbol.toPrimitive) return () => target.read();
-
-      const value = target.read();
+/** Convert a JS value into a ValueSlot, storing strings/arrays in tables. */
+function encodeValue(mem: SharedMemory, value: unknown): ValueSlot {
+  switch (typeof value) {
+    case "number":
+      return numberSlot(value);
+    case "boolean":
+      return booleanSlot(value);
+    case "bigint":
+      return bigintSlot(value);
+    case "string":
+      return stringRefSlot(mem.storeString(value));
+    default:
       if (Array.isArray(value)) {
-        if (prop === "length") return value.length;
-        if (typeof prop === "string" && /^\d+$/.test(prop)) {
-          return value[Number(prop)];
-        }
-        if (typeof prop === "symbol") {
-          if (prop === Symbol.iterator) {
-            return value[Symbol.iterator].bind(value);
+        for (const v of value) {
+          if (Array.isArray(v) || (v !== null && typeof v === "object")) {
+            throw new TypeError(
+              "Arrays may only contain primitives and bigints (no nested arrays or objects)",
+            );
           }
-          return (value as unknown as Record<symbol, unknown>)[prop];
         }
-        if (MUTATING_METHODS.has(prop)) {
-          const methodName = prop as string;
-          return (...args: unknown[]) => {
-            let result: unknown;
-            target.update((v) => {
-              const arr = v as unknown[];
-              result = (arr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!(...args);
-              return arr as T;
-            });
-            return result;
-          };
-        }
-        const method = (value as unknown as Record<string, unknown>)[prop];
-        if (typeof method === "function") return method.bind(value);
-        return method;
+        const slots = value.map((v) => encodeValue(mem, v));
+        return arrayRefSlot(mem.storeArray(slots));
       }
-
-      // Object value: property access.
-      const propValue = (value as Record<string | symbol, unknown>)[prop];
-      if (Array.isArray(propValue)) {
-        return createArrayProxy(target, prop);
-      }
-      return propValue;
-    },
-    set(target, prop, val) {
-      const value = target.read();
-      if (Array.isArray(value)) {
-        (value as unknown as Record<string | symbol, unknown>)[prop] = val;
-        target.write(value);
-        return true;
-      }
-      (value as Record<string | symbol, unknown>)[prop] = val;
-      target.write(value);
-      return true;
-    },
-    deleteProperty() {
       throw new TypeError(
-        "Shared values have a fixed shape: properties may not be added or removed",
+        `Cannot store value of type ${typeof value}: only primitives, bigints, and arrays of these are allowed`,
       );
-    },
-  }) as unknown as SharedRef<T>;
+  }
+}
+
+/** Decode a ValueSlot into a JS value, reading strings/arrays from tables. */
+function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
+  switch (slot.type) {
+    case 3: // string-ref
+      return mem.readString({ offset: slot.a, length: slot.b });
+    case 4: // array-ref
+      return mem.readArray({ offset: slot.a, count: slot.b }).map((s) =>
+        decodeValue(mem, s),
+      );
+    default:
+      return decodeSlot(slot);
+  }
 }
 
 /**
@@ -271,9 +76,6 @@ function createSharedRefProxy<T>(impl: SharedRefImpl<T>): SharedRef<T> {
  * are accessed directly (e.g. `user.name`). For arrays, index access and
  * mutating methods (push, pop, splice, ...) work directly. All access is
  * synchronized with an Atomics-based lock.
- *
- * The full value can also be read/written via `read()`, `write()`, and
- * `update()`.
  */
 export type SharedRef<T> = T extends object
   ? T & {
@@ -293,8 +95,10 @@ export type SharedRef<T> = T extends object
 
 /** Options for creating a shared value. */
 export interface SharedOptions {
-  /** Size in bytes of the shared slot. Defaults to 64 KiB. */
-  size?: number;
+  /** Initial size of each shared buffer in bytes. */
+  initialSize?: number;
+  /** Maximum size of each shared buffer in bytes. */
+  maxByteLength?: number;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -329,10 +133,8 @@ export function Shared<T>(
   const existing = registry.get(key);
   if (existing) return existing as SharedRef<T>;
 
-  const size = options.size ?? DEFAULT_SLOT_SIZE;
-  const buffer = new SharedArrayBuffer(HEADER_SIZE + size);
-  const impl = new SharedRefImpl<T>(key, buffer);
-  const ref = createSharedRefProxy(impl);
+  const mem = new SharedMemory(options);
+  const ref = createSharedRef<T>(mem, key);
   registry.set(key, ref as SharedRef<unknown>);
 
   if (typeof initialOrLoader === "function") {
@@ -344,4 +146,211 @@ export function Shared<T>(
 
   ref.write(initialOrLoader as T);
   return ref;
+}
+
+/** Create a SharedRef proxy backed by a SharedMemory instance. */
+function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
+  const target = {
+    key,
+    mem,
+    read: () => readValue(mem, key),
+    write: (value: T) => writeValue(mem, key, value),
+    update: (fn: (current: T) => T) => updateValue(mem, key, fn),
+  };
+
+  return new Proxy(target, {
+    get(t, prop) {
+      if (prop === "read") return t.read;
+      if (prop === "write") return t.write;
+      if (prop === "update") return t.update;
+      if (prop === "key") return t.key;
+      if (prop === "buffer") return mem.dataTable.buffer;
+      if (prop === Symbol.toPrimitive) return () => t.read();
+
+      const value = t.read();
+      if (Array.isArray(value)) {
+        return getTopLevelArrayMember(mem, key, value, prop);
+      }
+      // Object value: property access.
+      const propValue = (value as Record<string | symbol, unknown>)[prop];
+      if (Array.isArray(propValue)) {
+        return createArrayProxy(mem, key, prop as string);
+      }
+      return propValue;
+    },
+    set(t, prop, val) {
+      const value = t.read();
+      if (Array.isArray(value)) {
+        (value as unknown as Record<string | symbol, unknown>)[prop] = val;
+        t.write(value as T);
+        return true;
+      }
+      (value as Record<string | symbol, unknown>)[prop] = val;
+      t.write(value as T);
+      return true;
+    },
+    deleteProperty() {
+      throw new TypeError(
+        "Shared values have a fixed shape: properties may not be added or removed",
+      );
+    },
+  }) as unknown as SharedRef<T>;
+}
+
+/** Read the full value for a key from shared memory. */
+function readValue(mem: SharedMemory, key: string): unknown {
+  const offset = mem.lookup(key);
+  if (offset === null) {
+    throw new Error(`No shared value found for key "${key}"`);
+  }
+  const type = mem.dataTable.getView().getInt32(offset, true);
+  if (type === 5) {
+    // Object block.
+    const properties = mem.readObject(offset);
+    const obj: Record<string, unknown> = {};
+    for (const [name, slot] of properties) {
+      obj[name] = decodeValue(mem, slot);
+    }
+    return obj;
+  }
+  // Single value slot (primitive or array).
+  return decodeValue(mem, mem.readValueSlot(offset));
+}
+
+/** Write a full value for a key to shared memory. */
+function writeValue(mem: SharedMemory, key: string, value: unknown): void {
+  const existing = mem.lookup(key);
+  if (existing !== null) {
+    const type = mem.dataTable.getView().getInt32(existing, true);
+    if (type === 5) {
+      // Update existing object's property slots in place.
+      const properties = mem.readObject(existing);
+      const valueObj = value as Record<string, unknown>;
+      for (let i = 0; i < properties.length; i++) {
+        const [name] = properties[i]!;
+        if (!(name in valueObj)) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+          );
+        }
+        mem.updateObjectSlot(existing, i, encodeValue(mem, valueObj[name]));
+      }
+      // Check for extra properties.
+      const existingNames = new Set(properties.map(([n]) => n));
+      for (const name of Object.keys(valueObj)) {
+        if (!existingNames.has(name)) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+          );
+        }
+      }
+      return;
+    }
+    // Update a single value slot in place.
+    mem.updateValueSlot(existing, encodeValue(mem, value));
+    return;
+  }
+
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    // Create a new object.
+    const valueObj = value as Record<string, unknown>;
+    const props: Array<[string, ValueSlot]> = Object.entries(valueObj).map(
+      ([name, v]) => [name, encodeValue(mem, v)],
+    );
+    const offset = mem.createObject(props);
+    mem.insert(key, offset);
+    return;
+  }
+
+  // Create a single value slot (primitive or array).
+  const offset = mem.storeValueSlot(encodeValue(mem, value));
+  mem.insert(key, offset);
+}
+
+/** Atomically update the value for a key. */
+function updateValue<T>(
+  mem: SharedMemory,
+  key: string,
+  fn: (current: T) => T,
+): T {
+  const current = readValue(mem, key) as T;
+  const next = fn(current);
+  writeValue(mem, key, next);
+  return next;
+}
+
+/** Get a member of a top-level array value, with read-modify-write for mutating methods. */
+function getTopLevelArrayMember(
+  mem: SharedMemory,
+  key: string,
+  value: unknown[],
+  prop: string | symbol,
+): unknown {
+  if (prop === "length") return value.length;
+  if (typeof prop === "string" && /^\d+$/.test(prop)) {
+    return value[Number(prop)];
+  }
+  if (typeof prop === "symbol") {
+    if (prop === Symbol.iterator) return value[Symbol.iterator].bind(value);
+    return (value as unknown as Record<symbol, unknown>)[prop];
+  }
+  if (MUTATING_METHODS.has(prop)) {
+    const methodName = prop;
+    return (...args: unknown[]) => {
+      const fresh = readValue(mem, key) as unknown[];
+      const method = (fresh as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!;
+      const result = method.apply(fresh, args);
+      writeValue(mem, key, fresh);
+      return result;
+    };
+  }
+  const method = (value as unknown as Record<string, unknown>)[prop];
+  if (typeof method === "function") return method.bind(value);
+  return method;
+}
+
+/** Create a proxy for an array property of a shared object. */
+function createArrayProxy(
+  mem: SharedMemory,
+  key: string,
+  prop: string,
+): unknown[] {
+  return new Proxy([] as unknown[], {
+    get(_target, arrProp) {
+      const current = readValue(mem, key) as Record<string, unknown>;
+      const arr = current[prop] as unknown[];
+      if (!Array.isArray(arr)) {
+        throw new TypeError(`Property "${prop}" is not an array`);
+      }
+      if (arrProp === "length") return arr.length;
+      if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
+        return arr[Number(arrProp)];
+      }
+      if (typeof arrProp === "symbol") {
+        if (arrProp === Symbol.iterator) return arr[Symbol.iterator].bind(arr);
+        return (arr as unknown as Record<symbol, unknown>)[arrProp];
+      }
+      if (MUTATING_METHODS.has(arrProp)) {
+        const methodName = arrProp;
+        return (...args: unknown[]) => {
+          const fresh = readValue(mem, key) as Record<string, unknown>;
+          const freshArr = fresh[prop] as unknown[];
+          const method = (freshArr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!;
+          const result = method.apply(freshArr, args);
+          writeValue(mem, key, fresh);
+          return result;
+        };
+      }
+      const method = (arr as unknown as Record<string, unknown>)[arrProp];
+      if (typeof method === "function") return method.bind(arr);
+      return method;
+    },
+    set(_target, arrProp, val) {
+      const current = readValue(mem, key) as Record<string, unknown>;
+      const arr = current[prop] as unknown[];
+      (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
+      writeValue(mem, key, current);
+      return true;
+    },
+  });
 }
