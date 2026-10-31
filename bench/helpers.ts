@@ -5,7 +5,7 @@ interface BenchResult {
   nativeOps: number;
   sharedOps: number;
   ratio: number;
-  kind: "read" | "write" | "array-write";
+  kind: "read" | "array-read" | "write" | "array-write";
 }
 
 const results: BenchResult[] = [];
@@ -13,16 +13,16 @@ const results: BenchResult[] = [];
 /**
  * Classify a benchmark name into a summary category.
  *
- * - "read"        — any read operation
+ * - "read"        — primitive/object reads
+ * - "array-read"  — array index reads (top-level arrays or object array props)
  * - "array-write" — array mutations: index writes, push, pop (on top-level
  *                   arrays or object array properties)
  * - "write"       — everything else that writes (primitives, object props)
  */
 function classify(name: string): BenchResult["kind"] {
-  if (/read/i.test(name)) return "read";
-  if (/\[\]|array/i.test(name) && /write|push|pop/i.test(name)) {
-    return "array-write";
-  }
+  const isArray = /\[\]|array/i.test(name);
+  if (/read/i.test(name)) return isArray ? "array-read" : "read";
+  if (isArray && /write|push|pop/i.test(name)) return "array-write";
   return "write";
 }
 
@@ -63,9 +63,10 @@ export function benchPair(
   );
 }
 
-/** Print a summary separating reads, writes, and array writes. */
+/** Print a summary separating reads, array reads, writes, and array writes. */
 export function printSummary(): void {
   const reads = results.filter((r) => r.kind === "read");
+  const arrayReads = results.filter((r) => r.kind === "array-read");
   const writes = results.filter((r) => r.kind === "write");
   const arrayWrites = results.filter((r) => r.kind === "array-write");
 
@@ -81,6 +82,7 @@ export function printSummary(): void {
 
   console.log("\n── Summary ──────────────────────────────────────────────");
   console.log(`Reads        (${reads.length}):  ${fmt(reads)}`);
+  console.log(`Array reads  (${arrayReads.length}):  ${fmt(arrayReads)}`);
   console.log(`Writes       (${writes.length}): ${fmt(writes)}`);
   console.log(`Array writes (${arrayWrites.length}): ${fmt(arrayWrites)}`);
 }
