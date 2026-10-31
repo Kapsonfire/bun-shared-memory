@@ -183,9 +183,10 @@ initial value.
 ## Memory budget
 
 Shared memory is split across several growable `SharedArrayBuffer`s (the
-index, data, string, array, and version tables). A single `SharedArrayBuffer`
-can be at most **4 GiB**. By default each buffer grows independently up to its
-own `maxByteLength`, so the *total* memory can be several times that.
+index, data, string, and array tables; each key's version counter lives in its
+index entry). A single `SharedArrayBuffer` can be at most **4 GiB**. By default
+each buffer grows independently up to its own `maxByteLength`, so the *total*
+memory can be several times that.
 
 To cap the **total** memory across all buffers, pass `maxTotalBytes` when
 creating the memory (or to `init()`):

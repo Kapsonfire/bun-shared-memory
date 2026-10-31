@@ -136,7 +136,6 @@ describe("Read cache invalidation across workers", () => {
             dataTable: mem.dataTable.buffer,
             stringTable: mem.stringTable.buffer,
             arrayTable: mem.arrayTable.buffer,
-            versionTable: mem.versionTable.buffer,
           },
         });
       });

@@ -47,8 +47,10 @@ export const TYPE_BIGINT_STR = 6;
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
 const NAME_REF_SIZE = 8;
-const INDEX_ENTRY_SIZE = 12;
+const INDEX_ENTRY_SIZE = 16;
 const INDEX_HEADER = 4;
+/** Byte offset of the version field within an index entry. */
+const INDEX_VERSION_OFFSET = 12;
 /** Size of the objectId header at the start of each array block. */
 const ARRAY_HEADER = 4;
 
@@ -56,6 +58,11 @@ const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
 const DEFAULT_INTERN_CAPACITY = 256;
 const DEFAULT_INTERN_MAX = 1 << 16; // 65536 entries
+
+/** Int32Array index of a key's version cell within the Index Table buffer. */
+function versionCellIndex(index: number): number {
+  return (INDEX_HEADER + index * INDEX_ENTRY_SIZE + INDEX_VERSION_OFFSET) / 4;
+}
 
 /**
  * Reusable DataView for packing/unpacking 64-bit values (number, bigint) into
@@ -166,7 +173,6 @@ export interface SharedMemoryOptions {
     dataTable?: SharedArrayBuffer;
     stringTable?: SharedArrayBuffer;
     arrayTable?: SharedArrayBuffer;
-    versionTable?: SharedArrayBuffer;
     layoutVersion?: SharedArrayBuffer;
   };
 }
@@ -181,11 +187,11 @@ export class SharedMemory {
   readonly stringTable: GrowableBuffer;
   readonly arrayTable: GrowableBuffer;
   /**
-   * Per-key version counter (one Int32 per key index). Incremented on every
-   * write so workers can invalidate their read caches cross-worker.
+   * Cached Int32Array view over the Index Table, used to read/increment each
+   * key's version cell (stored as the 4th field of each index entry). Rebuilt
+   * on growth. The version is incremented on every write so workers can
+   * invalidate their read caches cross-worker.
    */
-  readonly versionTable: GrowableBuffer;
-  /** Cached Int32Array view over the version table (rebuilt on growth). */
   private versionView: Int32Array;
   /**
    * Global layout version cell. Bumped by the main thread after a
@@ -254,12 +260,7 @@ export class SharedMemory {
       perBufferMax,
       budget,
     );
-    this.versionTable = new GrowableBuffer(
-      buffers?.versionTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
-      perBufferMax,
-      budget,
-    );
-    this.versionView = new Int32Array(this.versionTable.buffer);
+    this.versionView = new Int32Array(this.indexTable.buffer);
     this.layoutVersion = new Int32Array(
       buffers?.layoutVersion ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
     );
@@ -282,7 +283,6 @@ export class SharedMemory {
     dataTable: SharedArrayBuffer;
     stringTable: SharedArrayBuffer;
     arrayTable: SharedArrayBuffer;
-    versionTable: SharedArrayBuffer;
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
   } {
@@ -291,7 +291,6 @@ export class SharedMemory {
       dataTable: this.dataTable.buffer,
       stringTable: this.stringTable.buffer,
       arrayTable: this.arrayTable.buffer,
-      versionTable: this.versionTable.buffer,
       layoutVersion: this.layoutVersion.buffer as SharedArrayBuffer,
       lock: this.lock.buffer as SharedArrayBuffer,
     };
@@ -306,7 +305,6 @@ export class SharedMemory {
     dataTable: SharedArrayBuffer;
     stringTable: SharedArrayBuffer;
     arrayTable: SharedArrayBuffer;
-    versionTable: SharedArrayBuffer;
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
   }): SharedMemory {
@@ -640,12 +638,12 @@ export class SharedMemory {
 
   /** Read the current version for a key index (lock-free). */
   getVersion(index: number): number {
-    return Atomics.load(this.versionView, index);
+    return Atomics.load(this.versionView, versionCellIndex(index));
   }
 
   /** Increment the version for a key index, invalidating read caches. */
   bumpVersion(index: number): void {
-    Atomics.add(this.versionView, index, 1);
+    Atomics.add(this.versionView, versionCellIndex(index), 1);
   }
 
   /** Insert a key → dataOffset mapping into the Index Table. */
@@ -658,16 +656,14 @@ export class SharedMemory {
     view.setInt32(entryOffset, keyRef.offset, true);
     view.setInt32(entryOffset + 4, keyRef.length, true);
     view.setInt32(entryOffset + 8, dataOffset, true);
+    // The 4th field is the key's version cell, initialized to 0.
+    view.setInt32(entryOffset + INDEX_VERSION_OFFSET, 0, true);
     view.setInt32(0, count + 1, true);
     this.indexTable.advance(INDEX_ENTRY_SIZE);
 
-    // Initialize the new key's version cell to 0.
-    const versionOffset = count * Int32Array.BYTES_PER_ELEMENT;
-    this.versionTable.ensureCapacity(versionOffset + Int32Array.BYTES_PER_ELEMENT);
-    // Rebuild the view if the buffer grew (grow preserves the SAB in place).
-    this.versionView = new Int32Array(this.versionTable.buffer);
-    Atomics.store(this.versionView, count, 0);
-    this.versionTable.advance(Int32Array.BYTES_PER_ELEMENT);
+    // Rebuild the version view if the buffer grew (grow preserves the SAB in
+    // place, but the Int32Array view must be recreated over the new buffer).
+    this.versionView = new Int32Array(this.indexTable.buffer);
   }
 
   // ---------------------------------------------------------------------------

@@ -160,6 +160,32 @@ describe("Defragmentation", () => {
     mem.withLock(() => mem.defragment());
     expect(mem.getLayoutVersion()).toBeGreaterThan(before);
   });
+
+  test("preserves per-key versions across defragmentation", () => {
+    const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
+    const a = Shared("ver-a", { name: "alpha" }, { memory: mem });
+    const b = Shared("ver-b", { name: "beta" }, { memory: mem });
+
+    // Bump each key's version a distinct number of times.
+    a.write({ name: "alpha2" });
+    a.write({ name: "alpha3" });
+    b.write({ name: "beta2" });
+
+    const indexA = mem.lookupIndex("ver-a")!;
+    const indexB = mem.lookupIndex("ver-b")!;
+    const versionA = mem.getVersion(indexA);
+    const versionB = mem.getVersion(indexB);
+    expect(versionA).toBeGreaterThan(0);
+    expect(versionB).toBeGreaterThan(0);
+
+    // Defragment (creates dead space from the overwrites) and verify the
+    // versions are unchanged — the version lives in the index entry, which is
+    // rewritten in place during defragmentation.
+    mem.withLock(() => mem.defragment());
+
+    expect(mem.getVersion(mem.lookupIndex("ver-a")!)).toBe(versionA);
+    expect(mem.getVersion(mem.lookupIndex("ver-b")!)).toBe(versionB);
+  });
 });
 
 describe("RefCount across workers", () => {
@@ -203,7 +229,6 @@ describe("RefCount across workers", () => {
           dataTable: mem.dataTable.buffer,
           stringTable: mem.stringTable.buffer,
           arrayTable: mem.arrayTable.buffer,
-          versionTable: mem.versionTable.buffer,
           layoutVersion: mem.layoutVersion.buffer,
         },
       });

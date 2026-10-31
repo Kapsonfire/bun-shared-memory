@@ -256,7 +256,7 @@ describe("SharedMemory total memory budget", () => {
   test("maxTotalBytes caps the sum of all buffers, not each buffer", () => {
     // A small total budget. Each buffer's own maxByteLength is
     // min(4 GiB, maxTotalBytes) = 8192, but the *sum* of all buffers is capped
-    // at 8192. The 5 initial buffers (1024 each = 5120) fit within the budget.
+    // at 8192. The 4 initial buffers (1024 each = 4096) fit within the budget.
     const mem = new SharedMemory({ maxTotalBytes: 8192 });
 
     // Writing enough distinct strings must eventually exceed the total budget
@@ -276,13 +276,13 @@ describe("SharedMemory total memory budget", () => {
       mem.indexTable.buffer.byteLength +
       mem.dataTable.buffer.byteLength +
       mem.stringTable.buffer.byteLength +
-      mem.arrayTable.buffer.byteLength +
-      mem.versionTable.buffer.byteLength;
+      mem.arrayTable.buffer.byteLength;
     expect(total).toBeLessThanOrEqual(8192);
   });
 
   test("maxTotalBytes smaller than the initial buffers throws", () => {
-    // 5 initial buffers of 1024 bytes = 5120, which exceeds a 4096 budget.
-    expect(() => new SharedMemory({ maxTotalBytes: 4096 })).toThrow(RangeError);
+    // 4 initial buffers of 1024 bytes = 4096, which exceeds a 4096 budget
+    // (the budget check is strict: total must stay within the budget).
+    expect(() => new SharedMemory({ maxTotalBytes: 4095 })).toThrow(RangeError);
   });
 });
