@@ -12,8 +12,14 @@ export class GrowableBuffer {
   private readonly maxByteLength: number;
   private used = 0;
 
-  constructor(initialSize: number, maxByteLength: number) {
-    this.buffer = new SharedArrayBuffer(initialSize, { maxByteLength });
+  constructor(
+    initialSizeOrBuffer: number | SharedArrayBuffer,
+    maxByteLength: number,
+  ) {
+    this.buffer =
+      typeof initialSizeOrBuffer === "number"
+        ? new SharedArrayBuffer(initialSizeOrBuffer, { maxByteLength })
+        : initialSizeOrBuffer;
     this.view = new DataView(this.buffer);
     this.maxByteLength = maxByteLength;
   }

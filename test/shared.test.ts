@@ -149,4 +149,32 @@ describe("Shared", () => {
     expect(result).toBe(1);
     expect(counter.read()).toBe(1);
   });
+
+  test("read cache is invalidated on write", () => {
+    const user = Shared("cache-1", { name: "Alice", age: 30 });
+    // Prime the cache.
+    expect(user.name).toBe("Alice");
+    // Write invalidates the cache; the next read must see the new value.
+    user.name = "Bob";
+    expect(user.name).toBe("Bob");
+    user.age = 31;
+    expect(user.age).toBe(31);
+    expect(user.name).toBe("Bob");
+  });
+
+  test("read cache is invalidated on repeated writes", () => {
+    const counter = Shared("cache-2", 0);
+    for (let i = 1; i <= 100; i++) {
+      counter.write(i);
+      expect(counter.read()).toBe(i);
+    }
+  });
+
+  test("read() returns a copy that cannot corrupt the cache", () => {
+    const user = Shared("cache-3", { name: "Alice", age: 30 });
+    const copy = user.read() as { name: string; age: number };
+    copy.name = "Mutated";
+    // The cache must be unaffected by mutating the returned copy.
+    expect(user.name).toBe("Alice");
+  });
 });

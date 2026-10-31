@@ -135,6 +135,13 @@ export class SharedMemory {
   readonly dataTable: GrowableBuffer;
   readonly stringTable: GrowableBuffer;
   readonly arrayTable: GrowableBuffer;
+  /**
+   * Per-key version counter (one Int32 per key index). Incremented on every
+   * write so workers can invalidate their read caches cross-worker.
+   */
+  readonly versionTable: GrowableBuffer;
+  /** Cached Int32Array view over the version table (rebuilt on growth). */
+  private versionView: Int32Array;
   /** Cross-worker mutex protecting all read/write operations. */
   readonly lock: Mutex;
 
@@ -145,13 +152,38 @@ export class SharedMemory {
     initialSize?: number;
     maxByteLength?: number;
     lock?: Mutex;
+    buffers?: {
+      indexTable?: SharedArrayBuffer;
+      dataTable?: SharedArrayBuffer;
+      stringTable?: SharedArrayBuffer;
+      arrayTable?: SharedArrayBuffer;
+      versionTable?: SharedArrayBuffer;
+    };
   }) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
     const max = options?.maxByteLength ?? DEFAULT_MAX;
-    this.indexTable = new GrowableBuffer(initial, max);
-    this.dataTable = new GrowableBuffer(initial, max);
-    this.stringTable = new GrowableBuffer(initial, max);
-    this.arrayTable = new GrowableBuffer(initial, max);
+    const buffers = options?.buffers;
+    this.indexTable = new GrowableBuffer(
+      buffers?.indexTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
+      max,
+    );
+    this.dataTable = new GrowableBuffer(
+      buffers?.dataTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
+      max,
+    );
+    this.stringTable = new GrowableBuffer(
+      buffers?.stringTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
+      max,
+    );
+    this.arrayTable = new GrowableBuffer(
+      buffers?.arrayTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
+      max,
+    );
+    this.versionTable = new GrowableBuffer(
+      buffers?.versionTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
+      max,
+    );
+    this.versionView = new Int32Array(this.versionTable.buffer);
     this.lock = options?.lock ?? new Mutex();
   }
 
@@ -293,6 +325,21 @@ export class SharedMemory {
 
   /** Look up a key in the Index Table, returning the DataTable offset or null. */
   lookup(key: string): number | null {
+    const index = this.lookupIndex(key);
+    if (index === null) return null;
+    const view = this.indexTable.getView();
+    const entryOffset = INDEX_HEADER + index * INDEX_ENTRY_SIZE;
+    return view.getInt32(entryOffset + 8, true);
+  }
+
+  /**
+   * Look up a key's stable index in the Index Table, or null if absent.
+   *
+   * The index is the key's position in the Index Table. Keys are never
+   * removed, so this index is stable for the lifetime of the key and can be
+   * used to address the key's version cell.
+   */
+  lookupIndex(key: string): number | null {
     const view = this.indexTable.getView();
     const count = view.getInt32(0, true);
     for (let i = 0; i < count; i++) {
@@ -301,10 +348,20 @@ export class SharedMemory {
       const keyLength = view.getInt32(entryOffset + 4, true);
       const storedKey = this.readString({ offset: keyOffset, length: keyLength });
       if (storedKey === key) {
-        return view.getInt32(entryOffset + 8, true);
+        return i;
       }
     }
     return null;
+  }
+
+  /** Read the current version for a key index (lock-free). */
+  getVersion(index: number): number {
+    return Atomics.load(this.versionView, index);
+  }
+
+  /** Increment the version for a key index, invalidating read caches. */
+  bumpVersion(index: number): void {
+    Atomics.add(this.versionView, index, 1);
   }
 
   /** Insert a key → dataOffset mapping into the Index Table. */
@@ -319,6 +376,14 @@ export class SharedMemory {
     view.setInt32(entryOffset + 8, dataOffset, true);
     view.setInt32(0, count + 1, true);
     this.indexTable.advance(INDEX_ENTRY_SIZE);
+
+    // Initialize the new key's version cell to 0.
+    const versionOffset = count * Int32Array.BYTES_PER_ELEMENT;
+    this.versionTable.ensureCapacity(versionOffset + Int32Array.BYTES_PER_ELEMENT);
+    // Rebuild the view if the buffer grew (grow preserves the SAB in place).
+    this.versionView = new Int32Array(this.versionTable.buffer);
+    Atomics.store(this.versionView, count, 0);
+    this.versionTable.advance(Int32Array.BYTES_PER_ELEMENT);
   }
 }
 

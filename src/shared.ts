@@ -93,12 +93,42 @@ export type SharedRef<T> = [T] extends [object]
       readonly buffer: SharedArrayBuffer;
     };
 
+/**
+ * Per-worker read cache: key -> { version, value, index }.
+ *
+ * Each worker has its own cache (module-level, not shared). A read hits the
+ * cache when the key's version cell (in shared memory) matches the cached
+ * version. Writes bump the version cell, so any worker's cache is invalidated
+ * automatically on the next read. The key's stable index is cached too, so a
+ * cache hit avoids the linear index-table lookup.
+ */
+const readCache = new Map<string, { version: number; value: unknown; index: number }>();
+
+/** Deep-ish copy of a decoded value, so callers can't corrupt the cache. */
+function copyValue(value: unknown): unknown {
+  if (Array.isArray(value)) return [...value];
+  if (value !== null && typeof value === "object") {
+    const copy: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      copy[k] = Array.isArray(v) ? [...v] : v;
+    }
+    return copy;
+  }
+  return value;
+}
+
 /** Options for creating a shared value. */
 export interface SharedOptions {
   /** Initial size of each shared buffer in bytes. */
   initialSize?: number;
   /** Maximum size of each shared buffer in bytes. */
   maxByteLength?: number;
+  /**
+   * An existing SharedMemory instance to use. When provided, the value is
+   * stored in (and read from) this shared memory, allowing multiple workers
+   * to access the same buffers.
+   */
+  memory?: SharedMemory;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -133,7 +163,7 @@ export function Shared<T>(
   const existing = registry.get(key);
   if (existing) return existing as SharedRef<T>;
 
-  const mem = new SharedMemory(options);
+  const mem = options.memory ?? new SharedMemory(options);
   const ref = createSharedRef<T>(mem, key);
   registry.set(key, ref as SharedRef<unknown>);
 
@@ -153,7 +183,7 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
   const target = {
     key,
     mem,
-    read: () => readValue(mem, key),
+    read: () => copyValue(readValue(mem, key)) as T,
     write: (value: T) => writeValue(mem, key, value),
     update: (fn: (current: T) => T) => updateValue(mem, key, fn),
   };
@@ -167,7 +197,8 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
       if (prop === "buffer") return mem.dataTable.buffer;
       if (prop === Symbol.toPrimitive) return () => t.read();
 
-      const value = t.read();
+      // Use the cached value directly (no copy) for property access.
+      const value = readValue(mem, key);
       if (Array.isArray(value)) {
         return getTopLevelArrayMember(mem, key, value, prop);
       }
@@ -196,9 +227,29 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
   }) as unknown as SharedRef<T>;
 }
 
-/** Read the full value for a key from shared memory. */
+/** Read the full value for a key from shared memory, using the read cache. */
 function readValue(mem: SharedMemory, key: string): unknown {
-  return mem.withLock(() => {
+  const cached = readCache.get(key);
+  const index =
+    cached !== undefined
+      ? cached.index
+      : (() => {
+          const i = mem.lookupIndex(key);
+          if (i === null) {
+            throw new Error(`No shared value found for key "${key}"`);
+          }
+          return i;
+        })();
+
+  // Lock-free fast path: if the cached version matches the current version
+  // cell, the cached value is still valid.
+  const version = mem.getVersion(index);
+  if (cached !== undefined && cached.version === version) {
+    return cached.value;
+  }
+
+  // Cache miss: decode under the lock and cache with the observed version.
+  const value = mem.withLock(() => {
     const offset = mem.lookup(key);
     if (offset === null) {
       throw new Error(`No shared value found for key "${key}"`);
@@ -216,6 +267,9 @@ function readValue(mem: SharedMemory, key: string): unknown {
     // Single value slot (primitive or array).
     return decodeValue(mem, mem.readValueSlot(offset));
   });
+
+  readCache.set(key, { version, value, index });
+  return value;
 }
 
 /** Write a full value for a key to shared memory. */
@@ -246,10 +300,12 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
             );
           }
         }
+        bump(mem, key);
         return;
       }
       // Update a single value slot in place.
       mem.updateValueSlot(existing, encodeValue(mem, value));
+      bump(mem, key);
       return;
     }
 
@@ -268,6 +324,12 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
     const offset = mem.storeValueSlot(encodeValue(mem, value));
     mem.insert(key, offset);
   });
+}
+
+/** Bump the version cell for a key, invalidating read caches. */
+function bump(mem: SharedMemory, key: string): void {
+  const index = mem.lookupIndex(key);
+  if (index !== null) mem.bumpVersion(index);
 }
 
 /** Atomically update the value for a key. */

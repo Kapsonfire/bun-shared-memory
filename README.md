@@ -8,6 +8,8 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 🚧 **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
 
+✅ **Read cache**: reads are cached per worker and invalidated cross-worker via a per-key version counter.
+
 ## Data Types
 
 - **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
@@ -52,6 +54,19 @@ const user2 = await Shared<User>("user-2", async () => {
 ## Synchronization
 
 All shared-memory reads and writes are protected by an `Atomics`-based mutex, so concurrent access from multiple workers is safe.
+
+### Read cache
+
+Reads are cached per worker to avoid re-decoding the value on every access.
+Each key has a version cell (an `Int32`) in shared memory that is incremented
+on every write. A read does a single lock-free `Atomics.load` on the version
+cell; if it matches the cached version, the cached value is returned without
+taking the lock or decoding. Because the version cell is shared, a write in
+any worker invalidates the cache in every other worker automatically.
+
+`read()` returns a copy, so mutating the returned object cannot corrupt the
+cache. Property access through the proxy (e.g. `user.name`) reads from the
+cache directly.
 
 ### Mutex
 
@@ -108,3 +123,8 @@ every supported data type and its arrays:
 
 Each benchmark reports ops/sec for the native and shared paths, plus the
 relative slowdown. Results are in `bench/`.
+
+With the read cache, **reads** are typically 5–12× slower than native (the
+remaining cost is the proxy dispatch). **Writes** are much slower because they
+must serialize, write, and bump the version cell; array `push` re-encodes the
+whole array each time.

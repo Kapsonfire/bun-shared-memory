@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Mutex, Notifier } from "../src/index.ts";
+import { Mutex, Notifier, Shared, SharedMemory } from "../src/index.ts";
 
 describe("Mutex", () => {
   test("locks and unlocks", () => {
@@ -93,5 +93,64 @@ describe("Notifier", () => {
     });
 
     expect(result).toBe("ok");
+  });
+});
+
+describe("Read cache invalidation across workers", () => {
+  test("a write in one worker invalidates the read cache in another", async () => {
+    const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
+    const user = Shared("cross-cache-1", { name: "Alice", age: 30 }, { memory: mem });
+    expect(user.name).toBe("Alice");
+
+    const workerCode = `
+      import { SharedMemory, Mutex, Shared } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const { buffers, lockBuf, key } = e.data;
+        const mem = new SharedMemory({
+          lock: new Mutex(lockBuf),
+          buffers,
+        });
+        const user = Shared(key, { name: "Alice", age: 30 }, { memory: mem });
+        if (e.data.action === "read") {
+          self.postMessage({ name: user.name, age: user.age });
+        }
+      };
+    `;
+
+    const worker = new Worker(
+      new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+      { type: "module" },
+    );
+
+    const readFromWorker = () =>
+      new Promise<{ name: string; age: number }>((resolve) => {
+        worker.onmessage = (e) => resolve(e.data as { name: string; age: number });
+        worker.postMessage({
+          action: "read",
+          key: "cross-cache-1",
+          lockBuf: mem.lock.buffer,
+          buffers: {
+            indexTable: mem.indexTable.buffer,
+            dataTable: mem.dataTable.buffer,
+            stringTable: mem.stringTable.buffer,
+            arrayTable: mem.arrayTable.buffer,
+            versionTable: mem.versionTable.buffer,
+          },
+        });
+      });
+
+    // Worker reads and caches the initial value.
+    expect(await readFromWorker()).toEqual({ name: "Alice", age: 30 });
+
+    // Main thread writes a new value (bumps the version cell).
+    user.name = "Bob";
+    user.age = 31;
+
+    // Worker's cache must be invalidated; it must see the new value.
+    expect(await readFromWorker()).toEqual({ name: "Bob", age: 31 });
+
+    worker.terminate();
   });
 });
