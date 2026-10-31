@@ -50,6 +50,14 @@ const INDEX_HEADER = 4;
 const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
 
+/**
+ * Reusable DataView for packing/unpacking 64-bit values (number, bigint) into
+ * the two 32-bit halves of a ValueSlot. Each worker has its own module
+ * instance, and all uses happen under the shared lock (or on a single thread),
+ * so reusing one view is safe and avoids allocating a buffer per call.
+ */
+const slotView = new DataView(new ArrayBuffer(8));
+
 export interface StringRef {
   offset: number;
   length: number;
@@ -80,10 +88,8 @@ export interface ObjectLayout {
 
 /** Encode a number (float64) into a ValueSlot. */
 export function numberSlot(value: number): ValueSlot {
-  const buf = new ArrayBuffer(8);
-  new DataView(buf).setFloat64(0, value, true);
-  const dv = new DataView(buf);
-  return { type: TYPE_NUMBER, a: dv.getInt32(0, true), b: dv.getInt32(4, true), c: 0 };
+  slotView.setFloat64(0, value, true);
+  return { type: TYPE_NUMBER, a: slotView.getInt32(0, true), b: slotView.getInt32(4, true), c: 0 };
 }
 
 /** Encode a boolean into a ValueSlot. */
@@ -93,10 +99,8 @@ export function booleanSlot(value: boolean): ValueSlot {
 
 /** Encode a bigint (int64) into a ValueSlot. */
 export function bigintSlot(value: bigint): ValueSlot {
-  const buf = new ArrayBuffer(8);
-  new DataView(buf).setBigInt64(0, value, true);
-  const dv = new DataView(buf);
-  return { type: TYPE_BIGINT, a: dv.getInt32(0, true), b: dv.getInt32(4, true), c: 0 };
+  slotView.setBigInt64(0, value, true);
+  return { type: TYPE_BIGINT, a: slotView.getInt32(0, true), b: slotView.getInt32(4, true), c: 0 };
 }
 
 /** Encode a string reference into a ValueSlot. */
@@ -113,20 +117,16 @@ export function arrayRefSlot(ref: ArrayRef): ValueSlot {
 export function decodeSlot(slot: ValueSlot): unknown {
   switch (slot.type) {
     case TYPE_NUMBER: {
-      const buf = new ArrayBuffer(8);
-      const dv = new DataView(buf);
-      dv.setInt32(0, slot.a, true);
-      dv.setInt32(4, slot.b, true);
-      return dv.getFloat64(0, true);
+      slotView.setInt32(0, slot.a, true);
+      slotView.setInt32(4, slot.b, true);
+      return slotView.getFloat64(0, true);
     }
     case TYPE_BOOLEAN:
       return slot.a === 1;
     case TYPE_BIGINT: {
-      const buf = new ArrayBuffer(8);
-      const dv = new DataView(buf);
-      dv.setInt32(0, slot.a, true);
-      dv.setInt32(4, slot.b, true);
-      return dv.getBigInt64(0, true);
+      slotView.setInt32(0, slot.a, true);
+      slotView.setInt32(4, slot.b, true);
+      return slotView.getBigInt64(0, true);
     }
     case TYPE_STRING_REF:
       return { offset: slot.a, length: slot.b };
