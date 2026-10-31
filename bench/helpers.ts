@@ -64,8 +64,16 @@ export function benchPair(
     shared();
   }
 
-  const nativeOps = measure(native, iterations);
+  // Run a short measurement pass with the native function itself before the
+  // real measurement. The JIT gives the very first measure() loop of a given
+  // closure a one-time constant-folding boost (~10 Mrd ops/s), while later
+  // runs of the same closure are much slower (~500 Mio). Warming up the exact
+  // native closure consumes that boost so the real measurement is consistent
+  // across tests (otherwise the first read test is a large outlier).
+  measure(native, iterations, 2_000);
+
   const sharedOps = measure(shared, iterations);
+  const nativeOps = measure(native, iterations);
 
   const ratio = nativeOps / sharedOps;
   const slower =
