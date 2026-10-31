@@ -32,8 +32,9 @@ Key entry points:
 **every** codebase change (even ones expected to have no performance impact):
 
 - Run `bun run bench`.
-- The benchmark automatically writes a full log to `benchlogs/<commit-hash>.md`
-  (one file per run, named after the commit it was measured on).
+- The benchmark automatically writes a full log to
+  `benchlogs/<unix-timestamp>-<commit-hash>.md` (one file per run, named after
+  the commit it was measured on, timestamp-prefixed for chronological sorting).
 - Add a new row to the table in `BENCH.md` with:
   - a date/commit reference,
   - a short description of the change,

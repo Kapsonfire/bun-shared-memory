@@ -113,8 +113,10 @@ export async function printSummary(): Promise<void> {
 }
 
 /**
- * Write the full benchmark results to `benchlogs/<commit-hash>.md` so each
- * run has its own file named after the commit it was measured on.
+ * Write the full benchmark results to
+ * `benchlogs/<unix-timestamp>-<commit-hash>.md` so each run has its own file
+ * named after the commit it was measured on. The timestamp prefix (the
+ * commit's committer date) makes the files sortable chronologically.
  */
 async function writeLogFile(groups: {
   reads: BenchResult[];
@@ -124,9 +126,9 @@ async function writeLogFile(groups: {
   fmt: (rs: BenchResult[]) => string;
 }): Promise<void> {
   const { reads, arrayReads, writes, arrayWrites, fmt } = groups;
-  const commit = currentCommit();
+  const { commit, timestamp } = currentCommit();
   const dir = new URL("../benchlogs/", import.meta.url);
-  const file = new URL(`${commit}.md`, dir);
+  const file = new URL(`${timestamp}-${commit}.md`, dir);
 
   const lines: string[] = [];
   lines.push(`# Benchmark ${commit}`);
@@ -151,21 +153,30 @@ async function writeLogFile(groups: {
   lines.push(`- Array writes: ${fmt(arrayWrites)}`);
 
   await Bun.write(file, lines.join("\n") + "\n");
-  console.log(`\nWrote benchmark log to benchlogs/${commit}.md`);
+  console.log(`\nWrote benchmark log to benchlogs/${timestamp}-${commit}.md`);
 }
 
-/** Resolve the current git commit hash (short form), or "unknown". */
-function currentCommit(): string {
+/**
+ * Resolve the current git commit hash (short form) and its committer date as
+ * a Unix timestamp, or "unknown"/0 if git is unavailable.
+ */
+function currentCommit(): { commit: string; timestamp: number } {
   try {
-    const out = Bun.spawnSync({
+    const hashOut = Bun.spawnSync({
       cmd: ["git", "rev-parse", "--short", "HEAD"],
       stdout: "pipe",
       stderr: "pipe",
     });
-    const hash = out.stdout.toString().trim();
-    return hash || "unknown";
+    const commit = hashOut.stdout.toString().trim() || "unknown";
+    const tsOut = Bun.spawnSync({
+      cmd: ["git", "show", "-s", "--format=%ct", "HEAD"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const timestamp = Number(tsOut.stdout.toString().trim()) || 0;
+    return { commit, timestamp };
   } catch {
-    return "unknown";
+    return { commit: "unknown", timestamp: 0 };
   }
 }
 
