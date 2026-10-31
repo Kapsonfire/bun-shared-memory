@@ -49,6 +49,8 @@ const OBJECT_HEADER = 16;
 const NAME_REF_SIZE = 8;
 const INDEX_ENTRY_SIZE = 12;
 const INDEX_HEADER = 4;
+/** Size of the objectId header at the start of each array block. */
+const ARRAY_HEADER = 4;
 
 const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
@@ -69,6 +71,10 @@ export interface StringRef {
 }
 
 export interface ArrayRef {
+  /**
+   * Byte offset of the array block in the ArrayTable, pointing at the 4-byte
+   * objectId header. The value slots start at `offset + ARRAY_HEADER`.
+   */
   offset: number;
   count: number;
   /** Number of slots reserved for this array (>= count). */
@@ -182,6 +188,13 @@ export class SharedMemory {
   /** Fast path: the most recently interned string and its ref. */
   private lastInterned: string | undefined;
   private lastInternedRef: StringRef | undefined;
+
+  /**
+   * Monotonic counter for stable object/array identity. Each object and array
+   * gets a unique id that is independent of its DataTable/ArrayTable offset
+   * (which changes during defragmentation). Used to key the refcount table.
+   */
+  private nextObjectId = 1;
 
   constructor(options?: {
     initialSize?: number;
@@ -314,21 +327,24 @@ export class SharedMemory {
   /**
    * Append an array of value slots to the ArrayTable and return its reference.
    *
-   * `capacity` is the number of slots reserved for the array (>= slots.length).
-   * The extra slots are padding so `push` can grow the array in place without
-   * overwriting the next array. When the padding is exhausted, the array must
-   * be moved (see `moveArray`).
+   * Each array block starts with a 4-byte objectId header (for refcounting),
+   * followed by `capacity` value slots. `capacity` is the number of slots
+   * reserved for the array (>= slots.length). The extra slots are padding so
+   * `push` can grow the array in place without overwriting the next array.
+   * When the padding is exhausted, the array must be moved (see `moveArray`).
    */
   storeArray(slots: ValueSlot[], capacity?: number): ArrayRef {
     const count = slots.length;
     const cap = Math.max(capacity ?? count, 1);
-    const offset = this.arrayTable.byteLength / SLOT_SIZE;
-    this.arrayTable.ensureCapacity((offset + cap) * SLOT_SIZE);
+    const offset = this.arrayTable.byteLength;
+    this.arrayTable.ensureCapacity(offset + ARRAY_HEADER + cap * SLOT_SIZE);
     const view = this.arrayTable.getView();
+    const objectId = this.nextObjectId++;
+    view.setInt32(offset, objectId, true);
     for (let i = 0; i < count; i++) {
-      writeSlot(view, (offset + i) * SLOT_SIZE, slots[i]!);
+      writeSlot(view, offset + ARRAY_HEADER + i * SLOT_SIZE, slots[i]!);
     }
-    this.arrayTable.advance(cap * SLOT_SIZE);
+    this.arrayTable.advance(ARRAY_HEADER + cap * SLOT_SIZE);
     return { offset, count, capacity: cap };
   }
 
@@ -337,19 +353,24 @@ export class SharedMemory {
     const view = this.arrayTable.getView();
     const slots: ValueSlot[] = [];
     for (let i = 0; i < ref.count; i++) {
-      slots.push(readSlot(view, (ref.offset + i) * SLOT_SIZE));
+      slots.push(readSlot(view, ref.offset + ARRAY_HEADER + i * SLOT_SIZE));
     }
     return slots;
   }
 
   /** Update a single value slot of an array in the ArrayTable in place. */
   updateArraySlot(ref: ArrayRef, index: number, slot: ValueSlot): void {
-    writeSlot(this.arrayTable.getView(), (ref.offset + index) * SLOT_SIZE, slot);
+    writeSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + index * SLOT_SIZE, slot);
   }
 
   /** Read a single value slot of an array from the ArrayTable. */
   readArraySlot(ref: ArrayRef, index: number): ValueSlot {
-    return readSlot(this.arrayTable.getView(), (ref.offset + index) * SLOT_SIZE);
+    return readSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + index * SLOT_SIZE);
+  }
+
+  /** Read the stable objectId of an array block in the ArrayTable. */
+  getArrayObjectId(offset: number): number {
+    return this.arrayTable.getView().getInt32(offset, true);
   }
 
   /**
@@ -358,13 +379,19 @@ export class SharedMemory {
    * the DataTable to point at the new location.
    */
   moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
-    const newOffset = this.arrayTable.byteLength / SLOT_SIZE;
-    this.arrayTable.ensureCapacity((newOffset + newCapacity) * SLOT_SIZE);
+    const newOffset = this.arrayTable.byteLength;
+    this.arrayTable.ensureCapacity(newOffset + ARRAY_HEADER + newCapacity * SLOT_SIZE);
     const view = this.arrayTable.getView();
+    const objectId = this.getArrayObjectId(ref.offset);
+    view.setInt32(newOffset, objectId, true);
     for (let i = 0; i < ref.count; i++) {
-      writeSlot(view, (newOffset + i) * SLOT_SIZE, readSlot(view, (ref.offset + i) * SLOT_SIZE));
+      writeSlot(
+        view,
+        newOffset + ARRAY_HEADER + i * SLOT_SIZE,
+        readSlot(view, ref.offset + ARRAY_HEADER + i * SLOT_SIZE),
+      );
     }
-    this.arrayTable.advance(newCapacity * SLOT_SIZE);
+    this.arrayTable.advance(ARRAY_HEADER + newCapacity * SLOT_SIZE);
     return { offset: newOffset, count: ref.count, capacity: newCapacity };
   }
 
@@ -376,11 +403,11 @@ export class SharedMemory {
    */
   appendArraySlot(ref: ArrayRef, slot: ValueSlot): ArrayRef {
     if (ref.count < ref.capacity) {
-      writeSlot(this.arrayTable.getView(), (ref.offset + ref.count) * SLOT_SIZE, slot);
+      writeSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + ref.count * SLOT_SIZE, slot);
       return { offset: ref.offset, count: ref.count + 1, capacity: ref.capacity };
     }
     const moved = this.moveArray(ref, Math.max(ref.capacity * 2, 1));
-    writeSlot(this.arrayTable.getView(), (moved.offset + moved.count) * SLOT_SIZE, slot);
+    writeSlot(this.arrayTable.getView(), moved.offset + ARRAY_HEADER + moved.count * SLOT_SIZE, slot);
     return { offset: moved.offset, count: moved.count + 1, capacity: moved.capacity };
   }
 
@@ -419,8 +446,10 @@ export class SharedMemory {
     this.dataTable.ensureCapacity(offset + blockSize);
     const view = this.dataTable.getView();
 
+    const objectId = this.nextObjectId++;
     view.setInt32(offset, TYPE_OBJECT, true);
     view.setInt32(offset + 4, properties.length, true);
+    view.setInt32(offset + 8, objectId, true);
 
     let cursor = offset + OBJECT_HEADER;
     for (const [name, slot] of properties) {
@@ -451,6 +480,11 @@ export class SharedMemory {
       properties.push([name, slot]);
     }
     return properties;
+  }
+
+  /** Read the stable objectId of an object block in the DataTable. */
+  getObjectId(offset: number): number {
+    return this.dataTable.getView().getInt32(offset + 8, true);
   }
 
   /**
