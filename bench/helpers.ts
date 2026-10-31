@@ -64,7 +64,7 @@ export function benchPair(
 }
 
 /** Print a summary separating reads, array reads, writes, and array writes. */
-export function printSummary(): void {
+export async function printSummary(): Promise<void> {
   const reads = results.filter((r) => r.kind === "read");
   const arrayReads = results.filter((r) => r.kind === "array-read");
   const writes = results.filter((r) => r.kind === "write");
@@ -85,6 +85,65 @@ export function printSummary(): void {
   console.log(`Array reads  (${arrayReads.length}):  ${fmt(arrayReads)}`);
   console.log(`Writes       (${writes.length}): ${fmt(writes)}`);
   console.log(`Array writes (${arrayWrites.length}): ${fmt(arrayWrites)}`);
+
+  await writeLogFile({ reads, arrayReads, writes, arrayWrites, fmt });
+}
+
+/**
+ * Write the full benchmark results to `benchlogs/<commit-hash>.md` so each
+ * run has its own file named after the commit it was measured on.
+ */
+async function writeLogFile(groups: {
+  reads: BenchResult[];
+  arrayReads: BenchResult[];
+  writes: BenchResult[];
+  arrayWrites: BenchResult[];
+  fmt: (rs: BenchResult[]) => string;
+}): void {
+  const { reads, arrayReads, writes, arrayWrites, fmt } = groups;
+  const commit = currentCommit();
+  const dir = new URL("../benchlogs/", import.meta.url);
+  const file = new URL(`${commit}.md`, dir);
+
+  const lines: string[] = [];
+  lines.push(`# Benchmark ${commit}`);
+  lines.push("");
+  lines.push(`Date: ${new Date().toISOString()}`);
+  lines.push("");
+  lines.push("## Results");
+  lines.push("");
+  lines.push("| Name | Native ops/s | Shared ops/s | Ratio |");
+  lines.push("|------|--------------|--------------|-------|");
+  for (const r of results) {
+    lines.push(
+      `| ${r.name} | ${r.nativeOps} | ${r.sharedOps} | ${r.ratio.toFixed(2)}× |`,
+    );
+  }
+  lines.push("");
+  lines.push("## Summary");
+  lines.push("");
+  lines.push(`- Reads: ${fmt(reads)}`);
+  lines.push(`- Array reads: ${fmt(arrayReads)}`);
+  lines.push(`- Writes: ${fmt(writes)}`);
+  lines.push(`- Array writes: ${fmt(arrayWrites)}`);
+
+  await Bun.write(file, lines.join("\n") + "\n");
+  console.log(`\nWrote benchmark log to benchlogs/${commit}.md`);
+}
+
+/** Resolve the current git commit hash (short form), or "unknown". */
+function currentCommit(): string {
+  try {
+    const out = Bun.spawnSync({
+      cmd: ["git", "rev-parse", "--short", "HEAD"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const hash = out.stdout.toString().trim();
+    return hash || "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 /** Measure ops/sec for `fn` over `iterations` invocations. */
