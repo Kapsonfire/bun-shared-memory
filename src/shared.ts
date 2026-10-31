@@ -15,6 +15,7 @@ import {
   type ValueSlot,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
+import { getDefaultMemory } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -275,7 +276,7 @@ export function Shared<T>(
   const existing = registry.get(key);
   if (existing) return existing as SharedRef<T>;
 
-  const mem = options.memory ?? new SharedMemory(options);
+  const mem = options.memory ?? getDefaultMemory();
   const ref = createSharedRef<T>(mem, key, options.refCount);
   registry.set(key, ref as SharedRef<unknown>);
 
@@ -286,7 +287,12 @@ export function Shared<T>(
     });
   }
 
-  ref.write(initialOrLoader as T);
+  // If the key already exists in shared memory (e.g. it was created by the
+  // main thread and this is a worker sharing the same buffers), don't
+  // overwrite it with the initial value.
+  if (getOffset(mem, key) === null) {
+    ref.write(initialOrLoader as T);
+  }
   return ref;
 }
 

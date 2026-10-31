@@ -53,11 +53,11 @@ const user2 = Shared<User>('user-1', loader); // Get a wrapper to user-1 in shar
 1. **M1 — Foundation**: Project scaffolding, build tooling, basic `SharedArrayBuffer` wrapper. ✅
 2. **M2 — Typed data**: Support for typed arrays and primitive serialization. ✅
 3. **M3 — Synchronization**: `Atomics`-based locking and notifications between workers. ✅
-4. **M4 — Worker integration**: Seamless usage within Bun `Worker` threads.
+4. **M4 — Worker integration**: Seamless usage within Bun `Worker` threads. ✅
 5. **M5 — Polish**: Documentation, benchmarks, and examples.
 
 ## Open Questions
 
-- How should the `SharedMemory` instance (and its buffers) be shared with worker threads? (M4)
-- Should the `Shared<T>` registry be shared across workers, or re-created per worker? (M4)
+- How should the `SharedMemory` instance (and its buffers) be shared with worker threads? (M4) — **Resolved**: the main thread calls `shareWithWorkers()` once; it listens for new workers via `process.on("worker")` and automatically sends the shared buffers to each one. A worker simply imports the library (which installs a message wrapper at module load) and calls `Shared()` — the buffers are reconstructed automatically.
+- Should the `Shared<T>` registry be shared across workers, or re-created per worker? (M4) — **Resolved**: the registry is per-worker (module-level in Bun). `Shared()` checks whether a key already exists in shared memory before writing the initial value, so a worker never overwrites a value created by the main thread.
 - What is the exact serialization format for structured data? (resolved by the 4-buffer architecture)

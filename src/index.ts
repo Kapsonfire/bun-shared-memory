@@ -5,3 +5,10 @@ export { Mutex } from "./mutex.ts";
 export { Notifier } from "./notifier.ts";
 export { RefCountBuffer, RefCountCoordinator, RefCountTracker } from "./refcount.ts";
 export type { ObjectId, RefEvent } from "./refcount.ts";
+export {
+  getDefaultMemory,
+  setDefaultMemory,
+  hasDefaultMemory,
+  shareWithWorkers,
+  onMessage,
+} from "./worker.ts";

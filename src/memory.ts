@@ -254,6 +254,49 @@ export class SharedMemory {
     return this.lock.withLock(fn);
   }
 
+  /**
+   * Export all shared buffers (including the lock) so they can be sent to a
+   * worker via `postMessage` and reconstructed there with `fromBuffers()`.
+   */
+  exportBuffers(): {
+    indexTable: SharedArrayBuffer;
+    dataTable: SharedArrayBuffer;
+    stringTable: SharedArrayBuffer;
+    arrayTable: SharedArrayBuffer;
+    versionTable: SharedArrayBuffer;
+    layoutVersion: SharedArrayBuffer;
+    lock: SharedArrayBuffer;
+  } {
+    return {
+      indexTable: this.indexTable.buffer,
+      dataTable: this.dataTable.buffer,
+      stringTable: this.stringTable.buffer,
+      arrayTable: this.arrayTable.buffer,
+      versionTable: this.versionTable.buffer,
+      layoutVersion: this.layoutVersion.buffer as SharedArrayBuffer,
+      lock: this.lock.buffer as SharedArrayBuffer,
+    };
+  }
+
+  /**
+   * Reconstruct a SharedMemory instance from buffers exported by
+   * `exportBuffers()` (e.g. received from the main thread in a worker).
+   */
+  static fromBuffers(buffers: {
+    indexTable: SharedArrayBuffer;
+    dataTable: SharedArrayBuffer;
+    stringTable: SharedArrayBuffer;
+    arrayTable: SharedArrayBuffer;
+    versionTable: SharedArrayBuffer;
+    layoutVersion: SharedArrayBuffer;
+    lock: SharedArrayBuffer;
+  }): SharedMemory {
+    return new SharedMemory({
+      buffers,
+      lock: new Mutex(buffers.lock),
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // StringTable
   // ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ✅ **Reference counting & defragmentation**: workers acquire/release references to shared objects/arrays (released on GC), the main thread tracks which worker holds what, and a defragmentation pass reclaims dead space when free space is low.
 
+✅ **M4 — Worker integration**: a worker can simply call `Shared()` and automatically share the same buffers as the main thread. The main thread calls `shareWithWorkers()` once; each worker just imports the library and calls `Shared()` — no manual buffer serialization needed.
+
 ## Data Types
 
 - **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
@@ -141,6 +143,37 @@ const copy = user.read();      // acquires a ref; released when `copy` is GC'd
 ```
 
 See [REFCOUNT.md](./REFCOUNT.md) for the full design.
+
+## Worker integration
+
+A worker can simply call `Shared()` and automatically share the same buffers
+as the main thread — no manual buffer serialization needed.
+
+```ts
+// main.ts
+import { Shared, shareWithWorkers } from "shared-memory";
+
+const user = Shared("user-1", { name: "Alice", age: 30 });
+shareWithWorkers();   // send the shared buffers to every new worker
+```
+
+```ts
+// worker.ts
+import { Shared, onMessage } from "shared-memory";
+
+// Importing the library automatically installs a message wrapper that
+// receives the shared buffers from the main thread. Register your own
+// message handler via onMessage(); messages are buffered until the buffers
+// have arrived.
+onMessage((e) => {
+  const user = Shared("user-1", { name: "x" });  // reads the main thread's value
+  self.postMessage(user.read());
+});
+```
+
+`Shared()` never overwrites a value that already exists in shared memory, so a
+worker reading a key created by the main thread gets the existing value rather
+than its own initial value.
 
 ## Development
 
