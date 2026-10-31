@@ -189,6 +189,12 @@ overwrites a value that already exists in shared memory, so a worker reading a
 key created by the main thread gets the existing value rather than its own
 initial value.
 
+> **Note:** a worker must call `await init()` before using `Shared()`. Calling
+> `Shared()` in a worker without `init()` throws an error rather than silently
+> creating a separate, unshared memory.
+
+A complete runnable example is in [`examples/worker/`](examples/worker/).
+
 ## Memory budget
 
 Shared memory is split across several growable `SharedArrayBuffer`s (the

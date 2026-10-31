@@ -37,6 +37,17 @@ export function getDefaultMemory(): SharedMemory {
           "Await init() before using Shared().",
       );
     }
+    if (!Bun.isMainThread) {
+      // A worker must call `await init()` to receive the shared buffers from
+      // the main thread. Without it, creating a fresh memory here would
+      // silently give the worker its own, unshared buffers — a hard-to-debug
+      // bug where reads/writes don't propagate to the main thread.
+      throw new Error(
+        "Shared() called in a worker without init(). " +
+          "Call `await init()` at the top of the worker to receive the shared " +
+          "buffers from the main thread before using Shared().",
+      );
+    }
     // Standalone process (or main thread): create a fresh memory.
     defaultMemory = new SharedMemory();
   }

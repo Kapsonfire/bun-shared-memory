@@ -112,4 +112,33 @@ describe("Worker integration (M4)", () => {
     expect(a).toBe(b);
     expect(hasDefaultMemory()).toBe(true);
   });
+
+  test("a worker calling Shared() without init() throws instead of creating unshared buffers", async () => {
+    const workerCode = `
+      import { Shared } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      try {
+        // No await init() — must throw, not silently create unshared buffers.
+        Shared("m4-no-init", { name: "x" });
+        self.postMessage("no-error");
+      } catch (e) {
+        self.postMessage("error:" + (e as Error).message);
+      }
+    `;
+
+    const result = await new Promise<string>((resolve) => {
+      const worker = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(workerCode),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      worker.onmessage = (e) => resolve(e.data as string);
+    });
+
+    expect(result).toContain("error:");
+    expect(result).toContain("init()");
+  });
 });
