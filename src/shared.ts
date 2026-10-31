@@ -1,5 +1,6 @@
 import {
   SharedMemory,
+  TYPE_ARRAY_REF,
   arrayRefSlot,
   bigintSlot,
   booleanSlot,
@@ -295,13 +296,50 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
       return propValue;
     },
     set(t, prop, val) {
-      return mutateValue<T, boolean>(mem, key, (value) => {
-        if (Array.isArray(value)) {
-          (value as unknown as Record<string | symbol, unknown>)[prop] = val;
-        } else {
-          (value as Record<string | symbol, unknown>)[prop] = val;
+      // In-place update: write only the affected slot instead of decoding and
+      // re-encoding the whole value.
+      return mem.withLock(() => {
+        // Object property: use the cached layout to write only that slot.
+        const layout = getObjectLayout(mem, key);
+        if (layout !== null) {
+          const slotOffset = layout.properties.get(prop as string);
+          if (slotOffset === undefined) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          mem.updateValueSlot(slotOffset, encodeValue(mem, val));
+          bump(mem, key);
+          return true;
         }
-        return true;
+
+        // Top-level array index write: update only that array slot.
+        const offset = mem.lookup(key);
+        if (offset === null) {
+          throw new Error(`No shared value found for key "${key}"`);
+        }
+        const slot = mem.readValueSlot(offset);
+        if (slot.type === TYPE_ARRAY_REF && typeof prop === "string" && /^\d+$/.test(prop)) {
+          const index = Number(prop);
+          const ref = { offset: slot.a, count: slot.b };
+          if (index >= ref.count) {
+            throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
+          }
+          mem.updateArraySlot(ref, index, encodeValue(mem, val));
+          bump(mem, key);
+          return true;
+        }
+
+        // Fallback: full read-modify-write (e.g. setting a primitive key's
+        // property, or a non-index property on an array).
+        return mutateValue<T, boolean>(mem, key, (value) => {
+          if (Array.isArray(value)) {
+            (value as unknown as Record<string | symbol, unknown>)[prop] = val;
+          } else {
+            (value as Record<string | symbol, unknown>)[prop] = val;
+          }
+          return true;
+        });
       });
     },
     deleteProperty() {
@@ -529,15 +567,37 @@ function createArrayProxy(
       return method;
     },
     set(_target, arrProp, val) {
-      return mutateValue<Record<string, unknown>, boolean>(
-        mem,
-        key,
-        (fresh) => {
-          const arr = fresh[prop] as unknown[];
-          (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
-          return true;
-        },
-      );
+      // In-place update: write only the affected array slot instead of
+      // decoding and re-encoding the whole object.
+      return mem.withLock(() => {
+        const layout = getObjectLayout(mem, key);
+        if (layout !== null) {
+          const slotOffset = layout.properties.get(prop);
+          if (slotOffset !== undefined) {
+            const propSlot = mem.readValueSlot(slotOffset);
+            if (propSlot.type === TYPE_ARRAY_REF && typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
+              const index = Number(arrProp);
+              const ref = { offset: propSlot.a, count: propSlot.b };
+              if (index >= ref.count) {
+                throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
+              }
+              mem.updateArraySlot(ref, index, encodeValue(mem, val));
+              bump(mem, key);
+              return true;
+            }
+          }
+        }
+        // Fallback: full read-modify-write.
+        return mutateValue<Record<string, unknown>, boolean>(
+          mem,
+          key,
+          (fresh) => {
+            const arr = fresh[prop] as unknown[];
+            (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
+            return true;
+          },
+        );
+      });
     },
   });
 }

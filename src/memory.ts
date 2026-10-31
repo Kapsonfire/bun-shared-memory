@@ -252,6 +252,11 @@ export class SharedMemory {
     return slots;
   }
 
+  /** Update a single value slot of an array in the ArrayTable in place. */
+  updateArraySlot(ref: ArrayRef, index: number, slot: ValueSlot): void {
+    writeSlot(this.arrayTable.getView(), (ref.offset + index) * SLOT_SIZE, slot);
+  }
+
   // ---------------------------------------------------------------------------
   // DataTable
   // ---------------------------------------------------------------------------
