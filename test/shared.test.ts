@@ -67,6 +67,26 @@ describe("Shared", () => {
     expect(arr.length).toBe(2);
   });
 
+  test("array push grows past capacity without corrupting other arrays", () => {
+    // Multiple arrays that grow, forcing the array table to move arrays to
+    // new locations with larger capacity. Verify no cross-array corruption.
+    const a = Shared("grow-a", [1, 2, 3]);
+    const b = Shared("grow-b", ["x", "y"]);
+    const c = Shared("grow-c", [10, 20, 30, 40]);
+
+    for (let i = 0; i < 20; i++) a.push(i);
+    for (let i = 0; i < 20; i++) b.push("s" + i);
+    for (let i = 0; i < 20; i++) c.push(i * 10);
+
+    expect(a.read()).toEqual([1, 2, 3, ...Array.from({ length: 20 }, (_, i) => i)]);
+    expect(b.read()).toEqual(["x", "y", ...Array.from({ length: 20 }, (_, i) => "s" + i)]);
+    expect(c.read()).toEqual([10, 20, 30, 40, ...Array.from({ length: 20 }, (_, i) => i * 10)]);
+
+    // Pop works after growth.
+    expect(a.pop()).toBe(19);
+    expect(a.length).toBe(22);
+  });
+
   test("supports mixed arrays", () => {
     const mixed = Shared("mixed-1", [1, "a", true, 2n]);
     expect(mixed[0]).toBe(1);

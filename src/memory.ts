@@ -58,6 +58,8 @@ export interface StringRef {
 export interface ArrayRef {
   offset: number;
   count: number;
+  /** Number of slots reserved for this array (>= count). */
+  capacity: number;
 }
 
 export interface ValueSlot {
@@ -104,7 +106,7 @@ export function stringRefSlot(ref: StringRef): ValueSlot {
 
 /** Encode an array reference into a ValueSlot. */
 export function arrayRefSlot(ref: ArrayRef): ValueSlot {
-  return { type: TYPE_ARRAY_REF, a: ref.offset, b: ref.count, c: 0 };
+  return { type: TYPE_ARRAY_REF, a: ref.offset, b: ref.count, c: ref.capacity };
 }
 
 /** Decode a ValueSlot into a JS value (primitives) or a ref object. */
@@ -129,7 +131,7 @@ export function decodeSlot(slot: ValueSlot): unknown {
     case TYPE_STRING_REF:
       return { offset: slot.a, length: slot.b };
     case TYPE_ARRAY_REF:
-      return { offset: slot.a, count: slot.b };
+      return { offset: slot.a, count: slot.b, capacity: slot.c };
     default:
       throw new Error(`Unknown slot type ${slot.type}`);
   }
@@ -229,17 +231,25 @@ export class SharedMemory {
   // ArrayTable
   // ---------------------------------------------------------------------------
 
-  /** Append an array of value slots to the ArrayTable and return its reference. */
-  storeArray(slots: ValueSlot[]): ArrayRef {
-    const offset = this.arrayTable.byteLength / SLOT_SIZE;
+  /**
+   * Append an array of value slots to the ArrayTable and return its reference.
+   *
+   * `capacity` is the number of slots reserved for the array (>= slots.length).
+   * The extra slots are padding so `push` can grow the array in place without
+   * overwriting the next array. When the padding is exhausted, the array must
+   * be moved (see `moveArray`).
+   */
+  storeArray(slots: ValueSlot[], capacity?: number): ArrayRef {
     const count = slots.length;
-    this.arrayTable.ensureCapacity((offset + count) * SLOT_SIZE);
+    const cap = Math.max(capacity ?? count, 1);
+    const offset = this.arrayTable.byteLength / SLOT_SIZE;
+    this.arrayTable.ensureCapacity((offset + cap) * SLOT_SIZE);
     const view = this.arrayTable.getView();
     for (let i = 0; i < count; i++) {
       writeSlot(view, (offset + i) * SLOT_SIZE, slots[i]!);
     }
-    this.arrayTable.advance(count * SLOT_SIZE);
-    return { offset, count };
+    this.arrayTable.advance(cap * SLOT_SIZE);
+    return { offset, count, capacity: cap };
   }
 
   /** Read an array of value slots from the ArrayTable by reference. */
@@ -255,6 +265,43 @@ export class SharedMemory {
   /** Update a single value slot of an array in the ArrayTable in place. */
   updateArraySlot(ref: ArrayRef, index: number, slot: ValueSlot): void {
     writeSlot(this.arrayTable.getView(), (ref.offset + index) * SLOT_SIZE, slot);
+  }
+
+  /** Read a single value slot of an array from the ArrayTable. */
+  readArraySlot(ref: ArrayRef, index: number): ValueSlot {
+    return readSlot(this.arrayTable.getView(), (ref.offset + index) * SLOT_SIZE);
+  }
+
+  /**
+   * Move an array to a new location with a larger capacity, copying its slots.
+   * Returns the new reference. The caller must update the array-ref slot in
+   * the DataTable to point at the new location.
+   */
+  moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
+    const newOffset = this.arrayTable.byteLength / SLOT_SIZE;
+    this.arrayTable.ensureCapacity((newOffset + newCapacity) * SLOT_SIZE);
+    const view = this.arrayTable.getView();
+    for (let i = 0; i < ref.count; i++) {
+      writeSlot(view, (newOffset + i) * SLOT_SIZE, readSlot(view, (ref.offset + i) * SLOT_SIZE));
+    }
+    this.arrayTable.advance(newCapacity * SLOT_SIZE);
+    return { offset: newOffset, count: ref.count, capacity: newCapacity };
+  }
+
+  /**
+   * Append a slot to an array, growing it in place if capacity allows, or
+   * moving it to a new location with doubled capacity otherwise. Returns the
+   * (possibly new) reference; the caller must update the array-ref slot in the
+   * DataTable if the reference changed.
+   */
+  appendArraySlot(ref: ArrayRef, slot: ValueSlot): ArrayRef {
+    if (ref.count < ref.capacity) {
+      writeSlot(this.arrayTable.getView(), (ref.offset + ref.count) * SLOT_SIZE, slot);
+      return { offset: ref.offset, count: ref.count + 1, capacity: ref.capacity };
+    }
+    const moved = this.moveArray(ref, Math.max(ref.capacity * 2, 1));
+    writeSlot(this.arrayTable.getView(), (moved.offset + moved.count) * SLOT_SIZE, slot);
+    return { offset: moved.offset, count: moved.count + 1, capacity: moved.capacity };
   }
 
   // ---------------------------------------------------------------------------

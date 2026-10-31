@@ -136,6 +136,10 @@ Each benchmark reports ops/sec for the native and shared paths, plus the
 relative slowdown. Results are in `bench/`.
 
 With the read cache and offset cache, **reads** are typically 5–12× slower than
-native (the remaining cost is the proxy dispatch). **Writes** are much slower
-because they must serialize, write, and bump the version cell; array `push`
-re-encodes the whole array each time.
+native (the remaining cost is the proxy dispatch). **Writes** are slower because
+they must serialize, write, and bump the version cell. Object property and array
+index writes are O(1) in-place updates (only the affected slot is written).
+Array `push`/`pop` are O(1) amortized in-place operations: arrays reserve
+capacity padding in the ArrayTable, `push` writes into the padding until it is
+exhausted (then the array is relocated with doubled capacity), and `pop` just
+decrements the length.

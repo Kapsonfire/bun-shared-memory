@@ -63,7 +63,7 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
     case 3: // string-ref
       return mem.readString({ offset: slot.a, length: slot.b });
     case 4: // array-ref
-      return mem.readArray({ offset: slot.a, count: slot.b }).map((s) =>
+      return mem.readArray({ offset: slot.a, count: slot.b, capacity: slot.c }).map((s) =>
         decodeValue(mem, s),
       );
     default:
@@ -229,6 +229,16 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
       if (prop === "buffer") return mem.dataTable.buffer;
       if (prop === Symbol.toPrimitive) return () => t.read();
 
+      // push/pop on a top-level array: operate directly on the array ref
+      // without decoding the whole array (O(1) amortized).
+      if (prop === "push" || prop === "pop") {
+        const slotOffset = findArrayRefSlot(mem, key, null);
+        if (slotOffset !== null) {
+          return (...args: unknown[]) =>
+            mutateArrayRef(mem, key, null, prop, args);
+        }
+      }
+
       // Fast path: if the full value is cached and valid, read the property
       // from the cached value (no decode, no lock).
       const cachedValue = getCachedValue(mem, key);
@@ -272,6 +282,11 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
             ? pc.index
             : readCache.get(key)?.index ?? mem.lookupIndex(key) ?? 0;
         const slot = mem.readValueSlot(slotOffset);
+        // Array properties are handled lazily by the array proxy; don't decode
+        // the whole array here (avoids O(n) work on every access).
+        if (slot.type === TYPE_ARRAY_REF) {
+          return createArrayProxy(mem, key, prop as string);
+        }
         const propValue = decodeValue(mem, slot);
         if (pc === undefined || pc.version !== version) {
           propCache.set(key, { version: mem.getVersion(index), index, props: new Map() });
@@ -321,7 +336,7 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
         const slot = mem.readValueSlot(offset);
         if (slot.type === TYPE_ARRAY_REF && typeof prop === "string" && /^\d+$/.test(prop)) {
           const index = Number(prop);
-          const ref = { offset: slot.a, count: slot.b };
+          const ref = { offset: slot.a, count: slot.b, capacity: slot.c };
           if (index >= ref.count) {
             throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
           }
@@ -498,6 +513,78 @@ function mutateValue<T, R>(
   });
 }
 
+/**
+ * Find the DataTable offset of the array-ref slot for a key's array.
+ *
+ * `prop` is null for a top-level array value, or the property name for an
+ * array property of an object. Returns null if the value is not an array.
+ */
+function findArrayRefSlot(
+  mem: SharedMemory,
+  key: string,
+  prop: string | null,
+): number | null {
+  if (prop === null) {
+    const offset = mem.lookup(key);
+    if (offset === null) return null;
+    const slot = mem.readValueSlot(offset);
+    return slot.type === TYPE_ARRAY_REF ? offset : null;
+  }
+  const layout = getObjectLayout(mem, key);
+  if (layout === null) return null;
+  const slotOffset = layout.properties.get(prop);
+  if (slotOffset === undefined) return null;
+  const slot = mem.readValueSlot(slotOffset);
+  return slot.type === TYPE_ARRAY_REF ? slotOffset : null;
+}
+
+/**
+ * O(1) in-place push/pop on a shared array ref, without decoding or
+ * re-encoding the whole array. `prop` is null for a top-level array, or the
+ * property name for an array property of an object.
+ */
+function mutateArrayRef(
+  mem: SharedMemory,
+  key: string,
+  prop: string | null,
+  method: "push" | "pop",
+  args: unknown[],
+): unknown {
+  return mem.withLock(() => {
+    const slotOffset = findArrayRefSlot(mem, key, prop);
+    if (slotOffset === null) {
+      throw new TypeError("Value is not an array");
+    }
+    const slot = mem.readValueSlot(slotOffset);
+    const ref: ArrayRef = { offset: slot.a, count: slot.b, capacity: slot.c };
+
+    if (method === "push") {
+      for (const arg of args) {
+        const next = mem.appendArraySlot(ref, encodeValue(mem, arg));
+        // Always persist the new count (and offset/capacity if moved).
+        mem.updateValueSlot(slotOffset, arrayRefSlot(next));
+        ref.offset = next.offset;
+        ref.count = next.count;
+        ref.capacity = next.capacity;
+      }
+      bump(mem, key);
+      return ref.count;
+    }
+
+    // pop
+    if (ref.count === 0) {
+      return undefined;
+    }
+    // Read the last element before decrementing.
+    const lastSlot = mem.readArraySlot(ref, ref.count - 1);
+    const result = decodeValue(mem, lastSlot);
+    const next = { offset: ref.offset, count: ref.count - 1, capacity: ref.capacity };
+    mem.updateValueSlot(slotOffset, arrayRefSlot(next));
+    bump(mem, key);
+    return result;
+  });
+}
+
 /** Get a member of a top-level array value, with read-modify-write for mutating methods. */
 function getTopLevelArrayMember(
   mem: SharedMemory,
@@ -515,6 +602,12 @@ function getTopLevelArrayMember(
   }
   if (MUTATING_METHODS.has(prop)) {
     const methodName = prop;
+    // push/pop are O(1) in-place operations on the array ref.
+    if (methodName === "push" || methodName === "pop") {
+      return (...args: unknown[]) => {
+        return mutateArrayRef(mem, key, null, methodName, args);
+      };
+    }
     return (...args: unknown[]) => {
       return mutateValue<unknown[], unknown>(mem, key, (fresh) => {
         const method = (fresh as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!;
@@ -535,6 +628,15 @@ function createArrayProxy(
 ): unknown[] {
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
+      // push/pop on an array property: operate directly on the array ref
+      // without decoding the whole object (O(1) amortized).
+      if (arrProp === "push" || arrProp === "pop") {
+        const slotOffset = findArrayRefSlot(mem, key, prop);
+        if (slotOffset !== null) {
+          return (...args: unknown[]) =>
+            mutateArrayRef(mem, key, prop, arrProp, args);
+        }
+      }
       const current = readValue(mem, key) as Record<string, unknown>;
       const arr = current[prop] as unknown[];
       if (!Array.isArray(arr)) {
@@ -550,6 +652,12 @@ function createArrayProxy(
       }
       if (MUTATING_METHODS.has(arrProp)) {
         const methodName = arrProp;
+        // push/pop are O(1) in-place operations on the array ref.
+        if (methodName === "push" || methodName === "pop") {
+          return (...args: unknown[]) => {
+            return mutateArrayRef(mem, key, prop, methodName, args);
+          };
+        }
         return (...args: unknown[]) => {
           return mutateValue<Record<string, unknown>, unknown>(
             mem,
@@ -577,7 +685,7 @@ function createArrayProxy(
             const propSlot = mem.readValueSlot(slotOffset);
             if (propSlot.type === TYPE_ARRAY_REF && typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
               const index = Number(arrProp);
-              const ref = { offset: propSlot.a, count: propSlot.b };
+              const ref = { offset: propSlot.a, count: propSlot.b, capacity: propSlot.c };
               if (index >= ref.count) {
                 throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
               }
