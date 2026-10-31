@@ -58,6 +58,6 @@ const user2 = Shared<User>('user-1', loader); // Get a wrapper to user-1 in shar
 
 ## Open Questions
 
-- How should the `SharedMemory` instance (and its buffers) be shared with worker threads? (M4) — **Resolved**: the main thread calls `shareWithWorkers()` once; it listens for new workers via `process.on("worker")` and automatically sends the shared buffers to each one. A worker simply imports the library (which installs a message wrapper at module load) and calls `Shared()` — the buffers are reconstructed automatically.
+- How should the `SharedMemory` instance (and its buffers) be shared with worker threads? (M4) — **Resolved**: both sides call `init()`. In the main thread it registers a `process.on("worker")` listener that answers buffer requests; in a worker it performs a request/response handshake (sends `{__sharedMemoryRequest:true}`, awaits the reply) and reconstructs the buffers. A worker then simply calls `Shared()` — the buffers are shared automatically.
 - Should the `Shared<T>` registry be shared across workers, or re-created per worker? (M4) — **Resolved**: the registry is per-worker (module-level in Bun). `Shared()` checks whether a key already exists in shared memory before writing the initial value, so a worker never overwrites a value created by the main thread.
 - What is the exact serialization format for structured data? (resolved by the 4-buffer architecture)

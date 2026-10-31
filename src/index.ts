@@ -9,6 +9,7 @@ export {
   getDefaultMemory,
   setDefaultMemory,
   hasDefaultMemory,
-  shareWithWorkers,
+  init,
+  stopInit,
   onMessage,
 } from "./worker.ts";

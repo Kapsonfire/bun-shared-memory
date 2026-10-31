@@ -12,7 +12,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ✅ **Reference counting & defragmentation**: workers acquire/release references to shared objects/arrays (released on GC), the main thread tracks which worker holds what, and a defragmentation pass reclaims dead space when free space is low.
 
-✅ **M4 — Worker integration**: a worker can simply call `Shared()` and automatically share the same buffers as the main thread. The main thread calls `shareWithWorkers()` once; each worker just imports the library and calls `Shared()` — no manual buffer serialization needed.
+✅ **M4 — Worker integration**: a worker can simply call `Shared()` and automatically share the same buffers as the main thread. Both sides call `init()` — the main thread answers buffer requests, each worker requests the shared buffers — no manual buffer serialization needed.
 
 ## Data Types
 
@@ -147,33 +147,38 @@ See [REFCOUNT.md](./REFCOUNT.md) for the full design.
 ## Worker integration
 
 A worker can simply call `Shared()` and automatically share the same buffers
-as the main thread — no manual buffer serialization needed.
+as the main thread — no manual buffer serialization needed. Both sides call
+`init()` to set up the handshake: the main thread answers buffer requests from
+workers, and each worker requests the shared buffers from the main thread.
 
 ```ts
 // main.ts
-import { Shared, shareWithWorkers } from "shared-memory";
+import { Shared, init } from "shared-memory";
 
 const user = Shared("user-1", { name: "Alice", age: 30 });
-shareWithWorkers();   // send the shared buffers to every new worker
+init();   // answer buffer requests from every new worker
 ```
 
 ```ts
 // worker.ts
-import { Shared, onMessage } from "shared-memory";
+import { Shared, init, onMessage } from "shared-memory";
 
-// Importing the library automatically installs a message wrapper that
-// receives the shared buffers from the main thread. Register your own
-// message handler via onMessage(); messages are buffered until the buffers
-// have arrived.
+await init();   // request the shared buffers from the main thread
+
+// Register your own message handler via onMessage(); messages are buffered
+// until the buffers have arrived.
 onMessage((e) => {
   const user = Shared("user-1", { name: "x" });  // reads the main thread's value
   self.postMessage(user.read());
 });
 ```
 
-`Shared()` never overwrites a value that already exists in shared memory, so a
-worker reading a key created by the main thread gets the existing value rather
-than its own initial value.
+`init()` is safe to call on both sides: in the main thread it registers the
+buffer-request listener, and in a worker it performs the request/response
+handshake and resolves once the buffers have arrived. `Shared()` never
+overwrites a value that already exists in shared memory, so a worker reading a
+key created by the main thread gets the existing value rather than its own
+initial value.
 
 ## Development
 

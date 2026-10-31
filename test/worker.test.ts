@@ -4,9 +4,10 @@ import {
   SharedMemory,
   getDefaultMemory,
   hasDefaultMemory,
+  init,
   onMessage,
   setDefaultMemory,
-  shareWithWorkers,
+  stopInit,
 } from "../src/index.ts";
 
 describe("Worker integration (M4)", () => {
@@ -27,17 +28,17 @@ describe("Worker integration (M4)", () => {
     setDefaultMemory(mem);
     const user = Shared("m4-worker", { name: "Alice", age: 30 }, { memory: mem });
 
-    // Main thread: share buffers with new workers automatically.
-    const stop = shareWithWorkers();
+    // Main thread: answer buffer requests from new workers.
+    await init();
 
     const workerCode = `
-      import { Shared, onMessage } from ${JSON.stringify(
+      import { Shared, init, onMessage } from ${JSON.stringify(
         new URL("../src/index.ts", import.meta.url).href,
       )};
-      // Importing the library automatically installs the message wrapper that
-      // receives the shared buffers from the main thread. Register our own
-      // handler via onMessage(); messages are buffered until the buffers have
-      // arrived.
+      // Request the shared buffers from the main thread and wait for them.
+      await init();
+      // Register our own handler via onMessage(); messages are buffered until
+      // the buffers have arrived.
       onMessage((e) => {
         if (e.data === "read") {
           // Just call Shared() — it uses the singleton initialized from the
@@ -54,7 +55,14 @@ describe("Worker integration (M4)", () => {
     );
 
     const read = await new Promise<{ name: string; age: number }>((resolve) => {
-      worker.onmessage = (e) => resolve(e.data as { name: string; age: number });
+      worker.onmessage = (e) => {
+        // Ignore the internal handshake request the worker sends to the main
+        // thread; only resolve on a real reply.
+        const data = e.data as { __sharedMemoryRequest?: boolean } | { name: string; age: number };
+        if (!("__sharedMemoryRequest" in data)) {
+          resolve(data as { name: string; age: number });
+        }
+      };
       worker.postMessage("read");
     });
 
@@ -63,13 +71,18 @@ describe("Worker integration (M4)", () => {
     // A write from the main thread is visible to the worker.
     user.write({ name: "Bob", age: 31 });
     const read2 = await new Promise<{ name: string; age: number }>((resolve) => {
-      worker.onmessage = (e) => resolve(e.data as { name: string; age: number });
+      worker.onmessage = (e) => {
+        const data = e.data as { __sharedMemoryRequest?: boolean } | { name: string; age: number };
+        if (!("__sharedMemoryRequest" in data)) {
+          resolve(data as { name: string; age: number });
+        }
+      };
       worker.postMessage("read");
     });
     expect(read2).toEqual({ name: "Bob", age: 31 });
 
     worker.terminate();
-    stop();
+    stopInit();
   });
 
   test("getDefaultMemory returns a singleton", () => {
