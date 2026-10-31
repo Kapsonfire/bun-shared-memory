@@ -150,9 +150,19 @@ const copy = user.read();   // acquires a ref; released when `copy` is GC'd
 
 // Main thread: register a worker and its close handler
 const coordinator = new RefCountCoordinator(memory);
-coordinator.registerWorker(worker);  // attaches close listener, frees refs on close
-coordinator.maybeDefragment();       // runs defragmentation if free space < 10%
+coordinator.autoRegister();  // auto-registers workers via process.on("worker")
+coordinator.maybeDefragment(); // runs defragmentation if free space < 10%
 ```
+
+### Worker registration
+
+Workers are registered automatically via Bun's `process.on("worker", ...)`
+event, which fires whenever a `Worker` is created in the process. The
+coordinator attaches a `close` listener (`worker.addEventListener("close", ...)`)
+to each worker that releases all of that worker's references on close/crash.
+
+Each worker self-allocates its worker id from the shared `RefCountBuffer`
+(`allocateWorkerId()`), which it uses for heartbeats and acquire/release events.
 
 ## Open Questions
 
@@ -163,3 +173,7 @@ coordinator.maybeDefragment();       // runs defragmentation if free space < 10%
   configurable.
 - **Heartbeat interval**: how often workers heartbeat, and the timeout before a
   silent worker's refs are reclaimed.
+- **Bun close event**: `worker.terminate()` does not fire the `close` event in
+  Bun 1.4.4; only a natural worker exit (e.g. `self.close()`) does. The
+  heartbeat is the safety net for workers that are terminated or crash without
+  a close event.

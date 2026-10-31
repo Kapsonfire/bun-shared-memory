@@ -10,6 +10,8 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ✅ **Read cache**: reads are cached per worker and invalidated cross-worker via a per-key version counter.
 
+✅ **Reference counting & defragmentation**: workers acquire/release references to shared objects/arrays (released on GC), the main thread tracks which worker holds what, and a defragmentation pass reclaims dead space when free space is low.
+
 ## Data Types
 
 - **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
@@ -113,6 +115,34 @@ const notifier = new Notifier();
 notifier.wait();      // block until notified
 notifier.notify(1);   // wake one waiting worker
 ```
+
+## Reference counting & memory reclamation
+
+The shared buffers are append-only, so dead space (overwritten strings,
+abandoned array blocks, replaced objects) is never reclaimed on its own. A
+reference-counting system tracks which workers hold references to which
+objects/arrays, and a **defragmentation** pass reclaims memory when free space
+runs low.
+
+```ts
+import { SharedMemory, RefCountCoordinator, RefCountTracker, RefCountBuffer } from "shared-memory";
+
+// Main thread: coordinate refcounts and auto-register workers.
+const mem = new SharedMemory();
+const coord = new RefCountCoordinator(mem);
+coord.autoRegister();          // track workers via process.on("worker")
+coord.drainEvents();           // process acquire/release events
+if (coord.needsDefrag()) {
+  mem.withLock(() => mem.defragment());
+}
+
+// Worker: track references acquired by read().
+const tracker = new RefCountTracker(new RefCountBuffer(refBuf), workerId);
+const user = Shared("user-1", { name: "Alice" }, { memory: mem, refCount: tracker });
+const copy = user.read();      // acquires a ref; released when `copy` is GC'd
+```
+
+See [REFCOUNT.md](./REFCOUNT.md) for the full design.
 
 ## Development
 
