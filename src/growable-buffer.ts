@@ -10,6 +10,7 @@ export class GrowableBuffer {
   readonly buffer: SharedArrayBuffer;
   private view: DataView;
   private readonly maxByteLength: number;
+  private used = 0;
 
   constructor(initialSize: number, maxByteLength: number) {
     this.buffer = new SharedArrayBuffer(initialSize, { maxByteLength });
@@ -17,8 +18,9 @@ export class GrowableBuffer {
     this.maxByteLength = maxByteLength;
   }
 
+  /** Number of bytes written so far (used length, not buffer capacity). */
   get byteLength(): number {
-    return this.buffer.byteLength;
+    return this.used;
   }
 
   /** Ensure the buffer has room for at least `needed` bytes. */
@@ -34,6 +36,11 @@ export class GrowableBuffer {
     if (newSize > this.maxByteLength) newSize = this.maxByteLength;
     this.buffer.grow(newSize);
     this.view = new DataView(this.buffer);
+  }
+
+  /** Mark `n` bytes as used, after writing them at the current offset. */
+  advance(n: number): void {
+    this.used += n;
   }
 
   getView(): DataView {

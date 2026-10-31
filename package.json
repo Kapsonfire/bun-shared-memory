@@ -8,7 +8,8 @@
   },
   "scripts": {
     "typecheck": "bun check",
-    "test": "bun test"
+    "test": "bun test",
+    "bench": "bun bench/bench.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

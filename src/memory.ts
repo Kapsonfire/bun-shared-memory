@@ -173,6 +173,7 @@ export class SharedMemory {
     for (let i = 0; i < bytes.byteLength; i++) {
       view.setUint8(offset + i, bytes[i]!);
     }
+    this.stringTable.advance(bytes.byteLength);
     return { offset, length: bytes.byteLength };
   }
 
@@ -196,6 +197,7 @@ export class SharedMemory {
     for (let i = 0; i < count; i++) {
       writeSlot(view, (offset + i) * SLOT_SIZE, slots[i]!);
     }
+    this.arrayTable.advance(count * SLOT_SIZE);
     return { offset, count };
   }
 
@@ -218,6 +220,7 @@ export class SharedMemory {
     const offset = this.dataTable.byteLength;
     this.dataTable.ensureCapacity(offset + SLOT_SIZE);
     writeSlot(this.dataTable.getView(), offset, slot);
+    this.dataTable.advance(SLOT_SIZE);
     return offset;
   }
 
@@ -255,6 +258,7 @@ export class SharedMemory {
       writeSlot(view, cursor, slot);
       cursor += SLOT_SIZE;
     }
+    this.dataTable.advance(blockSize);
     return offset;
   }
 
@@ -314,6 +318,7 @@ export class SharedMemory {
     view.setInt32(entryOffset + 4, keyRef.length, true);
     view.setInt32(entryOffset + 8, dataOffset, true);
     view.setInt32(0, count + 1, true);
+    this.indexTable.advance(INDEX_ENTRY_SIZE);
   }
 }
 

@@ -94,4 +94,17 @@ bun install        # install dependencies
 bun run typecheck  # type check (bun check)
 bun test           # run tests
 bun fmt            # format code
+bun run bench      # run benchmarks
 ```
+
+## Benchmarks
+
+`bun run bench` compares shared-memory access against native JS access for
+every supported data type and its arrays:
+
+- **Primitives**: `number`, `string`, `boolean`, `bigint` (read + write)
+- **Arrays**: `number[]`, `string[]`, `boolean[]`, `bigint[]`, `mixed[]` (index read, index write, push)
+- **Objects**: property read/write and array-property access
+
+Each benchmark reports ops/sec for the native and shared paths, plus the
+relative slowdown. Results are in `bench/`.

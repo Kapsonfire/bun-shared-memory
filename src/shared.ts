@@ -77,7 +77,7 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
  * mutating methods (push, pop, splice, ...) work directly. All access is
  * synchronized with an Atomics-based lock.
  */
-export type SharedRef<T> = T extends object
+export type SharedRef<T> = [T] extends [object]
   ? T & {
       read(): T;
       write(value: T): void;
