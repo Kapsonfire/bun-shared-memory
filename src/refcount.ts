@@ -274,6 +274,39 @@ export class RefCountCoordinator {
       free(this.mem.stringTable) < this.defragThreshold
     );
   }
+
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Start periodic maintenance on the main thread.
+   *
+   * Every `intervalMs` milliseconds this:
+   *   1. drains pending acquire/release events from the ring buffer, and
+   *   2. runs a defragmentation pass if any table has less than
+   *      `defragThreshold` free space.
+   *
+   * This is what actually reclaims SAB memory: without it, refcount events
+   * accumulate unprocessed and dead space is never compacted. Returns a
+   * function that stops the timer.
+   */
+  startAutoMaintenance(intervalMs = 100): () => void {
+    if (this.maintenanceTimer !== null) return () => {};
+    this.maintenanceTimer = setInterval(() => {
+      this.drainEvents();
+      if (this.needsDefrag()) {
+        this.mem.withLock(() => this.mem.defragment());
+      }
+    }, intervalMs);
+    return () => this.stopAutoMaintenance();
+  }
+
+  /** Stop the periodic maintenance timer, if running. */
+  stopAutoMaintenance(): void {
+    if (this.maintenanceTimer !== null) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+  }
 }
 
 /**

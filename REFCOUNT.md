@@ -151,8 +151,23 @@ const copy = user.read();   // acquires a ref; released when `copy` is GC'd
 // Main thread: register a worker and its close handler
 const coordinator = new RefCountCoordinator(memory);
 coordinator.autoRegister();  // auto-registers workers via process.on("worker")
-coordinator.maybeDefragment(); // runs defragmentation if free space < 10%
+coordinator.startAutoMaintenance(); // drains events + defragments periodically
 ```
+
+### Automatic maintenance
+
+`startAutoMaintenance(intervalMs = 100)` starts a periodic timer on the main
+thread that, every `intervalMs` milliseconds:
+
+1. **Drains** pending acquire/release events from the ring buffer
+   (`drainEvents()`), so refcounts stay in sync with what workers actually hold.
+2. **Defragments** if any table has less than `defragThreshold` (default 10%)
+   free space (`needsDefrag()` → `defragment()`), reclaiming dead SAB memory.
+
+Without this, refcount events accumulate unprocessed and dead space is never
+compacted. The returned function stops the timer. `needsDefrag()` is also
+available for manual checks, and `defragment()` can be called directly under
+`withLock`.
 
 ### Worker registration
 

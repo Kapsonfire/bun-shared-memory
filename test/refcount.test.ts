@@ -225,4 +225,28 @@ describe("RefCount across workers", () => {
     expect(coord.refCount(objectId)).toBe(0);
     stop();
   });
+
+  test("auto maintenance drains events and defragments on demand", async () => {
+    const mem = new SharedMemory();
+    const buf = new RefCountBuffer();
+    const coord = new RefCountCoordinator(mem, buf);
+    const workerId = coord.registerWorker({});
+
+    // Push an acquire event directly into the ring buffer (as a worker would).
+    const objectId = 1;
+    buf.pushEvent(workerId, 1, objectId);
+    expect(coord.refCount(objectId)).toBe(0);
+
+    const stop = coord.startAutoMaintenance(5);
+    // Wait for the timer to drain the event.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(coord.refCount(objectId)).toBe(1);
+
+    // Push a release event; it should be drained too.
+    buf.pushEvent(workerId, 0, objectId);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(coord.refCount(objectId)).toBe(0);
+
+    stop();
+  });
 });
