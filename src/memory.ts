@@ -169,6 +169,12 @@ export class SharedMemory {
   readonly versionTable: GrowableBuffer;
   /** Cached Int32Array view over the version table (rebuilt on growth). */
   private versionView: Int32Array;
+  /**
+   * Global layout version cell. Bumped by the main thread after a
+   * defragmentation pass so workers can invalidate cached offsets (indexCache,
+   * layoutCache, propCache, readCache, internCache).
+   */
+  readonly layoutVersion: Int32Array;
   /** Cross-worker mutex protecting all read/write operations. */
   readonly lock: Mutex;
 
@@ -208,6 +214,7 @@ export class SharedMemory {
       stringTable?: SharedArrayBuffer;
       arrayTable?: SharedArrayBuffer;
       versionTable?: SharedArrayBuffer;
+      layoutVersion?: SharedArrayBuffer;
     };
   }) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
@@ -234,6 +241,9 @@ export class SharedMemory {
       max,
     );
     this.versionView = new Int32Array(this.versionTable.buffer);
+    this.layoutVersion = new Int32Array(
+      buffers?.layoutVersion ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+    );
     this.lock = options?.lock ?? new Mutex();
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
     this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
@@ -597,6 +607,202 @@ export class SharedMemory {
     Atomics.store(this.versionView, count, 0);
     this.versionTable.advance(Int32Array.BYTES_PER_ELEMENT);
   }
+
+  // ---------------------------------------------------------------------------
+  // Layout version (cache invalidation)
+  // ---------------------------------------------------------------------------
+
+  /** Read the current global layout version (lock-free). */
+  getLayoutVersion(): number {
+    return Atomics.load(this.layoutVersion, 0);
+  }
+
+  /** Bump the global layout version, invalidating all per-worker caches. */
+  bumpLayoutVersion(): void {
+    Atomics.add(this.layoutVersion, 0, 1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Defragmentation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compact the DataTable, ArrayTable, and StringTable, reclaiming dead space.
+   *
+   * Live data is everything reachable from the Index Table (every key's value,
+   * its object properties, and the strings/arrays they reference). Dead space
+   * (overwritten strings, abandoned array blocks from `moveArray`, and
+   * abandoned object blocks) is reclaimed by moving live data to the front of
+   * each buffer and resetting the used length.
+   *
+   * All references (Index Table offsets, object property names, string slots,
+   * array slots) are remapped in a single pass. The global layout version is
+   * bumped at the end so workers invalidate their cached offsets.
+   *
+   * Must be called under the shared lock (or on a single thread).
+   */
+  defragment(): void {
+    const stringRemap = new Map<number, number>();
+    const arrayRemap = new Map<number, number>();
+    const objectRemap = new Map<number, number>();
+    const liveStrings = new Set<number>();
+    const liveArrays = new Set<number>();
+    const liveObjects = new Set<number>();
+    const liveDataOffsets = new Set<number>();
+
+    const markString = (offset: number) => liveStrings.add(offset);
+
+    const markValueSlot = (slot: ValueSlot) => {
+      switch (slot.type) {
+        case TYPE_STRING_REF:
+        case TYPE_BIGINT_STR:
+          liveStrings.add(slot.a);
+          break;
+        case TYPE_ARRAY_REF:
+          markArray(slot.a, slot.b);
+          break;
+      }
+    };
+
+    const markArray = (offset: number, count: number) => {
+      if (liveArrays.has(offset)) return;
+      liveArrays.add(offset);
+      const view = this.arrayTable.getView();
+      for (let i = 0; i < count; i++) {
+        markValueSlot(readSlot(view, offset + ARRAY_HEADER + i * SLOT_SIZE));
+      }
+    };
+
+    const markObject = (offset: number) => {
+      if (liveObjects.has(offset)) return;
+      liveObjects.add(offset);
+      liveDataOffsets.add(offset);
+      const view = this.dataTable.getView();
+      const count = view.getInt32(offset + 4, true);
+      let cursor = offset + OBJECT_HEADER;
+      for (let i = 0; i < count; i++) {
+        const nameOffset = view.getInt32(cursor, true);
+        const nameLength = view.getInt32(cursor + 4, true);
+        liveStrings.add(nameOffset);
+        cursor += NAME_REF_SIZE;
+        markValueSlot(readSlot(view, cursor));
+        cursor += SLOT_SIZE;
+      }
+    };
+
+    const markValue = (dataOffset: number) => {
+      const view = this.dataTable.getView();
+      if (view.getInt32(dataOffset, true) === TYPE_OBJECT) {
+        markObject(dataOffset);
+      } else {
+        liveDataOffsets.add(dataOffset);
+        markValueSlot(readSlot(view, dataOffset));
+      }
+    };
+
+    // Phase 1: Mark live data by walking the Index Table.
+    const indexView = this.indexTable.getView();
+    const indexCount = indexView.getInt32(0, true);
+    const indexEntries: Array<{ keyRef: StringRef; dataOffset: number }> = [];
+    for (let i = 0; i < indexCount; i++) {
+      const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
+      const keyRef = {
+        offset: indexView.getInt32(entryOffset, true),
+        length: indexView.getInt32(entryOffset + 4, true),
+      };
+      const dataOffset = indexView.getInt32(entryOffset + 8, true);
+      indexEntries.push({ keyRef, dataOffset });
+      liveStrings.add(keyRef.offset);
+      markValue(dataOffset);
+    }
+
+    // Phase 2: Compact the DataTable (objects and single value slots).
+    const sortedData = [...liveDataOffsets].sort((a, b) => a - b);
+    let newDataOffset = 0;
+    const dataView = this.dataTable.getView();
+    for (const oldOffset of sortedData) {
+      const size =
+        dataView.getInt32(oldOffset, true) === TYPE_OBJECT
+          ? OBJECT_HEADER +
+            dataView.getInt32(oldOffset + 4, true) * (NAME_REF_SIZE + SLOT_SIZE)
+          : SLOT_SIZE;
+      copyBytes(dataView, newDataOffset, oldOffset, size);
+      objectRemap.set(oldOffset, newDataOffset);
+      newDataOffset += size;
+    }
+    this.dataTable.reset(newDataOffset);
+
+    // Phase 3: Compact the ArrayTable.
+    const sortedArrays = [...liveArrays].sort((a, b) => a - b);
+    let newArrayOffset = 0;
+    const arrayView = this.arrayTable.getView();
+    for (const oldOffset of sortedArrays) {
+      // Determine the array's capacity by scanning forward to the next live
+      // array or the end of the used region.
+      const next = sortedArrays[sortedArrays.indexOf(oldOffset) + 1];
+      const end = next !== undefined ? next : this.arrayTable.byteLength;
+      const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
+      copyBytes(arrayView, newArrayOffset, oldOffset, ARRAY_HEADER + capacity * SLOT_SIZE);
+      arrayRemap.set(oldOffset, newArrayOffset);
+      newArrayOffset += ARRAY_HEADER + capacity * SLOT_SIZE;
+    }
+    this.arrayTable.reset(newArrayOffset);
+
+    // Phase 4: Compact the StringTable.
+    const sortedStrings = [...liveStrings].sort((a, b) => a - b);
+    let newStringOffset = 0;
+    const stringView = this.stringTable.getView();
+    for (const oldOffset of sortedStrings) {
+      const next = sortedStrings[sortedStrings.indexOf(oldOffset) + 1];
+      const end = next !== undefined ? next : this.stringTable.byteLength;
+      const length = end - oldOffset;
+      copyBytes(stringView, newStringOffset, oldOffset, length);
+      stringRemap.set(oldOffset, newStringOffset);
+      newStringOffset += length;
+    }
+    this.stringTable.reset(newStringOffset);
+
+    // Phase 5: Rewrite the Index Table with remapped key strings and offsets.
+    for (let i = 0; i < indexCount; i++) {
+      const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
+      const { keyRef, dataOffset } = indexEntries[i]!;
+      indexView.setInt32(entryOffset, stringRemap.get(keyRef.offset)!, true);
+      indexView.setInt32(entryOffset + 4, keyRef.length, true);
+      indexView.setInt32(entryOffset + 8, objectRemap.get(dataOffset)!, true);
+    }
+
+    // Phase 6: Rewrite object property names and value slots, and array slots.
+    for (const oldOffset of sortedData) {
+      if (dataView.getInt32(oldOffset, true) !== TYPE_OBJECT) continue;
+      const newOff = objectRemap.get(oldOffset)!;
+      const count = dataView.getInt32(newOff + 4, true);
+      let cursor = newOff + OBJECT_HEADER;
+      for (let i = 0; i < count; i++) {
+        const nameOffset = dataView.getInt32(cursor, true);
+        dataView.setInt32(cursor, stringRemap.get(nameOffset)!, true);
+        cursor += NAME_REF_SIZE;
+        remapSlot(dataView, cursor, stringRemap, arrayRemap);
+        cursor += SLOT_SIZE;
+      }
+    }
+    for (const oldOffset of sortedData) {
+      if (dataView.getInt32(oldOffset, true) === TYPE_OBJECT) continue;
+      const newOff = objectRemap.get(oldOffset)!;
+      remapSlot(dataView, newOff, stringRemap, arrayRemap);
+    }
+    for (const oldOffset of sortedArrays) {
+      const newOff = arrayRemap.get(oldOffset)!;
+      const next = sortedArrays[sortedArrays.indexOf(oldOffset) + 1];
+      const end = next !== undefined ? next : this.arrayTable.byteLength;
+      const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
+      for (let i = 0; i < capacity; i++) {
+        remapSlot(arrayView, newOff + ARRAY_HEADER + i * SLOT_SIZE, stringRemap, arrayRemap);
+      }
+    }
+
+    // Phase 7: Invalidate all per-worker caches.
+    this.bumpLayoutVersion();
+  }
 }
 
 function writeSlot(view: DataView, offset: number, slot: ValueSlot): void {
@@ -613,4 +819,30 @@ function readSlot(view: DataView, offset: number): ValueSlot {
     b: view.getInt32(offset + 8, true),
     c: view.getInt32(offset + 12, true),
   };
+}
+
+/** Copy `len` bytes from `src` to `dst` in the same buffer (dst <= src). */
+function copyBytes(view: DataView, dst: number, src: number, len: number): void {
+  for (let i = 0; i < len; i++) {
+    view.setUint8(dst + i, view.getUint8(src + i));
+  }
+}
+
+/**
+ * Rewrite a value slot's string/array references after compaction, in place.
+ * String refs and bigint-str refs are remapped via `stringRemap`; array refs
+ * via `arrayRemap`.
+ */
+function remapSlot(
+  view: DataView,
+  offset: number,
+  stringRemap: Map<number, number>,
+  arrayRemap: Map<number, number>,
+): void {
+  const type = view.getInt32(offset, true);
+  if (type === TYPE_STRING_REF || type === TYPE_BIGINT_STR) {
+    view.setInt32(offset + 4, stringRemap.get(view.getInt32(offset + 4, true))!, true);
+  } else if (type === TYPE_ARRAY_REF) {
+    view.setInt32(offset + 4, arrayRemap.get(view.getInt32(offset + 4, true))!, true);
+  }
 }

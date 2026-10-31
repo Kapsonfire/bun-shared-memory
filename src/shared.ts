@@ -14,6 +14,7 @@ import {
   type StringRef,
   type ValueSlot,
 } from "./memory.ts";
+import type { RefCountTracker } from "./refcount.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -157,6 +158,29 @@ function getOffset(mem: SharedMemory, key: string): number | null {
   return mem.lookupByIndex(index);
 }
 
+/** Whether a decoded value is a reference-countable object/array. */
+function isTrackable(value: unknown): boolean {
+  return value !== null && typeof value === "object";
+}
+
+/**
+ * Get the stable objectId of a key's top-level value, or null if it is a
+ * primitive (which is stored inline and not reference-counted).
+ */
+function getTopLevelObjectId(mem: SharedMemory, key: string): number | null {
+  const offset = getOffset(mem, key);
+  if (offset === null) return null;
+  const type = mem.dataTable.getView().getInt32(offset, true);
+  if (type === 5) {
+    return mem.getObjectId(offset);
+  }
+  const slot = mem.readValueSlot(offset);
+  if (slot.type === TYPE_ARRAY_REF) {
+    return mem.getArrayObjectId(slot.a);
+  }
+  return null;
+}
+
 /**
  * Per-worker cache of decoded object properties: key -> { version, props }.
  *
@@ -212,6 +236,11 @@ export interface SharedOptions {
    * to access the same buffers.
    */
   memory?: SharedMemory;
+  /**
+   * A worker-side reference-count tracker. When provided, `read()` acquires a
+   * reference to the returned object/array, released when it is GC'd.
+   */
+  refCount?: RefCountTracker;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -247,7 +276,7 @@ export function Shared<T>(
   if (existing) return existing as SharedRef<T>;
 
   const mem = options.memory ?? new SharedMemory(options);
-  const ref = createSharedRef<T>(mem, key);
+  const ref = createSharedRef<T>(mem, key, options.refCount);
   registry.set(key, ref as SharedRef<unknown>);
 
   if (typeof initialOrLoader === "function") {
@@ -262,11 +291,22 @@ export function Shared<T>(
 }
 
 /** Create a SharedRef proxy backed by a SharedMemory instance. */
-function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
+function createSharedRef<T>(
+  mem: SharedMemory,
+  key: string,
+  tracker?: RefCountTracker,
+): SharedRef<T> {
   const target = {
     key,
     mem,
-    read: () => copyValue(readValue(mem, key)) as T,
+    read: () => {
+      const value = copyValue(readValue(mem, key)) as T;
+      if (tracker && isTrackable(value)) {
+        const objectId = getTopLevelObjectId(mem, key);
+        if (objectId !== null) tracker.track(value as object, objectId);
+      }
+      return value;
+    },
     write: (value: T) => writeValue(mem, key, value),
     update: (fn: (current: T) => T) => updateValue(mem, key, fn),
   };

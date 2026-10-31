@@ -49,6 +49,16 @@ export class GrowableBuffer {
     this.used += n;
   }
 
+  /**
+   * Reset the used length to `n` bytes. Used by defragmentation after
+   * compacting live data to the front of the buffer. The underlying
+   * SharedArrayBuffer is not shrunk (it cannot be), but the tail beyond `n`
+   * is treated as free space for future writes.
+   */
+  reset(n: number): void {
+    this.used = n;
+  }
+
   getView(): DataView {
     return this.view;
   }

@@ -31,6 +31,8 @@ export interface ObjectId {
 
 /** An acquire/release event sent from a worker to the main thread. */
 export interface RefEvent {
+  /** The worker that sent the event. */
+  workerId: number;
   /** 1 = acquire, 0 = release. */
   op: 0 | 1;
   /** The objectId being acquired or released. */
@@ -44,8 +46,8 @@ export interface RefEvent {
  * Layout (all Int32):
  *   [0]        write index (producer, workers)
  *   [1]        read index (consumer, main thread)
- *   [2]        event count (number of queued events)
- *   [3..]      ring buffer of events (op, objectId pairs)
+ *   [2]        next worker id (allocated by workers)
+ *   [3..]      ring buffer of events (workerId, op, objectId triples)
  *   [ringEnd..] heartbeat table (one cell per worker)
  *   [hbEnd..]   global refcount table (one cell per objectId)
  */
@@ -64,7 +66,7 @@ export class RefCountBuffer {
     const maxWorkers = opts.maxWorkers ?? 64;
     const maxObjects = opts.maxObjects ?? 1 << 16;
     this.ringSize = ringSize;
-    this.hbOffset = 3 + ringSize * 2;
+    this.hbOffset = 3 + ringSize * 3;
     this.refOffset = this.hbOffset + maxWorkers;
     const total = this.refOffset + maxObjects;
     this.buffer =
@@ -77,17 +79,26 @@ export class RefCountBuffer {
     return this.buffer;
   }
 
+  /**
+   * Allocate a unique worker id (worker side). Each worker calls this once to
+   * obtain its id, which it uses for heartbeats and events.
+   */
+  allocateWorkerId(): number {
+    return Atomics.add(this.view, 2, 1);
+  }
+
   /** Append an acquire/release event to the ring buffer (worker side). */
-  pushEvent(op: 0 | 1, objectId: number): void {
+  pushEvent(workerId: number, op: 0 | 1, objectId: number): void {
     const write = Atomics.load(this.view, 0);
     const read = Atomics.load(this.view, 1);
     if (write - read >= this.ringSize) {
       // Ring full; drop the event (main thread will reconcile via heartbeat).
       return;
     }
-    const base = 3 + (write % this.ringSize) * 2;
-    Atomics.store(this.view, base, op);
-    Atomics.store(this.view, base + 1, objectId);
+    const base = 3 + (write % this.ringSize) * 3;
+    Atomics.store(this.view, base, workerId);
+    Atomics.store(this.view, base + 1, op);
+    Atomics.store(this.view, base + 2, objectId);
     Atomics.store(this.view, 0, write + 1);
   }
 
@@ -96,16 +107,22 @@ export class RefCountBuffer {
     const read = Atomics.load(this.view, 1);
     const write = Atomics.load(this.view, 0);
     if (read >= write) return null;
-    const base = 3 + (read % this.ringSize) * 2;
-    const op = Atomics.load(this.view, base) as 0 | 1;
-    const objectId = Atomics.load(this.view, base + 1);
+    const base = 3 + (read % this.ringSize) * 3;
+    const workerId = Atomics.load(this.view, base);
+    const op = Atomics.load(this.view, base + 1) as 0 | 1;
+    const objectId = Atomics.load(this.view, base + 2);
     Atomics.store(this.view, 1, read + 1);
-    return { op, objectId };
+    return { workerId, op, objectId };
   }
 
-  /** Update this worker's heartbeat cell. */
+  /**
+   * Update this worker's heartbeat cell. Uses a monotonic counter that fits in
+   * an Int32 (Date.now() overflows Int32), so the main thread can detect a
+   * worker that stopped heartbeating.
+   */
   heartbeat(workerId: number): void {
-    Atomics.store(this.view, this.hbOffset + workerId, Date.now());
+    const prev = Atomics.load(this.view, this.hbOffset + workerId);
+    Atomics.store(this.view, this.hbOffset + workerId, (prev + 1) | 0);
   }
 
   /** Read a worker's last heartbeat timestamp. */
@@ -159,14 +176,40 @@ export class RefCountCoordinator {
   }
 
   /** Register a worker and attach a close listener that frees its refs. */
-  registerWorker(worker: { onclose?: (() => void) | null }): number {
+  registerWorker(worker: {
+    onclose?: (() => void) | null;
+    addEventListener?: (type: string, fn: () => void) => void;
+  }): number {
     const workerId = this.nextWorkerId++;
     this.workerRefs.set(workerId, new Set());
     const release = () => this.releaseWorker(workerId);
-    if (typeof worker.onclose === "function") {
+    if (typeof worker.addEventListener === "function") {
+      worker.addEventListener("close", release);
+    } else if (worker.onclose !== undefined) {
       worker.onclose = release;
     }
     return workerId;
+  }
+
+  /**
+   * Automatically register workers as they are created.
+   *
+   * In Bun, `process.on("worker", ...)` fires whenever a Worker is created in
+   * this process, passing the Worker instance. This lets the coordinator track
+   * every worker without the caller manually calling `registerWorker`. The
+   * worker's `onclose` handler is set to release all of its references on
+   * close/crash.
+   *
+   * Returns a function that removes the listener.
+   */
+  autoRegister(): () => void {
+    const listener = (worker: { onclose?: (() => void) | null }) => {
+      this.registerWorker(worker);
+    };
+    process.on("worker", listener);
+    return () => {
+      process.off("worker", listener);
+    };
   }
 
   /** Release all references held by a worker (e.g. on close/crash). */
@@ -206,31 +249,18 @@ export class RefCountCoordinator {
     }
   }
 
+  /** Read the global refcount for an objectId. */
+  refCount(objectId: number): number {
+    return this.buffer.refCount(objectId);
+  }
+
   /** Drain pending acquire/release events from the ring buffer. */
   drainEvents(): void {
     let ev: RefEvent | null;
     while ((ev = this.buffer.popEvent()) !== null) {
-      // Events don't carry a workerId; the coordinator reconciles via the
-      // worker's heartbeat/registration. For simplicity, events are attributed
-      // to the most recently active worker.
-      const workerId = this.mostRecentWorker();
-      if (workerId === -1) continue;
-      if (ev.op === 1) this.acquire(ev.objectId, workerId);
-      else this.release(ev.objectId, workerId);
+      if (ev.op === 1) this.acquire(ev.objectId, ev.workerId);
+      else this.release(ev.objectId, ev.workerId);
     }
-  }
-
-  private mostRecentWorker(): number {
-    let best = -1;
-    let bestTime = -1;
-    for (const [id] of this.workerRefs) {
-      const t = this.buffer.lastHeartbeat(id);
-      if (t > bestTime) {
-        bestTime = t;
-        best = id;
-      }
-    }
-    return best;
   }
 
   /** Whether any table has less than `defragThreshold` free space. */
@@ -259,13 +289,13 @@ export class RefCountTracker {
     this.buffer = buffer;
     this.workerId = workerId;
     this.registry = new FinalizationRegistry((objectId) => {
-      this.buffer.pushEvent(0, objectId);
+      this.buffer.pushEvent(this.workerId, 0, objectId);
     });
   }
 
   /** Register a returned JS object/array so its ref is released on GC. */
   track(value: object, objectId: number): void {
-    this.buffer.pushEvent(1, objectId);
+    this.buffer.pushEvent(this.workerId, 1, objectId);
     this.registry.register(value, objectId);
   }
 
