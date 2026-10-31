@@ -29,13 +29,28 @@ Key entry points:
 ## Benchmark documentation (BENCH.md)
 
 `BENCH.md` contains a running, chronological table of benchmark results. For
-every codebase change that affects performance:
+**every** codebase change (even ones expected to have no performance impact):
 
 - Run `bun run bench`.
 - Add a new row to the table in `BENCH.md` with:
   - a date/commit reference,
   - a short description of the change,
-  - the measured results (or a summary of the key numbers).
+  - the measured results (or a summary of the key numbers),
+  - the `Δ vs prev` delta compared to the previous row.
+
+### Delta convention
+
+The `Δ vs prev` column compares each row against the previous version:
+
+- `+X%` = performance gain (faster)
+- `-X%` = performance loss (slower)
+- `0%` = no measurable change
+- `±<5% (Varianz)` = change under 5% is treated as test variance, not a real
+  change. Document it as such rather than as a gain/loss.
+
+Always record the actual measured numbers, even when the delta is expected to
+be zero. If the benchmark shows high variance, run it longer or more times to
+reduce noise before recording the result.
 
 Keep the table append-only so the history of performance changes is preserved.
 
