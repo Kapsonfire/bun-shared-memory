@@ -144,3 +144,10 @@ Array `push`/`pop` are O(1) amortized in-place operations: arrays reserve
 capacity padding in the ArrayTable, `push` writes into the padding until it is
 exhausted (then the array is relocated with doubled capacity), and `pop` just
 decrements the length.
+
+**String interning**: repeated writes of the same string reuse a cached
+StringTable reference instead of re-encoding and re-copying the bytes. The
+per-worker LRU cache grows dynamically (configurable via `internCapacity` /
+`internMax` on `SharedMemory`) and evicts least-recently-used entries once it
+reaches capacity. Because the StringTable is append-only, cached references stay
+valid for the lifetime of the buffer.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Shared } from "../src/index.ts";
+import { Shared, SharedMemory } from "../src/index.ts";
 
 describe("Shared", () => {
   test("creates a shared value from an initial value", () => {
@@ -221,5 +221,33 @@ describe("Shared", () => {
     copy.name = "Mutated";
     // The cache must be unaffected by mutating the returned copy.
     expect(user.name).toBe("Alice");
+  });
+});
+
+describe("SharedMemory string interning", () => {
+  test("repeated storeString calls reuse the same StringTable ref", () => {
+    const mem = new SharedMemory();
+    const r1 = mem.storeString("hello");
+    const r2 = mem.storeString("hello");
+    expect(r2.offset).toBe(r1.offset);
+    expect(r2.length).toBe(r1.length);
+    // The StringTable must not grow on a cache hit.
+    expect(mem.stringTable.byteLength).toBe(r1.length);
+  });
+
+  test("distinct strings get distinct refs", () => {
+    const mem = new SharedMemory();
+    const a = mem.storeString("alpha");
+    const b = mem.storeString("beta");
+    expect(a.offset).not.toBe(b.offset);
+  });
+
+  test("clearInternCache forces re-encoding", () => {
+    const mem = new SharedMemory();
+    const r1 = mem.storeString("hello");
+    mem.clearInternCache();
+    const r2 = mem.storeString("hello");
+    // After clearing, the string is re-encoded at a new offset.
+    expect(r2.offset).not.toBe(r1.offset);
   });
 });

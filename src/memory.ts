@@ -52,6 +52,8 @@ const INDEX_HEADER = 4;
 
 const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
+const DEFAULT_INTERN_CAPACITY = 256;
+const DEFAULT_INTERN_MAX = 1 << 16; // 65536 entries
 
 /**
  * Reusable DataView for packing/unpacking 64-bit values (number, bigint) into
@@ -167,10 +169,26 @@ export class SharedMemory {
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
 
+  /**
+   * LRU cache mapping interned strings to their stable StringTable refs.
+   * Per-worker (each worker has its own module instance). Refs are stable
+   * because the StringTable is append-only, so a cached ref stays valid.
+   * Grows dynamically up to `internMax`; evicts least-recently-used entries
+   * beyond `internCapacity`.
+   */
+  private readonly internCache = new Map<string, StringRef>();
+  private internCapacity: number;
+  private readonly internMax: number;
+  /** Fast path: the most recently interned string and its ref. */
+  private lastInterned: string | undefined;
+  private lastInternedRef: StringRef | undefined;
+
   constructor(options?: {
     initialSize?: number;
     maxByteLength?: number;
     lock?: Mutex;
+    internCapacity?: number;
+    internMax?: number;
     buffers?: {
       indexTable?: SharedArrayBuffer;
       dataTable?: SharedArrayBuffer;
@@ -204,6 +222,8 @@ export class SharedMemory {
     );
     this.versionView = new Int32Array(this.versionTable.buffer);
     this.lock = options?.lock ?? new Mutex();
+    this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
+    this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
   }
 
   /** Run `fn` while holding the shared lock. */
@@ -215,8 +235,32 @@ export class SharedMemory {
   // StringTable
   // ---------------------------------------------------------------------------
 
-  /** Append a string to the StringTable and return its reference. */
+  /**
+   * Append a string to the StringTable and return its reference.
+   *
+   * Interns the string in a per-worker LRU cache: repeated writes of the same
+   * string reuse the existing StringTable ref instead of re-encoding and
+   * re-copying the bytes. The cache grows dynamically up to `internMax` and
+   * evicts the least-recently-used entry once it exceeds `internCapacity`.
+   */
   storeString(value: string): StringRef {
+    // Fast path: the same string as the previous call reuses its ref without
+    // touching the LRU map (avoids the expensive delete+set on every hit).
+    if (value === this.lastInterned) {
+      return this.lastInternedRef!;
+    }
+
+    const cached = this.internCache.get(value);
+    if (cached !== undefined) {
+      // Refresh LRU position (Map preserves insertion order; re-insert moves
+      // the entry to the most-recently-used end).
+      this.internCache.delete(value);
+      this.internCache.set(value, cached);
+      this.lastInterned = value;
+      this.lastInternedRef = cached;
+      return cached;
+    }
+
     const bytes = this.encoder.encode(value);
     const offset = this.stringTable.byteLength;
     this.stringTable.ensureCapacity(offset + bytes.byteLength);
@@ -225,7 +269,35 @@ export class SharedMemory {
       view.setUint8(offset + i, bytes[i]!);
     }
     this.stringTable.advance(bytes.byteLength);
-    return { offset, length: bytes.byteLength };
+    const ref: StringRef = { offset, length: bytes.byteLength };
+
+    // Insert into the cache, growing capacity up to `internMax` before evicting.
+    if (this.internCache.size >= this.internCapacity) {
+      if (this.internCapacity < this.internMax) {
+        this.internCapacity = Math.min(this.internCapacity * 2, this.internMax);
+      } else {
+        // Evict the least-recently-used entry (first in insertion order).
+        const oldest = this.internCache.keys().next().value;
+        if (oldest !== undefined) this.internCache.delete(oldest);
+      }
+    }
+    this.internCache.set(value, ref);
+    this.lastInterned = value;
+    this.lastInternedRef = ref;
+    return ref;
+  }
+
+  /**
+   * Clear the per-worker string interning cache.
+   *
+   * Call this if the StringTable is ever compacted/defragmented (which would
+   * invalidate cached refs). The cache is repopulated lazily on the next
+   * `storeString` calls.
+   */
+  clearInternCache(): void {
+    this.internCache.clear();
+    this.lastInterned = undefined;
+    this.lastInternedRef = undefined;
   }
 
   /** Read a string from the StringTable by reference. */
