@@ -39,7 +39,9 @@ describe("RefCountBuffer", () => {
 describe("RefCountCoordinator", () => {
   test("tracks which worker holds a reference", () => {
     const mem = new SharedMemory();
-    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
+    const coord = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: false,
+    });
     const workerId = coord.registerWorker({});
     coord.acquire(1, workerId);
     expect(coord.refCount(1)).toBe(1);
@@ -49,7 +51,9 @@ describe("RefCountCoordinator", () => {
 
   test("releases all refs when a worker closes", () => {
     const mem = new SharedMemory();
-    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
+    const coord = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: false,
+    });
     const worker = { onclose: null as (() => void) | null };
     const workerId = coord.registerWorker(worker);
     coord.acquire(1, workerId);
@@ -88,8 +92,16 @@ describe("RefCountTracker", () => {
 describe("Defragmentation", () => {
   test("reclaims dead space while preserving all values", () => {
     const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
-    const a = Shared("a", { name: "alpha", tags: ["x", "y", "z"] }, { memory: mem });
-    const b = Shared("b", { name: "beta", nums: [1, 2, 3, 4, 5] }, { memory: mem });
+    const a = Shared(
+      "a",
+      { name: "alpha", tags: ["x", "y", "z"] },
+      { memory: mem },
+    );
+    const b = Shared(
+      "b",
+      { name: "beta", nums: [1, 2, 3, 4, 5] },
+      { memory: mem },
+    );
     const c = Shared("c", "gamma", { memory: mem });
 
     // Overwrite to create dead space (abandoned array blocks and strings).
@@ -191,8 +203,14 @@ describe("Defragmentation", () => {
 describe("RefCount across workers", () => {
   test("a worker's refs are released when it closes", async () => {
     const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
-    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
-    const user = Shared("rc-worker-1", { name: "Alice", age: 30 }, { memory: mem });
+    const coord = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: false,
+    });
+    const user = Shared(
+      "rc-worker-1",
+      { name: "Alice", age: 30 },
+      { memory: mem },
+    );
 
     const workerCode = `
       import { SharedMemory, Mutex, Shared, RefCountTracker, RefCountBuffer } from ${JSON.stringify(
@@ -212,14 +230,18 @@ describe("RefCount across workers", () => {
     `;
 
     const worker = new Worker(
-      new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+      new URL(
+        "data:text/javascript," + encodeURIComponent(workerCode),
+        import.meta.url,
+      ),
       { type: "module" },
     );
     // Auto-register the worker; its close handler releases its refs.
     const stop = coord.autoRegister();
 
     const read = await new Promise<{ name: string; age: number }>((resolve) => {
-      worker.onmessage = (e) => resolve(e.data as { name: string; age: number });
+      worker.onmessage = (e) =>
+        resolve(e.data as { name: string; age: number });
       worker.postMessage({
         key: "rc-worker-1",
         lockBuf: mem.lock.buffer,

@@ -18,7 +18,11 @@ import { Shared } from "../src/index.ts";
 const native = { name: "Alice", age: 30, active: true };
 
 // Shared value (read through the cache).
-const sharedUser = Shared("cache-bench-user", { name: "Alice", age: 30, active: true });
+const sharedUser = Shared("cache-bench-user", {
+  name: "Alice",
+  age: 30,
+  active: true,
+});
 
 function nativeRead(): unknown {
   return native.name;
@@ -28,4 +32,4 @@ function sharedRead(): unknown {
   return sharedUser.name;
 }
 
-benchPair("native vs cached shared read", nativeRead, sharedRead, 1_000_000);
+benchPair("native vs cached shared read", nativeRead, sharedRead);

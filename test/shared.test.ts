@@ -103,9 +103,24 @@ describe("Shared", () => {
     for (let i = 0; i < 20; i++) b.push("s" + i);
     for (let i = 0; i < 20; i++) c.push(i * 10);
 
-    expect(a.read()).toEqual([1, 2, 3, ...Array.from({ length: 20 }, (_, i) => i)]);
-    expect(b.read()).toEqual(["x", "y", ...Array.from({ length: 20 }, (_, i) => "s" + i)]);
-    expect(c.read()).toEqual([10, 20, 30, 40, ...Array.from({ length: 20 }, (_, i) => i * 10)]);
+    expect(a.read()).toEqual([
+      1,
+      2,
+      3,
+      ...Array.from({ length: 20 }, (_, i) => i),
+    ]);
+    expect(b.read()).toEqual([
+      "x",
+      "y",
+      ...Array.from({ length: 20 }, (_, i) => "s" + i),
+    ]);
+    expect(c.read()).toEqual([
+      10,
+      20,
+      30,
+      40,
+      ...Array.from({ length: 20 }, (_, i) => i * 10),
+    ]);
 
     // Pop works after growth.
     expect(a.pop()).toBe(19);

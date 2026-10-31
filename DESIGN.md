@@ -35,7 +35,7 @@ Maps a shared object's key to its location in the DataTable.
 
 Stores the actual shared values. Each value is one of:
 
-- **Object**: a fixed set of property slots. Each slot holds either a primitive value directly, or a *reference* to a string/array in tables 3/4.
+- **Object**: a fixed set of property slots. Each slot holds either a primitive value directly, or a _reference_ to a string/array in tables 3/4.
 - **Array**: a reference to an entry in the ArrayTable.
 - **String**: a reference to an entry in the StringTable.
 - **Primitive**: stored inline (number, boolean, bigint).
@@ -72,20 +72,22 @@ Stores array data. **Append-only**, same principle as the StringTable.
 
 ```ts
 const user = Shared<User>("user-1", { name: "Alice", age: 30, tags: ["a"] });
-user.name;          // getter → reads from DataTable → StringTable
-user.name = "Bob";  // setter → appends to StringTable, updates DataTable ref
+user.name; // getter → reads from DataTable → StringTable
+user.name = "Bob"; // setter → appends to StringTable, updates DataTable ref
 user.tags.push("b"); // appends to ArrayTable, updates DataTable ref
 ```
 
 ## Memory Layout Details
 
 ### Index Table entry (fixed size)
+
 ```
 [0..3]   key hash (Int32)
 [4..7]   data offset (Int32) — into DataTable
 ```
 
 ### DataTable value slot (fixed size)
+
 ```
 [0..3]   type tag (Int32): 0=primitive, 1=string-ref, 2=array-ref, 3=object
 [4..7]   payload / reference
@@ -93,12 +95,14 @@ user.tags.push("b"); // appends to ArrayTable, updates DataTable ref
 ```
 
 ### StringTable entry
+
 ```
 [0..3]   byte offset (Int32) — into string byte region
 [4..7]   byte length (Int32)
 ```
 
 ### ArrayTable entry
+
 ```
 [0..3]   element offset (Int32) — into element region
 [4..7]   element count (Int32)

@@ -13,12 +13,20 @@ import {
 describe("Worker integration (M4)", () => {
   test("exportBuffers/fromBuffers round-trips all buffers", () => {
     const mem = new SharedMemory();
-    const user = Shared("m4-roundtrip", { name: "Alice", age: 30 }, { memory: mem });
+    const user = Shared(
+      "m4-roundtrip",
+      { name: "Alice", age: 30 },
+      { memory: mem },
+    );
     user.write({ name: "Bob", age: 31 });
 
     const buffers = mem.exportBuffers();
     const mem2 = SharedMemory.fromBuffers(buffers);
-    const user2 = Shared<{ name: string; age: number }>("m4-roundtrip", { name: "x", age: 0 }, { memory: mem2 });
+    const user2 = Shared<{ name: string; age: number }>(
+      "m4-roundtrip",
+      { name: "x", age: 0 },
+      { memory: mem2 },
+    );
     expect(user2.read()).toEqual({ name: "Bob", age: 31 });
   });
 
@@ -26,7 +34,11 @@ describe("Worker integration (M4)", () => {
     const mem = new SharedMemory();
     // Make the singleton the memory we share with workers.
     setDefaultMemory(mem);
-    const user = Shared("m4-worker", { name: "Alice", age: 30 }, { memory: mem });
+    const user = Shared(
+      "m4-worker",
+      { name: "Alice", age: 30 },
+      { memory: mem },
+    );
 
     // Main thread: answer buffer requests from new workers.
     await init();
@@ -50,7 +62,10 @@ describe("Worker integration (M4)", () => {
     `;
 
     const worker = new Worker(
-      new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+      new URL(
+        "data:text/javascript," + encodeURIComponent(workerCode),
+        import.meta.url,
+      ),
       { type: "module" },
     );
 
@@ -58,7 +73,8 @@ describe("Worker integration (M4)", () => {
       worker.onmessage = (e) => {
         // Ignore the internal handshake request the worker sends to the main
         // thread; only resolve on a real reply.
-        const data = e.data as { __sharedMemoryRequest?: boolean } | { name: string; age: number };
+        const data = e.data as
+          { __sharedMemoryRequest?: boolean } | { name: string; age: number };
         if (!("__sharedMemoryRequest" in data)) {
           resolve(data as { name: string; age: number });
         }
@@ -70,15 +86,18 @@ describe("Worker integration (M4)", () => {
 
     // A write from the main thread is visible to the worker.
     user.write({ name: "Bob", age: 31 });
-    const read2 = await new Promise<{ name: string; age: number }>((resolve) => {
-      worker.onmessage = (e) => {
-        const data = e.data as { __sharedMemoryRequest?: boolean } | { name: string; age: number };
-        if (!("__sharedMemoryRequest" in data)) {
-          resolve(data as { name: string; age: number });
-        }
-      };
-      worker.postMessage("read");
-    });
+    const read2 = await new Promise<{ name: string; age: number }>(
+      (resolve) => {
+        worker.onmessage = (e) => {
+          const data = e.data as
+            { __sharedMemoryRequest?: boolean } | { name: string; age: number };
+          if (!("__sharedMemoryRequest" in data)) {
+            resolve(data as { name: string; age: number });
+          }
+        };
+        worker.postMessage("read");
+      },
+    );
     expect(read2).toEqual({ name: "Bob", age: 31 });
 
     worker.terminate();

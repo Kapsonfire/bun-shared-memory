@@ -1,4 +1,4 @@
-import { Shared, type SharedOptions } from "../src/index.ts";
+import { Shared } from "../src/index.ts";
 
 interface BenchResult {
   name: string;
@@ -36,7 +36,7 @@ export function benchPair(
   name: string,
   native: () => unknown,
   shared: () => unknown,
-  iterations = 100_000,
+  iterations = 1_000_000,
 ): void {
   // Warm up both paths so JIT compilation doesn't skew the comparison.
   // Use the same iteration count so growing operations (e.g. array push)
@@ -71,9 +71,7 @@ export async function printSummary(): Promise<void> {
   const arrayWrites = results.filter((r) => r.kind === "array-write");
 
   const avg = (rs: BenchResult[]) =>
-    rs.length === 0
-      ? 0
-      : rs.reduce((sum, r) => sum + r.ratio, 0) / rs.length;
+    rs.length === 0 ? 0 : rs.reduce((sum, r) => sum + r.ratio, 0) / rs.length;
 
   const fmt = (rs: BenchResult[]) =>
     rs.length === 0
@@ -99,7 +97,7 @@ async function writeLogFile(groups: {
   writes: BenchResult[];
   arrayWrites: BenchResult[];
   fmt: (rs: BenchResult[]) => string;
-}): void {
+}): Promise<void> {
   const { reads, arrayReads, writes, arrayWrites, fmt } = groups;
   const commit = currentCommit();
   const dir = new URL("../benchlogs/", import.meta.url);
@@ -146,12 +144,24 @@ function currentCommit(): string {
   }
 }
 
-/** Measure ops/sec for `fn` over `iterations` invocations. */
+/** Measure ops/sec for `fn` over a fixed wall-clock duration. */
 function measure(fn: () => unknown, iterations: number): number {
+  // Measure a fixed wall-clock duration (10s) rather than a fixed iteration
+  // count. A fixed count is unreliable for very fast ops (e.g. native reads
+  // at hundreds of millions of ops/s finish in a few ms), which makes the
+  // measurement dominated by background noise. Running for a fixed duration
+  // averages out that noise. `iterations` is used only to size the batch.
+  const minDurationMs = 10_000;
+  const batch = Math.max(1, Math.floor(iterations / 10));
+  let total = 0;
   const start = performance.now();
-  for (let i = 0; i < iterations; i++) fn();
-  const elapsedMs = performance.now() - start;
-  return Math.round(iterations / (elapsedMs / 1000));
+  let elapsed = 0;
+  do {
+    for (let i = 0; i < batch; i++) fn();
+    total += batch;
+    elapsed = performance.now() - start;
+  } while (elapsed < minDurationMs);
+  return Math.round(total / (elapsed / 1000));
 }
 
 /** A unique key per benchmark run, so runs don't collide in the registry. */
@@ -161,9 +171,41 @@ export function nextKey(prefix: string): string {
 }
 
 /**
- * Shared options for benchmarks: a large maxByteLength so append-only tables
- * don't exhaust the buffer during repeated write benchmarks.
+ * Create a bounded push function for benchmarks.
+ *
+ * Growing operations (push) on a single array would otherwise grow the array
+ * without bound and exhaust the shared buffers during a long (10s) measurement.
+ * This pushes `value` and, once the array reaches `maxLen`, resets its length
+ * to 1 so the next push overwrites the slot at index 1 instead of allocating a
+ * new one. This keeps the array (and the shared buffer) bounded.
+ *
+ * `reset` is an optional callback that restores the array to its initial
+ * state; it defaults to setting `length = 1`. `onReset` is an optional
+ * callback invoked after each reset (e.g. to periodically run a defragmentation
+ * pass so dead slots from array growth are reclaimed). A local counter tracks
+ * the size so it works with proxies whose `length` may be cached/stale.
  */
-export const benchOptions: SharedOptions = {
-  maxByteLength: 512 * 1024 * 1024, // 512 MiB
-};
+export function boundedPush<T>(
+  arr: T[],
+  value: T,
+  initial: T[],
+  maxLen = 10_000,
+  reset?: () => void,
+  onReset?: () => void,
+): () => void {
+  const doReset =
+    reset ??
+    (() => {
+      arr.length = 1;
+    });
+  let count = 0;
+  return () => {
+    arr.push(value);
+    count++;
+    if (count >= maxLen) {
+      doReset();
+      onReset?.();
+      count = 0;
+    }
+  };
+}

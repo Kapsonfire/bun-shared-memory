@@ -31,7 +31,7 @@ import { Shared } from "shared-memory";
 const user = Shared<User>("user-1", { name: "Alice", age: 30, tags: ["a"] });
 
 // Access object properties directly via getters/setters
-user.name;        // "Alice"
+user.name; // "Alice"
 user.name = "Bob"; // writes to shared memory
 user.age = 31;
 
@@ -114,8 +114,8 @@ import { Notifier } from "shared-memory";
 
 const notifier = new Notifier();
 // pass notifier.buffer to other workers, then:
-notifier.wait();      // block until notified
-notifier.notify(1);   // wake one waiting worker
+notifier.wait(); // block until notified
+notifier.notify(1); // wake one waiting worker
 ```
 
 ## Reference counting & memory reclamation
@@ -127,19 +127,28 @@ objects/arrays, and a **defragmentation** pass reclaims memory when free space
 runs low.
 
 ```ts
-import { SharedMemory, RefCountCoordinator, RefCountTracker, RefCountBuffer } from "shared-memory";
+import {
+  SharedMemory,
+  RefCountCoordinator,
+  RefCountTracker,
+  RefCountBuffer,
+} from "shared-memory";
 
 // Main thread: coordinate refcounts and auto-register workers.
 const mem = new SharedMemory();
-const coord = new RefCountCoordinator(mem);  // auto-maintenance starts automatically
-coord.autoRegister();          // track workers via process.on("worker")
+const coord = new RefCountCoordinator(mem); // auto-maintenance starts automatically
+coord.autoRegister(); // track workers via process.on("worker")
 // The coordinator periodically drains acquire/release events and defragments
 // when free space runs low — no manual calls needed.
 
 // Worker: track references acquired by read().
 const tracker = new RefCountTracker(new RefCountBuffer(refBuf), workerId);
-const user = Shared("user-1", { name: "Alice" }, { memory: mem, refCount: tracker });
-const copy = user.read();      // acquires a ref; released when `copy` is GC'd
+const user = Shared(
+  "user-1",
+  { name: "Alice" },
+  { memory: mem, refCount: tracker },
+);
+const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 ```
 
 See [REFCOUNT.md](./REFCOUNT.md) for the full design.
@@ -156,19 +165,19 @@ workers, and each worker requests the shared buffers from the main thread.
 import { Shared, init } from "shared-memory";
 
 const user = Shared("user-1", { name: "Alice", age: 30 });
-init();   // answer buffer requests from every new worker
+init(); // answer buffer requests from every new worker
 ```
 
 ```ts
 // worker.ts
 import { Shared, init, onMessage } from "shared-memory";
 
-await init();   // request the shared buffers from the main thread
+await init(); // request the shared buffers from the main thread
 
 // Register your own message handler via onMessage(); messages are buffered
 // until the buffers have arrived.
 onMessage((e) => {
-  const user = Shared("user-1", { name: "x" });  // reads the main thread's value
+  const user = Shared("user-1", { name: "x" }); // reads the main thread's value
   self.postMessage(user.read());
 });
 ```
@@ -185,7 +194,7 @@ initial value.
 Shared memory is split across several growable `SharedArrayBuffer`s (the
 index, data, string, and array tables; each key's version counter lives in its
 index entry). A single `SharedArrayBuffer` can be at most **4 GiB**. By default
-each buffer grows independently up to its own `maxByteLength`, so the *total*
+each buffer grows independently up to its own `maxByteLength`, so the _total_
 memory can be several times that.
 
 To cap the **total** memory across all buffers, pass `maxTotalBytes` when

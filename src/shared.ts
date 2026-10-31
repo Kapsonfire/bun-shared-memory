@@ -78,9 +78,9 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
     case TYPE_BIGINT_STR: // bigint stored as decimal string
       return BigInt(mem.readString({ offset: slot.a, length: slot.b }));
     case 4: // array-ref
-      return mem.readArray({ offset: slot.a, count: slot.b, capacity: slot.c }).map((s) =>
-        decodeValue(mem, s),
-      );
+      return mem
+        .readArray({ offset: slot.a, count: slot.b, capacity: slot.c })
+        .map((s) => decodeValue(mem, s));
     default:
       return decodeSlot(slot);
   }
@@ -119,7 +119,10 @@ export type SharedRef<T> = [T] extends [object]
  * automatically on the next read. The key's stable index is cached too, so a
  * cache hit avoids the linear index-table lookup.
  */
-const readCache = new Map<string, { version: number; value: unknown; index: number }>();
+const readCache = new Map<
+  string,
+  { version: number; value: unknown; index: number }
+>();
 
 /**
  * Per-worker cache of a key's stable index in the Index Table.
@@ -191,7 +194,10 @@ function getTopLevelObjectId(mem: SharedMemory, key: string): number | null {
  * repeated reads of the same property. Writes bump the object's version, so
  * the whole entry is invalidated automatically.
  */
-const propCache = new Map<string, { version: number; index: number; props: Map<string, unknown> }>();
+const propCache = new Map<
+  string,
+  { version: number; index: number; props: Map<string, unknown> }
+>();
 
 /**
  * Per-worker cache of object layouts: key -> stable property slot offsets.
@@ -343,7 +349,9 @@ function createSharedRef<T>(
         if (Array.isArray(cachedValue)) {
           return getTopLevelArrayMember(mem, key, cachedValue, prop);
         }
-        const propValue = (cachedValue as Record<string | symbol, unknown>)[prop];
+        const propValue = (cachedValue as Record<string | symbol, unknown>)[
+          prop
+        ];
         if (Array.isArray(propValue)) {
           return createArrayProxy(mem, key, prop as string);
         }
@@ -377,7 +385,7 @@ function createSharedRef<T>(
         const index =
           pc !== undefined
             ? pc.index
-            : readCache.get(key)?.index ?? getIndex(mem, key);
+            : (readCache.get(key)?.index ?? getIndex(mem, key));
         const slot = mem.readValueSlot(slotOffset);
         // Array properties are handled lazily by the array proxy; don't decode
         // the whole array here (avoids O(n) work on every access).
@@ -386,7 +394,11 @@ function createSharedRef<T>(
         }
         const propValue = decodeValue(mem, slot);
         if (pc === undefined || pc.version !== version) {
-          propCache.set(key, { version: mem.getVersion(index), index, props: new Map() });
+          propCache.set(key, {
+            version: mem.getVersion(index),
+            index,
+            props: new Map(),
+          });
         }
         propCache.get(key)!.props.set(prop as string, propValue);
         if (Array.isArray(propValue)) {
@@ -431,15 +443,45 @@ function createSharedRef<T>(
           throw new Error(`No shared value found for key "${key}"`);
         }
         const slot = mem.readValueSlot(offset);
-        if (slot.type === TYPE_ARRAY_REF && typeof prop === "string" && /^\d+$/.test(prop)) {
+        if (
+          slot.type === TYPE_ARRAY_REF &&
+          typeof prop === "string" &&
+          /^\d+$/.test(prop)
+        ) {
           const index = Number(prop);
           const ref = { offset: slot.a, count: slot.b, capacity: slot.c };
           if (index >= ref.count) {
-            throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
+            throw new RangeError(
+              `Index ${index} out of bounds for array of length ${ref.count}`,
+            );
           }
           mem.updateArraySlot(ref, index, encodeValue(mem, val));
           bump(mem, key);
           return true;
+        }
+
+        // Top-level array length write: shrink/grow the array in place without
+        // re-encoding the whole array (which would leave a dead slot behind).
+        if (slot.type === TYPE_ARRAY_REF && prop === "length") {
+          const newLen = Number(val);
+          if (!Number.isInteger(newLen) || newLen < 0) {
+            throw new RangeError("Invalid array length");
+          }
+          const ref = { offset: slot.a, count: slot.b, capacity: slot.c };
+          if (newLen <= ref.capacity) {
+            // Shrinking (or growing within capacity): just update the count.
+            mem.updateValueSlot(
+              offset,
+              arrayRefSlot({
+                offset: ref.offset,
+                count: newLen,
+                capacity: ref.capacity,
+              }),
+            );
+            bump(mem, key);
+            return true;
+          }
+          // Growing beyond capacity falls through to the full read-modify-write.
         }
 
         // Fallback: full read-modify-write (e.g. setting a primitive key's
@@ -665,7 +707,11 @@ function mutateArrayRef(
     // Read the last element before decrementing.
     const lastSlot = mem.readArraySlot(ref, ref.count - 1);
     const result = decodeValue(mem, lastSlot);
-    const next = { offset: ref.offset, count: ref.count - 1, capacity: ref.capacity };
+    const next = {
+      offset: ref.offset,
+      count: ref.count - 1,
+      capacity: ref.capacity,
+    };
     mem.updateValueSlot(slotOffset, arrayRefSlot(next));
     bump(mem, key);
     return result;
@@ -697,7 +743,9 @@ function getTopLevelArrayMember(
     }
     return (...args: unknown[]) => {
       return mutateValue<unknown[], unknown>(mem, key, (fresh) => {
-        const method = (fresh as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!;
+        const method = (
+          fresh as unknown as Record<string, (...a: unknown[]) => unknown>
+        )[methodName]!;
         return method.apply(fresh, args);
       });
     };
@@ -751,7 +799,12 @@ function createArrayProxy(
             key,
             (fresh) => {
               const freshArr = fresh[prop] as unknown[];
-              const method = (freshArr as unknown as Record<string, (...a: unknown[]) => unknown>)[methodName]!;
+              const method = (
+                freshArr as unknown as Record<
+                  string,
+                  (...a: unknown[]) => unknown
+                >
+              )[methodName]!;
               return method.apply(freshArr, args);
             },
           );
@@ -770,15 +823,51 @@ function createArrayProxy(
           const slotOffset = layout.properties.get(prop);
           if (slotOffset !== undefined) {
             const propSlot = mem.readValueSlot(slotOffset);
-            if (propSlot.type === TYPE_ARRAY_REF && typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
+            if (
+              propSlot.type === TYPE_ARRAY_REF &&
+              typeof arrProp === "string" &&
+              /^\d+$/.test(arrProp)
+            ) {
               const index = Number(arrProp);
-              const ref = { offset: propSlot.a, count: propSlot.b, capacity: propSlot.c };
+              const ref = {
+                offset: propSlot.a,
+                count: propSlot.b,
+                capacity: propSlot.c,
+              };
               if (index >= ref.count) {
-                throw new RangeError(`Index ${index} out of bounds for array of length ${ref.count}`);
+                throw new RangeError(
+                  `Index ${index} out of bounds for array of length ${ref.count}`,
+                );
               }
               mem.updateArraySlot(ref, index, encodeValue(mem, val));
               bump(mem, key);
               return true;
+            }
+            // Array property length write: shrink/grow in place without
+            // re-encoding the whole object (which would leave a dead slot).
+            if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
+              const newLen = Number(val);
+              if (!Number.isInteger(newLen) || newLen < 0) {
+                throw new RangeError("Invalid array length");
+              }
+              const ref = {
+                offset: propSlot.a,
+                count: propSlot.b,
+                capacity: propSlot.c,
+              };
+              if (newLen <= ref.capacity) {
+                mem.updateValueSlot(
+                  slotOffset,
+                  arrayRefSlot({
+                    offset: ref.offset,
+                    count: newLen,
+                    capacity: ref.capacity,
+                  }),
+                );
+                bump(mem, key);
+                return true;
+              }
+              // Growing beyond capacity falls through to the full read-modify-write.
             }
           }
         }

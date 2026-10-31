@@ -48,7 +48,10 @@ describe("Mutex", () => {
       let done = 0;
       for (let i = 0; i < WORKERS; i++) {
         const w = new Worker(
-          new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+          new URL(
+            "data:text/javascript," + encodeURIComponent(workerCode),
+            import.meta.url,
+          ),
           { type: "module" },
         );
         w.onmessage = () => {
@@ -84,7 +87,10 @@ describe("Notifier", () => {
 
     const result = await new Promise<string>((resolve) => {
       const w = new Worker(
-        new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+        new URL(
+          "data:text/javascript," + encodeURIComponent(workerCode),
+          import.meta.url,
+        ),
         { type: "module" },
       );
       w.onmessage = (e) => resolve(e.data as string);
@@ -99,7 +105,11 @@ describe("Notifier", () => {
 describe("Read cache invalidation across workers", () => {
   test("a write in one worker invalidates the read cache in another", async () => {
     const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
-    const user = Shared("cross-cache-1", { name: "Alice", age: 30 }, { memory: mem });
+    const user = Shared(
+      "cross-cache-1",
+      { name: "Alice", age: 30 },
+      { memory: mem },
+    );
     expect(user.name).toBe("Alice");
 
     const workerCode = `
@@ -120,13 +130,17 @@ describe("Read cache invalidation across workers", () => {
     `;
 
     const worker = new Worker(
-      new URL("data:text/javascript," + encodeURIComponent(workerCode), import.meta.url),
+      new URL(
+        "data:text/javascript," + encodeURIComponent(workerCode),
+        import.meta.url,
+      ),
       { type: "module" },
     );
 
     const readFromWorker = () =>
       new Promise<{ name: string; age: number }>((resolve) => {
-        worker.onmessage = (e) => resolve(e.data as { name: string; age: number });
+        worker.onmessage = (e) =>
+          resolve(e.data as { name: string; age: number });
         worker.postMessage({
           action: "read",
           key: "cross-cache-1",

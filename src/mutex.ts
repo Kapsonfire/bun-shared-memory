@@ -19,8 +19,7 @@ export class Mutex {
   private readonly cell: Int32Array;
 
   constructor(buffer?: SharedArrayBuffer) {
-    const sab =
-      buffer ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const sab = buffer ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
     this.cell = new Int32Array(sab);
   }
 

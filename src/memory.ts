@@ -107,7 +107,12 @@ export interface ObjectLayout {
 /** Encode a number (float64) into a ValueSlot. */
 export function numberSlot(value: number): ValueSlot {
   slotView.setFloat64(0, value, true);
-  return { type: TYPE_NUMBER, a: slotView.getInt32(0, true), b: slotView.getInt32(4, true), c: 0 };
+  return {
+    type: TYPE_NUMBER,
+    a: slotView.getInt32(0, true),
+    b: slotView.getInt32(4, true),
+    c: 0,
+  };
 }
 
 /** Encode a boolean into a ValueSlot. */
@@ -118,7 +123,12 @@ export function booleanSlot(value: boolean): ValueSlot {
 /** Encode a bigint (int64) into a ValueSlot. */
 export function bigintSlot(value: bigint): ValueSlot {
   slotView.setBigInt64(0, value, true);
-  return { type: TYPE_BIGINT, a: slotView.getInt32(0, true), b: slotView.getInt32(4, true), c: 0 };
+  return {
+    type: TYPE_BIGINT,
+    a: slotView.getInt32(0, true),
+    b: slotView.getInt32(4, true),
+    c: 0,
+  };
 }
 
 /** Encode a string reference into a ValueSlot. */
@@ -238,31 +248,37 @@ export class SharedMemory {
       4 * 1024 * 1024 * 1024,
       maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX,
     );
-    const budget = maxTotal !== undefined ? new SharedBudget(maxTotal) : undefined;
+    const budget =
+      maxTotal !== undefined ? new SharedBudget(maxTotal) : undefined;
     const buffers = options?.buffers;
     this.indexTable = new GrowableBuffer(
-      buffers?.indexTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      buffers?.indexTable ??
+        new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
       perBufferMax,
       budget,
     );
     this.dataTable = new GrowableBuffer(
-      buffers?.dataTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      buffers?.dataTable ??
+        new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
       perBufferMax,
       budget,
     );
     this.stringTable = new GrowableBuffer(
-      buffers?.stringTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      buffers?.stringTable ??
+        new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
       perBufferMax,
       budget,
     );
     this.arrayTable = new GrowableBuffer(
-      buffers?.arrayTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      buffers?.arrayTable ??
+        new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
       perBufferMax,
       budget,
     );
     this.versionView = new Int32Array(this.indexTable.buffer);
     this.layoutVersion = new Int32Array(
-      buffers?.layoutVersion ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+      buffers?.layoutVersion ??
+        new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
     );
     this.lock = options?.lock ?? new Mutex();
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
@@ -386,7 +402,11 @@ export class SharedMemory {
   /** Read a string from the StringTable by reference. */
   readString(ref: StringRef): string {
     const view = this.stringTable.getView();
-    const bytes = new Uint8Array(this.stringTable.buffer, ref.offset, ref.length);
+    const bytes = new Uint8Array(
+      this.stringTable.buffer,
+      ref.offset,
+      ref.length,
+    );
     return this.decoder.decode(bytes);
   }
 
@@ -430,12 +450,19 @@ export class SharedMemory {
 
   /** Update a single value slot of an array in the ArrayTable in place. */
   updateArraySlot(ref: ArrayRef, index: number, slot: ValueSlot): void {
-    writeSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + index * SLOT_SIZE, slot);
+    writeSlot(
+      this.arrayTable.getView(),
+      ref.offset + ARRAY_HEADER + index * SLOT_SIZE,
+      slot,
+    );
   }
 
   /** Read a single value slot of an array from the ArrayTable. */
   readArraySlot(ref: ArrayRef, index: number): ValueSlot {
-    return readSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + index * SLOT_SIZE);
+    return readSlot(
+      this.arrayTable.getView(),
+      ref.offset + ARRAY_HEADER + index * SLOT_SIZE,
+    );
   }
 
   /** Read the stable objectId of an array block in the ArrayTable. */
@@ -450,7 +477,9 @@ export class SharedMemory {
    */
   moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
     const newOffset = this.arrayTable.byteLength;
-    this.arrayTable.ensureCapacity(newOffset + ARRAY_HEADER + newCapacity * SLOT_SIZE);
+    this.arrayTable.ensureCapacity(
+      newOffset + ARRAY_HEADER + newCapacity * SLOT_SIZE,
+    );
     const view = this.arrayTable.getView();
     const objectId = this.getArrayObjectId(ref.offset);
     view.setInt32(newOffset, objectId, true);
@@ -473,12 +502,28 @@ export class SharedMemory {
    */
   appendArraySlot(ref: ArrayRef, slot: ValueSlot): ArrayRef {
     if (ref.count < ref.capacity) {
-      writeSlot(this.arrayTable.getView(), ref.offset + ARRAY_HEADER + ref.count * SLOT_SIZE, slot);
-      return { offset: ref.offset, count: ref.count + 1, capacity: ref.capacity };
+      writeSlot(
+        this.arrayTable.getView(),
+        ref.offset + ARRAY_HEADER + ref.count * SLOT_SIZE,
+        slot,
+      );
+      return {
+        offset: ref.offset,
+        count: ref.count + 1,
+        capacity: ref.capacity,
+      };
     }
     const moved = this.moveArray(ref, Math.max(ref.capacity * 2, 1));
-    writeSlot(this.arrayTable.getView(), moved.offset + ARRAY_HEADER + moved.count * SLOT_SIZE, slot);
-    return { offset: moved.offset, count: moved.count + 1, capacity: moved.capacity };
+    writeSlot(
+      this.arrayTable.getView(),
+      moved.offset + ARRAY_HEADER + moved.count * SLOT_SIZE,
+      slot,
+    );
+    return {
+      offset: moved.offset,
+      count: moved.count + 1,
+      capacity: moved.capacity,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -511,7 +556,8 @@ export class SharedMemory {
    * @returns the byte offset of the object block in the DataTable
    */
   createObject(properties: Array<[string, ValueSlot]>): number {
-    const blockSize = OBJECT_HEADER + properties.length * (NAME_REF_SIZE + SLOT_SIZE);
+    const blockSize =
+      OBJECT_HEADER + properties.length * (NAME_REF_SIZE + SLOT_SIZE);
     const offset = this.dataTable.byteLength;
     this.dataTable.ensureCapacity(offset + blockSize);
     const view = this.dataTable.getView();
@@ -588,9 +634,17 @@ export class SharedMemory {
   }
 
   /** Update a single value slot of an object in the DataTable. */
-  updateObjectSlot(offset: number, propertyIndex: number, slot: ValueSlot): void {
+  updateObjectSlot(
+    offset: number,
+    propertyIndex: number,
+    slot: ValueSlot,
+  ): void {
     const view = this.dataTable.getView();
-    const slotOffset = offset + OBJECT_HEADER + propertyIndex * (NAME_REF_SIZE + SLOT_SIZE) + NAME_REF_SIZE;
+    const slotOffset =
+      offset +
+      OBJECT_HEADER +
+      propertyIndex * (NAME_REF_SIZE + SLOT_SIZE) +
+      NAME_REF_SIZE;
     writeSlot(view, slotOffset, slot);
   }
 
@@ -628,7 +682,10 @@ export class SharedMemory {
       const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
       const keyOffset = view.getInt32(entryOffset, true);
       const keyLength = view.getInt32(entryOffset + 4, true);
-      const storedKey = this.readString({ offset: keyOffset, length: keyLength });
+      const storedKey = this.readString({
+        offset: keyOffset,
+        length: keyLength,
+      });
       if (storedKey === key) {
         return i;
       }
@@ -800,7 +857,12 @@ export class SharedMemory {
       const next = sortedArrays[sortedArrays.indexOf(oldOffset) + 1];
       const end = next !== undefined ? next : this.arrayTable.byteLength;
       const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
-      copyBytes(arrayView, newArrayOffset, oldOffset, ARRAY_HEADER + capacity * SLOT_SIZE);
+      copyBytes(
+        arrayView,
+        newArrayOffset,
+        oldOffset,
+        ARRAY_HEADER + capacity * SLOT_SIZE,
+      );
       arrayRemap.set(oldOffset, newArrayOffset);
       newArrayOffset += ARRAY_HEADER + capacity * SLOT_SIZE;
     }
@@ -854,7 +916,12 @@ export class SharedMemory {
       const end = next !== undefined ? next : this.arrayTable.byteLength;
       const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
       for (let i = 0; i < capacity; i++) {
-        remapSlot(arrayView, newOff + ARRAY_HEADER + i * SLOT_SIZE, stringRemap, arrayRemap);
+        remapSlot(
+          arrayView,
+          newOff + ARRAY_HEADER + i * SLOT_SIZE,
+          stringRemap,
+          arrayRemap,
+        );
       }
     }
 
@@ -880,7 +947,12 @@ function readSlot(view: DataView, offset: number): ValueSlot {
 }
 
 /** Copy `len` bytes from `src` to `dst` in the same buffer (dst <= src). */
-function copyBytes(view: DataView, dst: number, src: number, len: number): void {
+function copyBytes(
+  view: DataView,
+  dst: number,
+  src: number,
+  len: number,
+): void {
   for (let i = 0; i < len; i++) {
     view.setUint8(dst + i, view.getUint8(src + i));
   }
@@ -899,8 +971,16 @@ function remapSlot(
 ): void {
   const type = view.getInt32(offset, true);
   if (type === TYPE_STRING_REF || type === TYPE_BIGINT_STR) {
-    view.setInt32(offset + 4, stringRemap.get(view.getInt32(offset + 4, true))!, true);
+    view.setInt32(
+      offset + 4,
+      stringRemap.get(view.getInt32(offset + 4, true))!,
+      true,
+    );
   } else if (type === TYPE_ARRAY_REF) {
-    view.setInt32(offset + 4, arrayRemap.get(view.getInt32(offset + 4, true))!, true);
+    view.setInt32(
+      offset + 4,
+      arrayRemap.get(view.getInt32(offset + 4, true))!,
+      true,
+    );
   }
 }

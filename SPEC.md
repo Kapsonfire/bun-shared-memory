@@ -41,11 +41,9 @@ Bun supports worker threads, but passing data between them typically requires st
 
 ```ts
 // Get a wrapper to user-1 in shared memory. If it doesn't exist, create it with the provided initial value.
-const user = Shared<User>('user-1', { name: 'Alice', age: 30 });
+const user = Shared<User>("user-1", { name: "Alice", age: 30 });
 
-const user2 = Shared<User>('user-1', loader); // Get a wrapper to user-1 in shared memory. If it doesn't exist, create it with the provided loader function. The loader function may be async
-
-
+const user2 = Shared<User>("user-1", loader); // Get a wrapper to user-1 in shared memory. If it doesn't exist, create it with the provided loader function. The loader function may be async
 ```
 
 ## Milestones

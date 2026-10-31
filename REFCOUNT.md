@@ -85,7 +85,7 @@ after a timeout.
 
 Every object and array in the DataTable gets a stable **objectId** (a monotonic
 counter). The objectId is stored in the object/array header so the refcount
-table can be keyed by it. The DataTable offset is *not* used as identity because
+table can be keyed by it. The DataTable offset is _not_ used as identity because
 it changes during defragmentation.
 
 ### Global refcount table (main thread)
@@ -146,11 +146,11 @@ eagerly on every release.
 ```ts
 // Worker: acquire a reference when reading
 const user = Shared<User>("user-1", { name: "Alice" });
-const copy = user.read();   // acquires a ref; released when `copy` is GC'd
+const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 
 // Main thread: register a worker and its close handler
 const coordinator = new RefCountCoordinator(memory);
-coordinator.autoRegister();  // auto-registers workers via process.on("worker")
+coordinator.autoRegister(); // auto-registers workers via process.on("worker")
 ```
 
 ### Automatic maintenance

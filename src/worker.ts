@@ -88,16 +88,24 @@ export function stopInit(): void {
 }
 
 /** The main-thread worker listener, so it can be removed by `stopInit()`. */
-let mainListener: ((worker: {
-  postMessage: (msg: unknown) => void;
-  addEventListener: (type: string, fn: (e: { data: unknown }) => void) => void;
-}) => void) | null = null;
+let mainListener:
+  | ((worker: {
+      postMessage: (msg: unknown) => void;
+      addEventListener: (
+        type: string,
+        fn: (e: { data: unknown }) => void,
+      ) => void;
+    }) => void)
+  | null = null;
 
 /** Main thread: answer each worker's buffer request. */
 function initMain(): void {
   const listener = (worker: {
     postMessage: (msg: unknown) => void;
-    addEventListener: (type: string, fn: (e: { data: unknown }) => void) => void;
+    addEventListener: (
+      type: string,
+      fn: (e: { data: unknown }) => void,
+    ) => void;
   }) => {
     worker.addEventListener("message", (e) => {
       const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
@@ -131,7 +139,9 @@ async function initWorker(): Promise<void> {
     pendingInitResolve = resolve;
   });
 
-  const scope = globalThis as unknown as { postMessage: (msg: unknown) => void };
+  const scope = globalThis as unknown as {
+    postMessage: (msg: unknown) => void;
+  };
   scope.postMessage({ __sharedMemoryRequest: true });
 
   await reply;
@@ -162,7 +172,10 @@ function installMessageWrapper(): void {
 
   const wrapper = (e: { data: unknown }) => {
     const msg = e.data as
-      | { __sharedMemoryInit?: boolean; buffers?: Parameters<typeof SharedMemory.fromBuffers>[0] }
+      | {
+          __sharedMemoryInit?: boolean;
+          buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
+        }
       | undefined;
     if (msg && msg.__sharedMemoryInit && msg.buffers) {
       setDefaultMemory(SharedMemory.fromBuffers(msg.buffers));
