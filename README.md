@@ -6,7 +6,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
 
-🚧 **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
+✅ **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
 
 ✅ **Read cache**: reads are cached per worker and invalidated cross-worker via a per-key version counter.
 
