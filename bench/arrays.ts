@@ -1,5 +1,5 @@
 import { Shared } from "../src/index.ts";
-import { benchPair, boundedPush, nextKey } from "./helpers.ts";
+import { benchPair, nextKey } from "./helpers.ts";
 import { benchOptions } from "./setup.ts";
 
 // ---------------------------------------------------------------------------
@@ -24,16 +24,6 @@ import { benchOptions } from "./setup.ts";
     () => (native[3] = 99),
     () => (shared[3] = 99),
   );
-  benchPair(
-    "number[] · push",
-    boundedPush(native, 11, initial),
-    boundedPush(shared as unknown as number[], 11, initial),
-  );
-  benchPair(
-    "number[] · pop",
-    () => native.pop(),
-    () => shared.pop(),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -57,16 +47,6 @@ import { benchOptions } from "./setup.ts";
     "string[] · write index",
     () => (native[3] = "z"),
     () => (shared[3] = "z"),
-  );
-  benchPair(
-    "string[] · push",
-    boundedPush(native, "k", initial),
-    boundedPush(shared as unknown as string[], "k", initial),
-  );
-  benchPair(
-    "string[] · pop",
-    () => native.pop(),
-    () => shared.pop(),
   );
 }
 
@@ -103,16 +83,6 @@ import { benchOptions } from "./setup.ts";
     () => (native[3] = true),
     () => (shared[3] = true),
   );
-  benchPair(
-    "boolean[] · push",
-    boundedPush(native, true, initial),
-    boundedPush(shared as unknown as boolean[], true, initial),
-  );
-  benchPair(
-    "boolean[] · pop",
-    () => native.pop(),
-    () => shared.pop(),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -137,16 +107,6 @@ import { benchOptions } from "./setup.ts";
     () => (native[3] = 99n),
     () => (shared[3] = 99n),
   );
-  benchPair(
-    "bigint[] · push",
-    boundedPush(native, 11n, initial),
-    boundedPush(shared as unknown as bigint[], 11n, initial),
-  );
-  benchPair(
-    "bigint[] · pop",
-    () => native.pop(),
-    () => shared.pop(),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -170,19 +130,5 @@ import { benchOptions } from "./setup.ts";
     "mixed[] · write index",
     () => (native[3] = 99),
     () => (shared[3] = 99),
-  );
-  benchPair(
-    "mixed[] · push",
-    boundedPush(native, 11, initial),
-    boundedPush(
-      shared as unknown as (number | string | boolean | bigint)[],
-      11,
-      initial,
-    ),
-  );
-  benchPair(
-    "mixed[] · pop",
-    () => native.pop(),
-    () => shared.pop(),
   );
 }

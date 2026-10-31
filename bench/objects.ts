@@ -1,5 +1,5 @@
 import { Shared } from "../src/index.ts";
-import { benchPair, boundedPush, nextKey } from "./helpers.ts";
+import { benchPair, nextKey } from "./helpers.ts";
 import { benchOptions } from "./setup.ts";
 
 interface User {
@@ -75,18 +75,5 @@ const makeUser = (): User => ({
     "object · write array prop index",
     () => (native.tags[1] = "x"),
     () => (shared.tags[1] = "x"),
-  );
-  benchPair(
-    "object · array prop push",
-    boundedPush(native.tags, "d", ["a", "b", "c"]),
-    boundedPush(
-      shared.tags as unknown as string[],
-      "d",
-      ["a", "b", "c"],
-      10_000,
-      () => {
-        shared.tags.length = 1;
-      },
-    ),
   );
 }

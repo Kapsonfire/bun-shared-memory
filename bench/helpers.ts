@@ -10,6 +10,9 @@ interface BenchResult {
 
 const results: BenchResult[] = [];
 
+/** Whether the one-time CPU warmup has already run (see benchPair). */
+let warmedUp = false;
+
 /**
  * Classify a benchmark name into a summary category.
  *
@@ -38,6 +41,20 @@ export function benchPair(
   shared: () => unknown,
   iterations = 1_000_000,
 ): void {
+  // On the very first benchmark, run a longer CPU-intensive warmup so the
+  // machine "wakes up" (e.g. after idle/screen-lock) and the JIT is fully
+  // initialized. Without this, the first test (number · read) is a large
+  // outlier (e.g. 70× instead of ~8×) because the CPU is still ramping up.
+  if (!warmedUp) {
+    warmedUp = true;
+    const t0 = performance.now();
+    let x = 0;
+    while (performance.now() - t0 < 2_000) {
+      for (let i = 0; i < 1_000_000; i++) x = (x + i) % 1_000_003;
+    }
+    void x;
+  }
+
   // Warm up both paths so JIT compilation doesn't skew the comparison.
   // Use the same iteration count so growing operations (e.g. array push)
   // don't exhaust the append-only buffers during warmup.
@@ -168,44 +185,4 @@ function measure(fn: () => unknown, iterations: number): number {
 let keyCounter = 0;
 export function nextKey(prefix: string): string {
   return `${prefix}-${keyCounter++}`;
-}
-
-/**
- * Create a bounded push function for benchmarks.
- *
- * Growing operations (push) on a single array would otherwise grow the array
- * without bound and exhaust the shared buffers during a long (5s) measurement.
- * This pushes `value` and, once the array reaches `maxLen`, resets its length
- * to 1 so the next push overwrites the slot at index 1 instead of allocating a
- * new one. This keeps the array (and the shared buffer) bounded.
- *
- * `reset` is an optional callback that restores the array to its initial
- * state; it defaults to setting `length = 1`. `onReset` is an optional
- * callback invoked after each reset (e.g. to periodically run a defragmentation
- * pass so dead slots from array growth are reclaimed). A local counter tracks
- * the size so it works with proxies whose `length` may be cached/stale.
- */
-export function boundedPush<T>(
-  arr: T[],
-  value: T,
-  initial: T[],
-  maxLen = 10_000,
-  reset?: () => void,
-  onReset?: () => void,
-): () => void {
-  const doReset =
-    reset ??
-    (() => {
-      arr.length = 1;
-    });
-  let count = 0;
-  return () => {
-    arr.push(value);
-    count++;
-    if (count >= maxLen) {
-      doReset();
-      onReset?.();
-      count = 0;
-    }
-  };
 }
