@@ -12,7 +12,7 @@ import {
  *
  * The benchmarks exercise growing operations (push) that would otherwise
  * exhaust the append-only buffers. The coordinator's periodic maintenance
- * reclaims dead space so the buffers don't overflow during a 10s measurement.
+ * reclaims dead space so the buffers don't overflow during a 5s measurement.
  */
 const mem = new SharedMemory({ maxByteLength: 512 * 1024 * 1024 }); // 512 MiB
 

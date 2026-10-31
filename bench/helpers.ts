@@ -146,12 +146,12 @@ function currentCommit(): string {
 
 /** Measure ops/sec for `fn` over a fixed wall-clock duration. */
 function measure(fn: () => unknown, iterations: number): number {
-  // Measure a fixed wall-clock duration (10s) rather than a fixed iteration
+  // Measure a fixed wall-clock duration (5s) rather than a fixed iteration
   // count. A fixed count is unreliable for very fast ops (e.g. native reads
   // at hundreds of millions of ops/s finish in a few ms), which makes the
   // measurement dominated by background noise. Running for a fixed duration
   // averages out that noise. `iterations` is used only to size the batch.
-  const minDurationMs = 10_000;
+  const minDurationMs = 5_000;
   const batch = Math.max(1, Math.floor(iterations / 10));
   let total = 0;
   const start = performance.now();
@@ -174,7 +174,7 @@ export function nextKey(prefix: string): string {
  * Create a bounded push function for benchmarks.
  *
  * Growing operations (push) on a single array would otherwise grow the array
- * without bound and exhaust the shared buffers during a long (10s) measurement.
+ * without bound and exhaust the shared buffers during a long (5s) measurement.
  * This pushes `value` and, once the array reaches `maxLen`, resets its length
  * to 1 so the next push overwrites the slot at index 1 instead of allocating a
  * new one. This keeps the array (and the shared buffer) bounded.

@@ -301,3 +301,39 @@ describe("SharedMemory total memory budget", () => {
     expect(() => new SharedMemory({ maxTotalBytes: 4095 })).toThrow(RangeError);
   });
 });
+
+describe("Shared arrayCapacity option", () => {
+  test("reserves extra capacity so push does not move the array", () => {
+    const mem = new SharedMemory();
+    const arr = Shared("cap-arr-1", [1, 2, 3], { memory: mem, arrayCapacity: 100 });
+
+    // Push well beyond the initial length; all values must be preserved.
+    for (let i = 4; i <= 50; i++) {
+      arr.push(i);
+    }
+    expect(arr.read()).toEqual(
+      Array.from({ length: 50 }, (_, i) => i + 1),
+    );
+
+    // The array ref's capacity should be 100 (the reserved capacity), not
+    // grown to 64/128 by doubling. Inspect the stored array ref directly.
+    const offset = mem.lookupIndex("cap-arr-1");
+    expect(offset).not.toBeNull();
+    const slot = mem.readValueSlot(mem.lookupByIndex(offset!)!);
+    expect(slot.type).toBe(4); // TYPE_ARRAY_REF
+    expect(slot.c).toBe(100);
+  });
+
+  test("capacity smaller than length falls back to the length", () => {
+    const mem = new SharedMemory();
+    const arr = Shared("cap-arr-2", [1, 2, 3, 4, 5], {
+      memory: mem,
+      arrayCapacity: 2,
+    });
+    const offset = mem.lookupIndex("cap-arr-2");
+    expect(offset).not.toBeNull();
+    const slot = mem.readValueSlot(mem.lookupByIndex(offset!)!);
+    expect(slot.c).toBe(5); // capacity = max(2, length) = 5
+    expect(arr.read()).toEqual([1, 2, 3, 4, 5]);
+  });
+});

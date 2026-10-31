@@ -425,7 +425,7 @@ export class SharedMemory {
    */
   storeArray(slots: ValueSlot[], capacity?: number): ArrayRef {
     const count = slots.length;
-    const cap = Math.max(capacity ?? count, 1);
+    const cap = Math.max(capacity ?? 0, count, 1);
     const offset = this.arrayTable.byteLength;
     this.arrayTable.ensureCapacity(offset + ARRAY_HEADER + cap * SLOT_SIZE);
     const view = this.arrayTable.getView();

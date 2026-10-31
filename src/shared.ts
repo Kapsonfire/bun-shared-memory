@@ -37,7 +37,11 @@ const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = 2n ** 63n - 1n;
 
 /** Convert a JS value into a ValueSlot, storing strings/arrays in tables. */
-function encodeValue(mem: SharedMemory, value: unknown): ValueSlot {
+function encodeValue(
+  mem: SharedMemory,
+  value: unknown,
+  arrayCapacity?: number,
+): ValueSlot {
   switch (typeof value) {
     case "number":
       return numberSlot(value);
@@ -61,8 +65,8 @@ function encodeValue(mem: SharedMemory, value: unknown): ValueSlot {
             );
           }
         }
-        const slots = value.map((v) => encodeValue(mem, v));
-        return arrayRefSlot(mem.storeArray(slots));
+        const slots = value.map((v) => encodeValue(mem, v, arrayCapacity));
+        return arrayRefSlot(mem.storeArray(slots, arrayCapacity));
       }
       throw new TypeError(
         `Cannot store value of type ${typeof value}: only primitives, bigints, and arrays of these are allowed`,
@@ -248,6 +252,13 @@ export interface SharedOptions {
    * reference to the returned object/array, released when it is GC'd.
    */
   refCount?: RefCountTracker;
+  /**
+   * Initial capacity (in elements) reserved for arrays when they are first
+   * stored. Arrays are created with this many slots, so subsequent `push`
+   * calls can append in place without growing/moving the array until the
+   * capacity is exhausted. Defaults to the array's length.
+   */
+  arrayCapacity?: number;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -283,7 +294,7 @@ export function Shared<T>(
   if (existing) return existing as SharedRef<T>;
 
   const mem = options.memory ?? getDefaultMemory();
-  const ref = createSharedRef<T>(mem, key, options.refCount);
+  const ref = createSharedRef<T>(mem, key, options.refCount, options.arrayCapacity);
   registry.set(key, ref as SharedRef<unknown>);
 
   if (typeof initialOrLoader === "function") {
@@ -307,6 +318,7 @@ function createSharedRef<T>(
   mem: SharedMemory,
   key: string,
   tracker?: RefCountTracker,
+  arrayCapacity?: number,
 ): SharedRef<T> {
   const target = {
     key,
@@ -319,8 +331,8 @@ function createSharedRef<T>(
       }
       return value;
     },
-    write: (value: T) => writeValue(mem, key, value),
-    update: (fn: (current: T) => T) => updateValue(mem, key, fn),
+    write: (value: T) => writeValue(mem, key, value, arrayCapacity),
+    update: (fn: (current: T) => T) => updateValue(mem, key, fn, arrayCapacity),
   };
 
   return new Proxy(target, {
@@ -347,13 +359,13 @@ function createSharedRef<T>(
       const cachedValue = getCachedValue(mem, key);
       if (cachedValue !== undefined) {
         if (Array.isArray(cachedValue)) {
-          return getTopLevelArrayMember(mem, key, cachedValue, prop);
+          return getTopLevelArrayMember(mem, key, cachedValue, prop, arrayCapacity);
         }
         const propValue = (cachedValue as Record<string | symbol, unknown>)[
           prop
         ];
         if (Array.isArray(propValue)) {
-          return createArrayProxy(mem, key, prop as string);
+          return createArrayProxy(mem, key, prop as string, arrayCapacity);
         }
         return propValue;
       }
@@ -373,7 +385,7 @@ function createSharedRef<T>(
           const cachedProp = pc.props.get(prop as string);
           if (cachedProp !== undefined) {
             if (Array.isArray(cachedProp)) {
-              return createArrayProxy(mem, key, prop as string);
+              return createArrayProxy(mem, key, prop as string, arrayCapacity);
             }
             return cachedProp;
           }
@@ -390,7 +402,7 @@ function createSharedRef<T>(
         // Array properties are handled lazily by the array proxy; don't decode
         // the whole array here (avoids O(n) work on every access).
         if (slot.type === TYPE_ARRAY_REF) {
-          return createArrayProxy(mem, key, prop as string);
+          return createArrayProxy(mem, key, prop as string, arrayCapacity);
         }
         const propValue = decodeValue(mem, slot);
         if (pc === undefined || pc.version !== version) {
@@ -402,7 +414,7 @@ function createSharedRef<T>(
         }
         propCache.get(key)!.props.set(prop as string, propValue);
         if (Array.isArray(propValue)) {
-          return createArrayProxy(mem, key, prop as string);
+          return createArrayProxy(mem, key, prop as string, arrayCapacity);
         }
         return propValue;
       }
@@ -410,12 +422,12 @@ function createSharedRef<T>(
       // Primitive/array key: use the cached value directly (no copy).
       const value = readValue(mem, key);
       if (Array.isArray(value)) {
-        return getTopLevelArrayMember(mem, key, value, prop);
+        return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
       }
       // Object value: property access.
       const propValue = (value as Record<string | symbol, unknown>)[prop];
       if (Array.isArray(propValue)) {
-        return createArrayProxy(mem, key, prop as string);
+        return createArrayProxy(mem, key, prop as string, arrayCapacity);
       }
       return propValue;
     },
@@ -493,7 +505,7 @@ function createSharedRef<T>(
             (value as Record<string | symbol, unknown>)[prop] = val;
           }
           return true;
-        });
+        }, arrayCapacity);
       });
     },
     deleteProperty() {
@@ -552,7 +564,12 @@ function readValue(mem: SharedMemory, key: string): unknown {
 }
 
 /** Write a full value for a key to shared memory. */
-function writeValue(mem: SharedMemory, key: string, value: unknown): void {
+function writeValue(
+  mem: SharedMemory,
+  key: string,
+  value: unknown,
+  arrayCapacity?: number,
+): void {
   mem.withLock(() => {
     const existing = getOffset(mem, key);
     if (existing !== null) {
@@ -568,7 +585,7 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
               `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
             );
           }
-          mem.updateObjectSlot(existing, i, encodeValue(mem, valueObj[name]));
+          mem.updateObjectSlot(existing, i, encodeValue(mem, valueObj[name], arrayCapacity));
         }
         // Check for extra properties.
         const existingNames = new Set(properties.map(([n]) => n));
@@ -583,7 +600,7 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
         return;
       }
       // Update a single value slot in place.
-      mem.updateValueSlot(existing, encodeValue(mem, value));
+      mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
       bump(mem, key);
       return;
     }
@@ -592,7 +609,7 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
       // Create a new object.
       const valueObj = value as Record<string, unknown>;
       const props: Array<[string, ValueSlot]> = Object.entries(valueObj).map(
-        ([name, v]) => [name, encodeValue(mem, v)],
+        ([name, v]) => [name, encodeValue(mem, v, arrayCapacity)],
       );
       const offset = mem.createObject(props);
       mem.insert(key, offset);
@@ -600,7 +617,7 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
     }
 
     // Create a single value slot (primitive or array).
-    const offset = mem.storeValueSlot(encodeValue(mem, value));
+    const offset = mem.storeValueSlot(encodeValue(mem, value, arrayCapacity));
     mem.insert(key, offset);
   });
 }
@@ -615,11 +632,12 @@ function updateValue<T>(
   mem: SharedMemory,
   key: string,
   fn: (current: T) => T,
+  arrayCapacity?: number,
 ): T {
   return mem.withLock(() => {
     const current = readValue(mem, key) as T;
     const next = fn(current);
-    writeValue(mem, key, next);
+    writeValue(mem, key, next, arrayCapacity);
     return next;
   });
 }
@@ -633,11 +651,12 @@ function mutateValue<T, R>(
   mem: SharedMemory,
   key: string,
   fn: (current: T) => R,
+  arrayCapacity?: number,
 ): R {
   return mem.withLock(() => {
     const current = readValue(mem, key) as T;
     const result = fn(current);
-    writeValue(mem, key, current);
+    writeValue(mem, key, current, arrayCapacity);
     return result;
   });
 }
@@ -724,6 +743,7 @@ function getTopLevelArrayMember(
   key: string,
   value: unknown[],
   prop: string | symbol,
+  arrayCapacity?: number,
 ): unknown {
   if (prop === "length") return value.length;
   if (typeof prop === "string" && /^\d+$/.test(prop)) {
@@ -747,7 +767,7 @@ function getTopLevelArrayMember(
           fresh as unknown as Record<string, (...a: unknown[]) => unknown>
         )[methodName]!;
         return method.apply(fresh, args);
-      });
+      }, arrayCapacity);
     };
   }
   const method = (value as unknown as Record<string, unknown>)[prop];
@@ -760,6 +780,7 @@ function createArrayProxy(
   mem: SharedMemory,
   key: string,
   prop: string,
+  arrayCapacity?: number,
 ): unknown[] {
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
@@ -807,6 +828,7 @@ function createArrayProxy(
               )[methodName]!;
               return method.apply(freshArr, args);
             },
+            arrayCapacity,
           );
         };
       }
@@ -880,6 +902,7 @@ function createArrayProxy(
             (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
             return true;
           },
+          arrayCapacity,
         );
       });
     },
