@@ -12,16 +12,29 @@ await init();
 
 // `self` is the worker global; cast to access postMessage (not in the main
 // thread's type context).
-const workerScope = globalThis as unknown as { postMessage: (m: unknown) => void };
+const workerScope = globalThis as unknown as {
+  postMessage: (m: unknown) => void;
+};
 
 // Register a message handler. Messages are buffered until the buffers have
 // arrived, then forwarded here in order.
-onMessage((e) => {
-  if (e.data === "increment") {
-    // Read the shared value, mutate it, and write it back.
+onMessage(async (e) => {
+  const msg = e.data as { type?: string; count?: number };
+  if (msg.type === "increment") {
     const counter = Shared("counter", { value: 0 });
-    const current = counter.read();
-    counter.write({ value: current.value + 1 });
-    workerScope.postMessage(`incremented to ${counter.read().value}`);
+    const count = msg.count ?? 1;
+    for (let i = 0; i < count; i++) {
+      // Read the current value, then write the incremented value back.
+      const current = counter.read();
+      console.log(`Worker: read -> ${current.value}`);
+      counter.write({ value: current.value + 1 });
+      console.log(`Worker: write -> ${counter.read().value}`);
+
+      // Report both the value after the write and after the read to the main
+      // thread, then pause briefly so the example runs a little longer.
+      workerScope.postMessage({ kind: "write", value: current.value + 1 });
+      workerScope.postMessage({ kind: "read", value: counter.read().value });
+      await new Promise((r) => setTimeout(r, 200));
+    }
   }
 });
