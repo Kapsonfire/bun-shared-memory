@@ -251,3 +251,38 @@ describe("SharedMemory string interning", () => {
     expect(r2.offset).not.toBe(r1.offset);
   });
 });
+
+describe("SharedMemory total memory budget", () => {
+  test("maxTotalBytes caps the sum of all buffers, not each buffer", () => {
+    // A small total budget. Each buffer's own maxByteLength is
+    // min(4 GiB, maxTotalBytes) = 8192, but the *sum* of all buffers is capped
+    // at 8192. The 5 initial buffers (1024 each = 5120) fit within the budget.
+    const mem = new SharedMemory({ maxTotalBytes: 8192 });
+
+    // Writing enough distinct strings must eventually exceed the total budget
+    // even though no single buffer would exceed its own maxByteLength.
+    let threw = false;
+    try {
+      for (let i = 0; i < 100_000; i++) {
+        mem.storeString(`string-number-${i}-with-some-length`);
+      }
+    } catch (e) {
+      threw = e instanceof RangeError;
+    }
+    expect(threw).toBe(true);
+
+    // The total physical size never exceeded the budget.
+    const total =
+      mem.indexTable.buffer.byteLength +
+      mem.dataTable.buffer.byteLength +
+      mem.stringTable.buffer.byteLength +
+      mem.arrayTable.buffer.byteLength +
+      mem.versionTable.buffer.byteLength;
+    expect(total).toBeLessThanOrEqual(8192);
+  });
+
+  test("maxTotalBytes smaller than the initial buffers throws", () => {
+    // 5 initial buffers of 1024 bytes = 5120, which exceeds a 4096 budget.
+    expect(() => new SharedMemory({ maxTotalBytes: 4096 })).toThrow(RangeError);
+  });
+});

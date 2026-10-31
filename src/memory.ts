@@ -1,4 +1,4 @@
-import { GrowableBuffer } from "./growable-buffer.ts";
+import { GrowableBuffer, SharedBudget } from "./growable-buffer.ts";
 import { Mutex } from "./mutex.ts";
 
 /**
@@ -153,6 +153,24 @@ export function decodeSlot(slot: ValueSlot): unknown {
   }
 }
 
+export interface SharedMemoryOptions {
+  initialSize?: number;
+  maxByteLength?: number;
+  /** Total memory budget shared across all buffers (see below). */
+  maxTotalBytes?: number;
+  lock?: Mutex;
+  internCapacity?: number;
+  internMax?: number;
+  buffers?: {
+    indexTable?: SharedArrayBuffer;
+    dataTable?: SharedArrayBuffer;
+    stringTable?: SharedArrayBuffer;
+    arrayTable?: SharedArrayBuffer;
+    versionTable?: SharedArrayBuffer;
+    layoutVersion?: SharedArrayBuffer;
+  };
+}
+
 /**
  * Manages the four shared buffers and provides operations to store and read
  * strings, arrays, and objects.
@@ -202,43 +220,44 @@ export class SharedMemory {
    */
   private nextObjectId = 1;
 
-  constructor(options?: {
-    initialSize?: number;
-    maxByteLength?: number;
-    lock?: Mutex;
-    internCapacity?: number;
-    internMax?: number;
-    buffers?: {
-      indexTable?: SharedArrayBuffer;
-      dataTable?: SharedArrayBuffer;
-      stringTable?: SharedArrayBuffer;
-      arrayTable?: SharedArrayBuffer;
-      versionTable?: SharedArrayBuffer;
-      layoutVersion?: SharedArrayBuffer;
-    };
-  }) {
+  constructor(options?: SharedMemoryOptions) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
-    const max = options?.maxByteLength ?? DEFAULT_MAX;
+    // A single SharedArrayBuffer can be at most 4 GiB. `maxTotalBytes` is a
+    // *total* budget shared across all buffers: each buffer's own maxByteLength
+    // is capped at min(4 GiB, maxTotalBytes), and the sum of all buffers'
+    // physical sizes is additionally capped at maxTotalBytes. Without
+    // maxTotalBytes, each buffer simply grows up to its own maxByteLength.
+    const maxTotal = options?.maxTotalBytes;
+    const perBufferMax = Math.min(
+      4 * 1024 * 1024 * 1024,
+      maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX,
+    );
+    const budget = maxTotal !== undefined ? new SharedBudget(maxTotal) : undefined;
     const buffers = options?.buffers;
     this.indexTable = new GrowableBuffer(
-      buffers?.indexTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
-      max,
+      buffers?.indexTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      perBufferMax,
+      budget,
     );
     this.dataTable = new GrowableBuffer(
-      buffers?.dataTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
-      max,
+      buffers?.dataTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      perBufferMax,
+      budget,
     );
     this.stringTable = new GrowableBuffer(
-      buffers?.stringTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
-      max,
+      buffers?.stringTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      perBufferMax,
+      budget,
     );
     this.arrayTable = new GrowableBuffer(
-      buffers?.arrayTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
-      max,
+      buffers?.arrayTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      perBufferMax,
+      budget,
     );
     this.versionTable = new GrowableBuffer(
-      buffers?.versionTable ?? new SharedArrayBuffer(initial, { maxByteLength: max }),
-      max,
+      buffers?.versionTable ?? new SharedArrayBuffer(initial, { maxByteLength: perBufferMax }),
+      perBufferMax,
+      budget,
     );
     this.versionView = new Int32Array(this.versionTable.buffer);
     this.layoutVersion = new Int32Array(

@@ -1,4 +1,4 @@
-import { SharedMemory } from "./memory.ts";
+import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
 
 /**
  * Worker integration (M4).
@@ -57,15 +57,20 @@ export function hasDefaultMemory(): boolean {
  * Initialize the shared-memory handshake.
  *
  * - **Main thread**: call once after creating the first SharedMemory. It
- *   listens for new workers and answers each worker's buffer request.
+ *   listens for new workers and answers each worker's buffer request. If no
+ *   SharedMemory exists yet, one is created from `options` (e.g. to set a
+ *   total memory budget via `maxTotalBytes`).
  * - **Worker**: `await init()` at startup. It requests the shared buffers from
  *   the main thread and reconstructs the singleton `SharedMemory` from them.
  *
  * Returns a promise that resolves once the handshake is set up (immediately in
  * the main thread, after the buffers arrive in a worker).
  */
-export async function init(): Promise<void> {
+export async function init(options?: SharedMemoryOptions): Promise<void> {
   if (Bun.isMainThread) {
+    if (!hasDefaultMemory()) {
+      setDefaultMemory(new SharedMemory(options));
+    }
     initMain();
     return;
   }

@@ -180,6 +180,32 @@ overwrites a value that already exists in shared memory, so a worker reading a
 key created by the main thread gets the existing value rather than its own
 initial value.
 
+## Memory budget
+
+Shared memory is split across several growable `SharedArrayBuffer`s (the
+index, data, string, array, and version tables). A single `SharedArrayBuffer`
+can be at most **4 GiB**. By default each buffer grows independently up to its
+own `maxByteLength`, so the *total* memory can be several times that.
+
+To cap the **total** memory across all buffers, pass `maxTotalBytes` when
+creating the memory (or to `init()`):
+
+```ts
+import { SharedMemory, init } from "shared-memory";
+
+// Total budget of 4 GiB shared across all buffers. Each buffer's own
+// maxByteLength is min(4 GiB, maxTotalBytes), and the sum of all buffers'
+// physical sizes is additionally capped at maxTotalBytes.
+const mem = new SharedMemory({ maxTotalBytes: 4 * 1024 * 1024 * 1024 });
+
+// Or set it when initializing the shared-memory handshake:
+await init({ maxTotalBytes: 4 * 1024 * 1024 * 1024 });
+```
+
+The budget is shared dynamically — buffers grow as needed, but only while the
+sum of all buffers stays within `maxTotalBytes`. If a write would exceed the
+budget, a `RangeError` is thrown.
+
 ## Development
 
 ```bash
