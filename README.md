@@ -129,12 +129,10 @@ import { SharedMemory, RefCountCoordinator, RefCountTracker, RefCountBuffer } fr
 
 // Main thread: coordinate refcounts and auto-register workers.
 const mem = new SharedMemory();
-const coord = new RefCountCoordinator(mem);
+const coord = new RefCountCoordinator(mem);  // auto-maintenance starts automatically
 coord.autoRegister();          // track workers via process.on("worker")
-coord.drainEvents();           // process acquire/release events
-if (coord.needsDefrag()) {
-  mem.withLock(() => mem.defragment());
-}
+// The coordinator periodically drains acquire/release events and defragments
+// when free space runs low — no manual calls needed.
 
 // Worker: track references acquired by read().
 const tracker = new RefCountTracker(new RefCountBuffer(refBuf), workerId);
