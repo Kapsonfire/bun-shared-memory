@@ -67,6 +67,15 @@ export interface ValueSlot {
   c: number;
 }
 
+/**
+ * The stable layout of an object value in the DataTable: its total offset and
+ * the slot offset of each property. Static for the lifetime of the object.
+ */
+export interface ObjectLayout {
+  totalOffset: number;
+  properties: Map<string, number>;
+}
+
 /** Encode a number (float64) into a ValueSlot. */
 export function numberSlot(value: number): ValueSlot {
   const buf = new ArrayBuffer(8);
@@ -310,6 +319,36 @@ export class SharedMemory {
       properties.push([name, slot]);
     }
     return properties;
+  }
+
+  /**
+   * Get the stable layout of an object value: its total DataTable offset and
+   * the slot offset of each property.
+   *
+   * Because object properties may not be added or removed, the layout is
+   * static for the lifetime of the object (it only changes if the object is
+   * moved by a future GC/defragmentation). Callers can cache it and read
+   * individual property slots directly without decoding the whole object.
+   *
+   * Returns null if the key does not exist or is not an object.
+   */
+  getObjectLayout(key: string): ObjectLayout | null {
+    const offset = this.lookup(key);
+    if (offset === null) return null;
+    const view = this.dataTable.getView();
+    if (view.getInt32(offset, true) !== TYPE_OBJECT) return null;
+    const count = view.getInt32(offset + 4, true);
+    const properties = new Map<string, number>();
+    let cursor = offset + OBJECT_HEADER;
+    for (let i = 0; i < count; i++) {
+      const nameOffset = view.getInt32(cursor, true);
+      const nameLength = view.getInt32(cursor + 4, true);
+      const name = this.readString({ offset: nameOffset, length: nameLength });
+      cursor += NAME_REF_SIZE;
+      properties.set(name, cursor);
+      cursor += SLOT_SIZE;
+    }
+    return { totalOffset: offset, properties };
   }
 
   /** Update a single value slot of an object in the DataTable. */

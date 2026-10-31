@@ -7,6 +7,7 @@ import {
   numberSlot,
   stringRefSlot,
   type ArrayRef,
+  type ObjectLayout,
   type StringRef,
   type ValueSlot,
 } from "./memory.ts";
@@ -104,6 +105,36 @@ export type SharedRef<T> = [T] extends [object]
  */
 const readCache = new Map<string, { version: number; value: unknown; index: number }>();
 
+/**
+ * Per-worker cache of decoded object properties: key -> { version, props }.
+ *
+ * When a property of an object is read via the layout (single-slot decode),
+ * the decoded value is cached here keyed by the object's version. A hit avoids
+ * re-decoding the property (e.g. re-reading a string from the StringTable) on
+ * repeated reads of the same property. Writes bump the object's version, so
+ * the whole entry is invalidated automatically.
+ */
+const propCache = new Map<string, { version: number; index: number; props: Map<string, unknown> }>();
+
+/**
+ * Per-worker cache of object layouts: key -> stable property slot offsets.
+ *
+ * Because object properties may not be added or removed, the layout is static
+ * for the lifetime of the object. It is built once (under the lock) and cached
+ * so individual property reads can decode only the requested slot instead of
+ * the whole object. If a future GC/defragmentation moves an object block, this
+ * cache must be invalidated (e.g. via a layout version cell).
+ */
+const layoutCache = new Map<string, ObjectLayout | null>();
+
+/** Get (and cache) the stable layout of an object value, or null if not an object. */
+function getObjectLayout(mem: SharedMemory, key: string): ObjectLayout | null {
+  if (layoutCache.has(key)) return layoutCache.get(key)!;
+  const layout = mem.withLock(() => mem.getObjectLayout(key));
+  layoutCache.set(key, layout);
+  return layout;
+}
+
 /** Deep-ish copy of a decoded value, so callers can't corrupt the cache. */
 function copyValue(value: unknown): unknown {
   if (Array.isArray(value)) return [...value];
@@ -197,7 +228,61 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
       if (prop === "buffer") return mem.dataTable.buffer;
       if (prop === Symbol.toPrimitive) return () => t.read();
 
-      // Use the cached value directly (no copy) for property access.
+      // Fast path: if the full value is cached and valid, read the property
+      // from the cached value (no decode, no lock).
+      const cachedValue = getCachedValue(mem, key);
+      if (cachedValue !== undefined) {
+        if (Array.isArray(cachedValue)) {
+          return getTopLevelArrayMember(mem, key, cachedValue, prop);
+        }
+        const propValue = (cachedValue as Record<string | symbol, unknown>)[prop];
+        if (Array.isArray(propValue)) {
+          return createArrayProxy(mem, key, prop as string);
+        }
+        return propValue;
+      }
+
+      // Cache miss: for objects, decode only the requested property's slot via
+      // the cached layout, avoiding a full-object decode. The decoded value is
+      // cached per property so repeated reads of the same property are cheap.
+      const layout = getObjectLayout(mem, key);
+      if (layout !== null) {
+        const slotOffset = layout.properties.get(prop as string);
+        if (slotOffset === undefined) return undefined;
+
+        // Property cache hit: the object's version is unchanged.
+        const pc = propCache.get(key);
+        const version = pc !== undefined ? mem.getVersion(pc.index) : -1;
+        if (pc !== undefined && pc.version === version) {
+          const cachedProp = pc.props.get(prop as string);
+          if (cachedProp !== undefined) {
+            if (Array.isArray(cachedProp)) {
+              return createArrayProxy(mem, key, prop as string);
+            }
+            return cachedProp;
+          }
+        }
+
+        // Decode the single slot and cache it under the object's version.
+        // The key's index is stable (keys are never removed), so reuse the
+        // cached index when available to avoid the linear index-table lookup.
+        const index =
+          pc !== undefined
+            ? pc.index
+            : readCache.get(key)?.index ?? mem.lookupIndex(key) ?? 0;
+        const slot = mem.readValueSlot(slotOffset);
+        const propValue = decodeValue(mem, slot);
+        if (pc === undefined || pc.version !== version) {
+          propCache.set(key, { version: mem.getVersion(index), index, props: new Map() });
+        }
+        propCache.get(key)!.props.set(prop as string, propValue);
+        if (Array.isArray(propValue)) {
+          return createArrayProxy(mem, key, prop as string);
+        }
+        return propValue;
+      }
+
+      // Primitive/array key: use the cached value directly (no copy).
       const value = readValue(mem, key);
       if (Array.isArray(value)) {
         return getTopLevelArrayMember(mem, key, value, prop);
@@ -225,6 +310,17 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
       );
     },
   }) as unknown as SharedRef<T>;
+}
+
+/**
+ * Return the cached full value for a key if it is still valid (lock-free
+ * version check), or undefined on a cache miss. Does not decode.
+ */
+function getCachedValue(mem: SharedMemory, key: string): unknown | undefined {
+  const cached = readCache.get(key);
+  if (cached === undefined) return undefined;
+  if (cached.version !== mem.getVersion(cached.index)) return undefined;
+  return cached.value;
 }
 
 /** Read the full value for a key from shared memory, using the read cache. */

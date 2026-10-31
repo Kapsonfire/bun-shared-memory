@@ -68,6 +68,17 @@ any worker invalidates the cache in every other worker automatically.
 cache. Property access through the proxy (e.g. `user.name`) reads from the
 cache directly.
 
+### Offset cache
+
+Because object properties may not be added or removed, an object's layout
+(total DataTable offset + each property's slot offset) is static for the
+lifetime of the object. The layout is built once (under the lock) and cached
+per worker, so a property read decodes only the requested slot instead of the
+whole object. The decoded property value is cached per property and
+invalidated by the same per-key version cell, so repeated reads of the same
+property are cheap. If a future GC/defragmentation moves an object block, the
+layout cache must be invalidated (e.g. via a layout version cell).
+
 ### Mutex
 
 A re-entrant cross-worker mutex. Share the same buffer across workers.
@@ -124,7 +135,7 @@ every supported data type and its arrays:
 Each benchmark reports ops/sec for the native and shared paths, plus the
 relative slowdown. Results are in `bench/`.
 
-With the read cache, **reads** are typically 5–12× slower than native (the
-remaining cost is the proxy dispatch). **Writes** are much slower because they
-must serialize, write, and bump the version cell; array `push` re-encodes the
-whole array each time.
+With the read cache and offset cache, **reads** are typically 5–12× slower than
+native (the remaining cost is the proxy dispatch). **Writes** are much slower
+because they must serialize, write, and bump the version cell; array `push`
+re-encodes the whole array each time.
