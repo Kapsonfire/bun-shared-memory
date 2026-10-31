@@ -120,6 +120,44 @@ export type SharedRef<T> = [T] extends [object]
 const readCache = new Map<string, { version: number; value: unknown; index: number }>();
 
 /**
+ * Per-worker cache of a key's stable index in the Index Table.
+ *
+ * Keys are never removed, so a key's index is stable for its lifetime. Once
+ * resolved, it can be cached forever, avoiding the linear index-table lookup
+ * (which decodes every stored key string) on every access.
+ */
+const indexCache = new Map<string, number>();
+
+/** Resolve a key's stable index, caching it after the first lookup. */
+function getIndex(mem: SharedMemory, key: string): number {
+  const cached = indexCache.get(key);
+  if (cached !== undefined) return cached;
+  const index = mem.lookupIndex(key);
+  if (index === null) {
+    throw new Error(`No shared value found for key "${key}"`);
+  }
+  indexCache.set(key, index);
+  return index;
+}
+
+/**
+ * Resolve a key's current DataTable offset using the cached stable index.
+ * The offset can change on GC/defragmentation, so it is re-read from the
+ * Index Table each time (a single Int32 read), but the expensive linear
+ * key-string scan is avoided. Returns null if the key is not present.
+ */
+function getOffset(mem: SharedMemory, key: string): number | null {
+  const cached = indexCache.get(key);
+  if (cached !== undefined) {
+    return mem.lookupByIndex(cached);
+  }
+  const index = mem.lookupIndex(key);
+  if (index === null) return null;
+  indexCache.set(key, index);
+  return mem.lookupByIndex(index);
+}
+
+/**
  * Per-worker cache of decoded object properties: key -> { version, props }.
  *
  * When a property of an object is read via the layout (single-slot decode),
@@ -293,7 +331,7 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
         const index =
           pc !== undefined
             ? pc.index
-            : readCache.get(key)?.index ?? mem.lookupIndex(key) ?? 0;
+            : readCache.get(key)?.index ?? getIndex(mem, key);
         const slot = mem.readValueSlot(slotOffset);
         // Array properties are handled lazily by the array proxy; don't decode
         // the whole array here (avoids O(n) work on every access).
@@ -342,7 +380,7 @@ function createSharedRef<T>(mem: SharedMemory, key: string): SharedRef<T> {
         }
 
         // Top-level array index write: update only that array slot.
-        const offset = mem.lookup(key);
+        const offset = getOffset(mem, key);
         if (offset === null) {
           throw new Error(`No shared value found for key "${key}"`);
         }
@@ -392,16 +430,7 @@ function getCachedValue(mem: SharedMemory, key: string): unknown | undefined {
 /** Read the full value for a key from shared memory, using the read cache. */
 function readValue(mem: SharedMemory, key: string): unknown {
   const cached = readCache.get(key);
-  const index =
-    cached !== undefined
-      ? cached.index
-      : (() => {
-          const i = mem.lookupIndex(key);
-          if (i === null) {
-            throw new Error(`No shared value found for key "${key}"`);
-          }
-          return i;
-        })();
+  const index = cached !== undefined ? cached.index : getIndex(mem, key);
 
   // Lock-free fast path: if the cached version matches the current version
   // cell, the cached value is still valid.
@@ -412,7 +441,7 @@ function readValue(mem: SharedMemory, key: string): unknown {
 
   // Cache miss: decode under the lock and cache with the observed version.
   const value = mem.withLock(() => {
-    const offset = mem.lookup(key);
+    const offset = getOffset(mem, key);
     if (offset === null) {
       throw new Error(`No shared value found for key "${key}"`);
     }
@@ -437,7 +466,7 @@ function readValue(mem: SharedMemory, key: string): unknown {
 /** Write a full value for a key to shared memory. */
 function writeValue(mem: SharedMemory, key: string, value: unknown): void {
   mem.withLock(() => {
-    const existing = mem.lookup(key);
+    const existing = getOffset(mem, key);
     if (existing !== null) {
       const type = mem.dataTable.getView().getInt32(existing, true);
       if (type === 5) {
@@ -490,8 +519,7 @@ function writeValue(mem: SharedMemory, key: string, value: unknown): void {
 
 /** Bump the version cell for a key, invalidating read caches. */
 function bump(mem: SharedMemory, key: string): void {
-  const index = mem.lookupIndex(key);
-  if (index !== null) mem.bumpVersion(index);
+  mem.bumpVersion(getIndex(mem, key));
 }
 
 /** Atomically update the value for a key. */
@@ -538,7 +566,7 @@ function findArrayRefSlot(
   prop: string | null,
 ): number | null {
   if (prop === null) {
-    const offset = mem.lookup(key);
+    const offset = getOffset(mem, key);
     if (offset === null) return null;
     const slot = mem.readValueSlot(offset);
     return slot.type === TYPE_ARRAY_REF ? offset : null;

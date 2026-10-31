@@ -426,7 +426,14 @@ export class SharedMemory {
   lookup(key: string): number | null {
     const index = this.lookupIndex(key);
     if (index === null) return null;
+    return this.lookupByIndex(index);
+  }
+
+  /** Read the DataTable offset for a known stable index, or null if absent. */
+  lookupByIndex(index: number): number | null {
     const view = this.indexTable.getView();
+    const count = view.getInt32(0, true);
+    if (index >= count) return null;
     const entryOffset = INDEX_HEADER + index * INDEX_ENTRY_SIZE;
     return view.getInt32(entryOffset + 8, true);
   }
