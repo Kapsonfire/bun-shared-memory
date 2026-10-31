@@ -11,6 +11,7 @@ import { benchOptions, benchPair, nextKey } from "./helpers.ts";
   benchPair("number[] · read index", () => native[3], () => shared[3]);
   benchPair("number[] · write index", () => (native[3] = 99), () => (shared[3] = 99), 1_000);
   benchPair("number[] · push", () => native.push(11), () => shared.push(11), 1_000);
+  benchPair("number[] · pop", () => native.pop(), () => shared.pop(), 1_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,7 @@ import { benchOptions, benchPair, nextKey } from "./helpers.ts";
   benchPair("string[] · read index", () => native[3], () => shared[3]);
   benchPair("string[] · write index", () => (native[3] = "z"), () => (shared[3] = "z"), 1_000);
   benchPair("string[] · push", () => native.push("k"), () => shared.push("k"), 1_000);
+  benchPair("string[] · pop", () => native.pop(), () => shared.pop(), 1_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ import { benchOptions, benchPair, nextKey } from "./helpers.ts";
   benchPair("boolean[] · read index", () => native[3], () => shared[3]);
   benchPair("boolean[] · write index", () => (native[3] = true), () => (shared[3] = true), 1_000);
   benchPair("boolean[] · push", () => native.push(true), () => shared.push(true), 1_000);
+  benchPair("boolean[] · pop", () => native.pop(), () => shared.pop(), 1_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +50,7 @@ import { benchOptions, benchPair, nextKey } from "./helpers.ts";
   benchPair("bigint[] · read index", () => native[3], () => shared[3]);
   benchPair("bigint[] · write index", () => (native[3] = 99n), () => (shared[3] = 99n), 1_000);
   benchPair("bigint[] · push", () => native.push(11n), () => shared.push(11n), 1_000);
+  benchPair("bigint[] · pop", () => native.pop(), () => shared.pop(), 1_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -59,4 +63,5 @@ import { benchOptions, benchPair, nextKey } from "./helpers.ts";
   benchPair("mixed[] · read index", () => native[3], () => shared[3]);
   benchPair("mixed[] · write index", () => (native[3] = 99), () => (shared[3] = 99), 1_000);
   benchPair("mixed[] · push", () => native.push(11), () => shared.push(11), 1_000);
+  benchPair("mixed[] · pop", () => native.pop(), () => shared.pop(), 1_000);
 }
