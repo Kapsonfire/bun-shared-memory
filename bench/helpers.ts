@@ -5,14 +5,25 @@ interface BenchResult {
   nativeOps: number;
   sharedOps: number;
   ratio: number;
-  kind: "read" | "write";
+  kind: "read" | "write" | "array-write";
 }
 
 const results: BenchResult[] = [];
 
-/** Classify a benchmark name as a read or a write. */
-function classify(name: string): "read" | "write" {
-  return /read/i.test(name) ? "read" : "write";
+/**
+ * Classify a benchmark name into a summary category.
+ *
+ * - "read"        — any read operation
+ * - "array-write" — array mutations: index writes, push, pop (on top-level
+ *                   arrays or object array properties)
+ * - "write"       — everything else that writes (primitives, object props)
+ */
+function classify(name: string): BenchResult["kind"] {
+  if (/read/i.test(name)) return "read";
+  if (/\[\]|array/i.test(name) && /write|push|pop/i.test(name)) {
+    return "array-write";
+  }
+  return "write";
 }
 
 /**
@@ -52,10 +63,11 @@ export function benchPair(
   );
 }
 
-/** Print a summary separating reads and writes. */
+/** Print a summary separating reads, writes, and array writes. */
 export function printSummary(): void {
   const reads = results.filter((r) => r.kind === "read");
   const writes = results.filter((r) => r.kind === "write");
+  const arrayWrites = results.filter((r) => r.kind === "array-write");
 
   const avg = (rs: BenchResult[]) =>
     rs.length === 0
@@ -68,8 +80,9 @@ export function printSummary(): void {
       : `${avg(rs).toFixed(1)}× slower (min ${Math.min(...rs.map((r) => r.ratio)).toFixed(1)}×, max ${Math.max(...rs.map((r) => r.ratio)).toFixed(1)}×)`;
 
   console.log("\n── Summary ──────────────────────────────────────────────");
-  console.log(`Reads  (${reads.length}):  ${fmt(reads)}`);
-  console.log(`Writes (${writes.length}): ${fmt(writes)}`);
+  console.log(`Reads        (${reads.length}):  ${fmt(reads)}`);
+  console.log(`Writes       (${writes.length}): ${fmt(writes)}`);
+  console.log(`Array writes (${arrayWrites.length}): ${fmt(arrayWrites)}`);
 }
 
 /** Measure ops/sec for `fn` over `iterations` invocations. */
