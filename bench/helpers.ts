@@ -1,5 +1,20 @@
 import { Shared, type SharedOptions } from "../src/index.ts";
 
+interface BenchResult {
+  name: string;
+  nativeOps: number;
+  sharedOps: number;
+  ratio: number;
+  kind: "read" | "write";
+}
+
+const results: BenchResult[] = [];
+
+/** Classify a benchmark name as a read or a write. */
+function classify(name: string): "read" | "write" {
+  return /read/i.test(name) ? "read" : "write";
+}
+
 /**
  * Run a shared-vs-native benchmark for a single operation.
  *
@@ -30,9 +45,31 @@ export function benchPair(
       ? `${ratio.toFixed(2)}× slower`
       : `${(1 / ratio).toFixed(2)}× faster`;
 
+  results.push({ name, nativeOps, sharedOps, ratio, kind: classify(name) });
+
   console.log(
     `${name.padEnd(34)} native ${String(nativeOps).padStart(12)} ops/s | shared ${String(sharedOps).padStart(12)} ops/s | ${slower}`,
   );
+}
+
+/** Print a summary separating reads and writes. */
+export function printSummary(): void {
+  const reads = results.filter((r) => r.kind === "read");
+  const writes = results.filter((r) => r.kind === "write");
+
+  const avg = (rs: BenchResult[]) =>
+    rs.length === 0
+      ? 0
+      : rs.reduce((sum, r) => sum + r.ratio, 0) / rs.length;
+
+  const fmt = (rs: BenchResult[]) =>
+    rs.length === 0
+      ? "n/a"
+      : `${avg(rs).toFixed(1)}× slower (min ${Math.min(...rs.map((r) => r.ratio)).toFixed(1)}×, max ${Math.max(...rs.map((r) => r.ratio)).toFixed(1)}×)`;
+
+  console.log("\n── Summary ──────────────────────────────────────────────");
+  console.log(`Reads  (${reads.length}):  ${fmt(reads)}`);
+  console.log(`Writes (${writes.length}): ${fmt(writes)}`);
 }
 
 /** Measure ops/sec for `fn` over `iterations` invocations. */
