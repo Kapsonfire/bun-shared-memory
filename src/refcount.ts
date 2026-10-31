@@ -160,15 +160,25 @@ export class RefCountCoordinator {
   private nextWorkerId = 0;
   /** Free-space threshold (fraction of maxByteLength) that triggers defrag. */
   private readonly defragThreshold: number;
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     mem: SharedMemory,
     buffer?: RefCountBuffer,
-    opts: { defragThreshold?: number } = {},
+    opts: {
+      defragThreshold?: number;
+      autoMaintenance?: boolean;
+      maintenanceInterval?: number;
+    } = {},
   ) {
     this.mem = mem;
     this.buffer = buffer ?? new RefCountBuffer();
     this.defragThreshold = opts.defragThreshold ?? 0.1;
+    // Start periodic maintenance automatically so refcount events are drained
+    // and dead space is reclaimed without an explicit call.
+    if (opts.autoMaintenance ?? true) {
+      this.startAutoMaintenance(opts.maintenanceInterval ?? 100);
+    }
   }
 
   get sab(): SharedArrayBuffer {
@@ -274,8 +284,6 @@ export class RefCountCoordinator {
       free(this.mem.stringTable) < this.defragThreshold
     );
   }
-
-  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Start periodic maintenance on the main thread.

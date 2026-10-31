@@ -39,7 +39,7 @@ describe("RefCountBuffer", () => {
 describe("RefCountCoordinator", () => {
   test("tracks which worker holds a reference", () => {
     const mem = new SharedMemory();
-    const coord = new RefCountCoordinator(mem);
+    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
     const workerId = coord.registerWorker({});
     coord.acquire(1, workerId);
     expect(coord.refCount(1)).toBe(1);
@@ -49,7 +49,7 @@ describe("RefCountCoordinator", () => {
 
   test("releases all refs when a worker closes", () => {
     const mem = new SharedMemory();
-    const coord = new RefCountCoordinator(mem);
+    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
     const worker = { onclose: null as (() => void) | null };
     const workerId = coord.registerWorker(worker);
     coord.acquire(1, workerId);
@@ -65,7 +65,7 @@ describe("RefCountCoordinator", () => {
   test("drains events from the ring buffer", () => {
     const mem = new SharedMemory();
     const buf = new RefCountBuffer();
-    const coord = new RefCountCoordinator(mem, buf);
+    const coord = new RefCountCoordinator(mem, buf, { autoMaintenance: false });
     const workerId = coord.registerWorker({});
     buf.pushEvent(workerId, 1, 10);
     coord.drainEvents();
@@ -165,7 +165,7 @@ describe("Defragmentation", () => {
 describe("RefCount across workers", () => {
   test("a worker's refs are released when it closes", async () => {
     const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
-    const coord = new RefCountCoordinator(mem);
+    const coord = new RefCountCoordinator(mem, undefined, { autoMaintenance: false });
     const user = Shared("rc-worker-1", { name: "Alice", age: 30 }, { memory: mem });
 
     const workerCode = `
@@ -229,7 +229,8 @@ describe("RefCount across workers", () => {
   test("auto maintenance drains events and defragments on demand", async () => {
     const mem = new SharedMemory();
     const buf = new RefCountBuffer();
-    const coord = new RefCountCoordinator(mem, buf);
+    // autoMaintenance starts automatically in the constructor.
+    const coord = new RefCountCoordinator(mem, buf, { maintenanceInterval: 5 });
     const workerId = coord.registerWorker({});
 
     // Push an acquire event directly into the ring buffer (as a worker would).
@@ -237,8 +238,7 @@ describe("RefCount across workers", () => {
     buf.pushEvent(workerId, 1, objectId);
     expect(coord.refCount(objectId)).toBe(0);
 
-    const stop = coord.startAutoMaintenance(5);
-    // Wait for the timer to drain the event.
+    // Wait for the automatic timer to drain the event.
     await new Promise((r) => setTimeout(r, 30));
     expect(coord.refCount(objectId)).toBe(1);
 
@@ -247,6 +247,6 @@ describe("RefCount across workers", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(coord.refCount(objectId)).toBe(0);
 
-    stop();
+    coord.stopAutoMaintenance();
   });
 });
