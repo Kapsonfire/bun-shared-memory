@@ -10,14 +10,16 @@ import { Mutex } from "./mutex.ts";
  *   4) ArrayTable    — append-only storage for arrays
  *
  * Value slot layout (16 bytes):
- *   [0..3]   type (Int32): 0=number, 1=boolean, 2=bigint, 3=string-ref, 4=array-ref
+ *   [0..3]   type (Int32): 0=number, 1=boolean, 2=bigint, 3=string-ref, 4=array-ref, 6=bigint-str
  *   [4..7]   payload A
  *   [8..11]  payload B
  *   [12..15] payload C
  *
  *   number     -> float64 in [4..11]
  *   boolean    -> [4] = 0/1
- *   bigint     -> int64 in [4..11]
+ *   bigint     -> int64 in [4..11] (only values that fit in 64 bits)
+ *   bigint-str -> [4..7]=offset, [8..11]=length (into StringTable); for bigints
+ *                 too large for 64 bits, stored as their decimal string
  *   string-ref -> [4..7]=offset, [8..11]=length (into StringTable)
  *   array-ref  -> [4..7]=offset, [8..11]=count (into ArrayTable)
  *
@@ -40,6 +42,7 @@ export const TYPE_BIGINT = 2;
 export const TYPE_STRING_REF = 3;
 export const TYPE_ARRAY_REF = 4;
 export const TYPE_OBJECT = 5;
+export const TYPE_BIGINT_STR = 6;
 
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
@@ -106,6 +109,11 @@ export function bigintSlot(value: bigint): ValueSlot {
 /** Encode a string reference into a ValueSlot. */
 export function stringRefSlot(ref: StringRef): ValueSlot {
   return { type: TYPE_STRING_REF, a: ref.offset, b: ref.length, c: 0 };
+}
+
+/** Encode a bigint stored as a decimal string into a ValueSlot. */
+export function bigintStrSlot(ref: StringRef): ValueSlot {
+  return { type: TYPE_BIGINT_STR, a: ref.offset, b: ref.length, c: 0 };
 }
 
 /** Encode an array reference into a ValueSlot. */

@@ -1,8 +1,10 @@
 import {
   SharedMemory,
   TYPE_ARRAY_REF,
+  TYPE_BIGINT_STR,
   arrayRefSlot,
   bigintSlot,
+  bigintStrSlot,
   booleanSlot,
   decodeSlot,
   numberSlot,
@@ -28,6 +30,10 @@ const MUTATING_METHODS = new Set([
 
 type Primitive = number | string | boolean | bigint;
 
+/** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
+const MIN_INT64 = -(2n ** 63n);
+const MAX_INT64 = 2n ** 63n - 1n;
+
 /** Convert a JS value into a ValueSlot, storing strings/arrays in tables. */
 function encodeValue(mem: SharedMemory, value: unknown): ValueSlot {
   switch (typeof value) {
@@ -36,7 +42,12 @@ function encodeValue(mem: SharedMemory, value: unknown): ValueSlot {
     case "boolean":
       return booleanSlot(value);
     case "bigint":
-      return bigintSlot(value);
+      // Bigints that fit in 64 bits are stored as a fast int64 slot; larger
+      // ones are stored as their decimal string in the StringTable.
+      if (value >= MIN_INT64 && value <= MAX_INT64) {
+        return bigintSlot(value);
+      }
+      return bigintStrSlot(mem.storeString(value.toString()));
     case "string":
       return stringRefSlot(mem.storeString(value));
     default:
@@ -62,6 +73,8 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
   switch (slot.type) {
     case 3: // string-ref
       return mem.readString({ offset: slot.a, length: slot.b });
+    case TYPE_BIGINT_STR: // bigint stored as decimal string
+      return BigInt(mem.readString({ offset: slot.a, length: slot.b }));
     case 4: // array-ref
       return mem.readArray({ offset: slot.a, count: slot.b, capacity: slot.c }).map((s) =>
         decodeValue(mem, s),

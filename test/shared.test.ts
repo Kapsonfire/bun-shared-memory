@@ -45,6 +45,31 @@ describe("Shared", () => {
     expect(bi.read()).toBe(123n);
   });
 
+  test("supports bigints larger than 64 bits via read/write", () => {
+    const big = 2n ** 100n;
+    const s = Shared("big-2", big);
+    expect(s.read()).toBe(big);
+
+    const neg = -(2n ** 200n);
+    const n = Shared("big-3", neg);
+    expect(n.read()).toBe(neg);
+
+    // Boundary: exactly max/min int64 stay as int64; just past go to string.
+    const max = Shared("big-4", 2n ** 63n - 1n);
+    expect(max.read()).toBe(2n ** 63n - 1n);
+    const over = Shared("big-5", 2n ** 63n);
+    expect(over.read()).toBe(2n ** 63n);
+  });
+
+  test("supports bigints larger than 64 bits in arrays and object properties", () => {
+    const arr = Shared("big-arr-1", [1n, 2n ** 100n, -(2n ** 200n)]);
+    expect(arr.read()).toEqual([1n, 2n ** 100n, -(2n ** 200n)]);
+
+    const obj = Shared("big-obj-1", { a: 1n, b: 2n ** 100n });
+    expect(obj.a).toBe(1n);
+    expect(obj.b).toBe(2n ** 100n);
+  });
+
   test("supports top-level arrays with index access", () => {
     const arr = Shared("arr-1", [1, 2, 3]);
     expect(arr[0]).toBe(1);

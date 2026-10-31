@@ -13,6 +13,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 ## Data Types
 
 - **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
+- **BigInts** of any size are supported: values that fit in 64 bits are stored as a fast int64 slot; larger values are stored as their decimal string in the StringTable.
 - **Objects** have a **fixed shape**: once created, properties may not be added or removed — only their values can change.
 - **Not allowed**: nested objects, nested arrays, `null`, `undefined`.
 
