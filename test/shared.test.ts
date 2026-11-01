@@ -305,15 +305,16 @@ describe("SharedMemory total memory budget", () => {
 describe("Shared arrayCapacity option", () => {
   test("reserves extra capacity so push does not move the array", () => {
     const mem = new SharedMemory();
-    const arr = Shared("cap-arr-1", [1, 2, 3], { memory: mem, arrayCapacity: 100 });
+    const arr = Shared("cap-arr-1", [1, 2, 3], {
+      memory: mem,
+      arrayCapacity: 100,
+    });
 
     // Push well beyond the initial length; all values must be preserved.
     for (let i = 4; i <= 50; i++) {
       arr.push(i);
     }
-    expect(arr.read()).toEqual(
-      Array.from({ length: 50 }, (_, i) => i + 1),
-    );
+    expect(arr.read()).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
 
     // The array ref's capacity should be 100 (the reserved capacity), not
     // grown to 64/128 by doubling. Inspect the stored array ref directly.

@@ -294,7 +294,12 @@ export function Shared<T>(
   if (existing) return existing as SharedRef<T>;
 
   const mem = options.memory ?? getDefaultMemory();
-  const ref = createSharedRef<T>(mem, key, options.refCount, options.arrayCapacity);
+  const ref = createSharedRef<T>(
+    mem,
+    key,
+    options.refCount,
+    options.arrayCapacity,
+  );
   registry.set(key, ref as SharedRef<unknown>);
 
   if (typeof initialOrLoader === "function") {
@@ -328,8 +333,7 @@ function createSharedRef<T>(
     // on every local write/update; cross-worker invalidation is detected by
     // the version check in the get handler.
     __cache: undefined as
-      | { version: number; value: unknown; index: number }
-      | undefined,
+      { version: number; value: unknown; index: number } | undefined,
     read: () => {
       const value = copyValue(readValue(mem, key, target)) as T;
       if (tracker && isTrackable(value)) {
@@ -371,10 +375,19 @@ function createSharedRef<T>(
       // from the cached value (no decode, no lock). The cache entry is kept
       // directly on the target to avoid a Map lookup on the hot path.
       const cached = t.__cache;
-      if (cached !== undefined && cached.version === mem.getVersion(cached.index)) {
+      if (
+        cached !== undefined &&
+        cached.version === mem.getVersion(cached.index)
+      ) {
         const cachedValue = cached.value;
         if (Array.isArray(cachedValue)) {
-          return getTopLevelArrayMember(mem, key, cachedValue, prop, arrayCapacity);
+          return getTopLevelArrayMember(
+            mem,
+            key,
+            cachedValue,
+            prop,
+            arrayCapacity,
+          );
         }
         const propValue = (cachedValue as Record<string | symbol, unknown>)[
           prop
@@ -514,14 +527,20 @@ function createSharedRef<T>(
 
         // Fallback: full read-modify-write (e.g. setting a primitive key's
         // property, or a non-index property on an array).
-        return mutateValue<T, boolean>(mem, key, (value) => {
-          if (Array.isArray(value)) {
-            (value as unknown as Record<string | symbol, unknown>)[prop] = val;
-          } else {
-            (value as Record<string | symbol, unknown>)[prop] = val;
-          }
-          return true;
-        }, arrayCapacity);
+        return mutateValue<T, boolean>(
+          mem,
+          key,
+          (value) => {
+            if (Array.isArray(value)) {
+              (value as unknown as Record<string | symbol, unknown>)[prop] =
+                val;
+            } else {
+              (value as Record<string | symbol, unknown>)[prop] = val;
+            }
+            return true;
+          },
+          arrayCapacity,
+        );
       });
     },
     deleteProperty() {
@@ -542,7 +561,9 @@ function createSharedRef<T>(
 function readValue(
   mem: SharedMemory,
   key: string,
-  cacheTarget?: { __cache?: { version: number; value: unknown; index: number } },
+  cacheTarget?: {
+    __cache?: { version: number; value: unknown; index: number };
+  },
 ): unknown {
   const cached = readCache.get(key);
   const index = cached !== undefined ? cached.index : getIndex(mem, key);
@@ -602,7 +623,11 @@ function writeValue(
               `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
             );
           }
-          mem.updateObjectSlot(existing, i, encodeValue(mem, valueObj[name], arrayCapacity));
+          mem.updateObjectSlot(
+            existing,
+            i,
+            encodeValue(mem, valueObj[name], arrayCapacity),
+          );
         }
         // Check for extra properties.
         const existingNames = new Set(properties.map(([n]) => n));
@@ -779,12 +804,17 @@ function getTopLevelArrayMember(
       };
     }
     return (...args: unknown[]) => {
-      return mutateValue<unknown[], unknown>(mem, key, (fresh) => {
-        const method = (
-          fresh as unknown as Record<string, (...a: unknown[]) => unknown>
-        )[methodName]!;
-        return method.apply(fresh, args);
-      }, arrayCapacity);
+      return mutateValue<unknown[], unknown>(
+        mem,
+        key,
+        (fresh) => {
+          const method = (
+            fresh as unknown as Record<string, (...a: unknown[]) => unknown>
+          )[methodName]!;
+          return method.apply(fresh, args);
+        },
+        arrayCapacity,
+      );
     };
   }
   const method = (value as unknown as Record<string, unknown>)[prop];
