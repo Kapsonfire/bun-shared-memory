@@ -323,16 +323,29 @@ function createSharedRef<T>(
   const target = {
     key,
     mem,
+    // Fast-path cache: mirrors the module-level readCache entry for this key
+    // so the proxy get handler can read it without a Map lookup. Invalidated
+    // on every local write/update; cross-worker invalidation is detected by
+    // the version check in the get handler.
+    __cache: undefined as
+      | { version: number; value: unknown; index: number }
+      | undefined,
     read: () => {
-      const value = copyValue(readValue(mem, key)) as T;
+      const value = copyValue(readValue(mem, key, target)) as T;
       if (tracker && isTrackable(value)) {
         const objectId = getTopLevelObjectId(mem, key);
         if (objectId !== null) tracker.track(value as object, objectId);
       }
       return value;
     },
-    write: (value: T) => writeValue(mem, key, value, arrayCapacity),
-    update: (fn: (current: T) => T) => updateValue(mem, key, fn, arrayCapacity),
+    write: (value: T) => {
+      target.__cache = undefined;
+      writeValue(mem, key, value, arrayCapacity);
+    },
+    update: (fn: (current: T) => T) => {
+      target.__cache = undefined;
+      return updateValue(mem, key, fn, arrayCapacity);
+    },
   };
 
   return new Proxy(target, {
@@ -355,9 +368,11 @@ function createSharedRef<T>(
       }
 
       // Fast path: if the full value is cached and valid, read the property
-      // from the cached value (no decode, no lock).
-      const cachedValue = getCachedValue(mem, key);
-      if (cachedValue !== undefined) {
+      // from the cached value (no decode, no lock). The cache entry is kept
+      // directly on the target to avoid a Map lookup on the hot path.
+      const cached = t.__cache;
+      if (cached !== undefined && cached.version === mem.getVersion(cached.index)) {
+        const cachedValue = cached.value;
         if (Array.isArray(cachedValue)) {
           return getTopLevelArrayMember(mem, key, cachedValue, prop, arrayCapacity);
         }
@@ -420,7 +435,7 @@ function createSharedRef<T>(
       }
 
       // Primitive/array key: use the cached value directly (no copy).
-      const value = readValue(mem, key);
+      const value = readValue(mem, key, t);
       if (Array.isArray(value)) {
         return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
       }
@@ -434,6 +449,7 @@ function createSharedRef<T>(
     set(t, prop, val) {
       // In-place update: write only the affected slot instead of decoding and
       // re-encoding the whole value.
+      t.__cache = undefined;
       return mem.withLock(() => {
         // Object property: use the cached layout to write only that slot.
         const layout = getObjectLayout(mem, key);
@@ -517,18 +533,17 @@ function createSharedRef<T>(
 }
 
 /**
- * Return the cached full value for a key if it is still valid (lock-free
- * version check), or undefined on a cache miss. Does not decode.
+ * Read the full value for a key from shared memory, using the read cache.
+ *
+ * When `cacheTarget` is provided (the proxy target), the cache entry is also
+ * mirrored onto `cacheTarget.__cache` so the proxy get handler can read it
+ * without a Map lookup on the hot path.
  */
-function getCachedValue(mem: SharedMemory, key: string): unknown | undefined {
-  const cached = readCache.get(key);
-  if (cached === undefined) return undefined;
-  if (cached.version !== mem.getVersion(cached.index)) return undefined;
-  return cached.value;
-}
-
-/** Read the full value for a key from shared memory, using the read cache. */
-function readValue(mem: SharedMemory, key: string): unknown {
+function readValue(
+  mem: SharedMemory,
+  key: string,
+  cacheTarget?: { __cache?: { version: number; value: unknown; index: number } },
+): unknown {
   const cached = readCache.get(key);
   const index = cached !== undefined ? cached.index : getIndex(mem, key);
 
@@ -559,7 +574,9 @@ function readValue(mem: SharedMemory, key: string): unknown {
     return decodeValue(mem, mem.readValueSlot(offset));
   });
 
-  readCache.set(key, { version, value, index });
+  const entry = { version, value, index };
+  readCache.set(key, entry);
+  if (cacheTarget) cacheTarget.__cache = entry;
   return value;
 }
 
