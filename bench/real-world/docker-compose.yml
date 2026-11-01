@@ -1,9 +1,12 @@
-# MySQL service for the real-world benchmark.
+# MySQL + Redis services for the real-world benchmark.
 #
-# Start it with:
+# Start them with:
 #   docker compose -f bench/real-world/docker-compose.yml up -d
 #
-# The benchmark connects with the credentials below (see run.ts / api.ts).
+# Both services expose their data over a Unix socket (mounted from
+# ./sockets) in addition to TCP, so the benchmark can compare TCP vs socket
+# access. The benchmark connects with the credentials below (see run.ts /
+# api.ts).
 services:
   mysql:
     image: mysql:8.4
@@ -15,8 +18,24 @@ services:
       MYSQL_PASSWORD: bench
     ports:
       - "3306:3306"
+    volumes:
+      - ./sockets/mysql:/var/run/mysqld
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: bun-shared-memory-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./sockets/redis:/sockets
+    command: ["redis-server", "--unixsocket", "/sockets/redis.sock", "--unixsocketperm", "777"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 2s
       retries: 30

@@ -1,14 +1,15 @@
 /**
- * Seed the SQLite and MySQL databases with the benchmark data.
+ * Seed the SQLite, MySQL and Redis databases with the benchmark data.
  *
  * Run once before benchmarking:
  *   bun bench/real-world/seed.ts
  *
- * Requires the MySQL container to be up (see docker-compose.yml).
+ * Requires the MySQL and Redis containers to be up (see docker-compose.yml).
  */
 import { Database } from "bun:sqlite";
 import mysql from "mysql2/promise";
-import { makeUser, SEED_ROWS } from "./data.ts";
+import Redis from "ioredis";
+import { makeUser, REDIS_KEY_PREFIX, SEED_ROWS } from "./data.ts";
 
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
 
@@ -68,5 +69,19 @@ async function seedMysql(): Promise<void> {
   console.log(`MySQL seeded: ${SEED_ROWS} rows`);
 }
 
+async function seedRedis(): Promise<void> {
+  const redis = new Redis({ host: "127.0.0.1", port: 6379 });
+  const keys = await redis.keys(`${REDIS_KEY_PREFIX}*`);
+  if (keys.length > 0) await redis.del(...keys);
+  const pipeline = redis.pipeline();
+  for (let i = 1; i <= SEED_ROWS; i++) {
+    pipeline.set(`${REDIS_KEY_PREFIX}${i}`, JSON.stringify(makeUser(i)));
+  }
+  await pipeline.exec();
+  await redis.quit();
+  console.log(`Redis seeded: ${SEED_ROWS} rows`);
+}
+
 await seedSqlite();
 await seedMysql();
+await seedRedis();

@@ -7,6 +7,7 @@
  *   - "shared"  — reads from shared memory (bun-shared-memory)
  *   - "sqlite"  — reads live from a SQLite database
  *   - "mysql"   — reads live from a MySQL database
+ *   - "redis"   — reads live from a Redis database
  *
  * The benchmark never starts an HTTP server. Instead it builds a `Request`
  * object by hand and calls `app.fetch(request)` directly, which runs the
@@ -15,18 +16,45 @@
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
 import mysql from "mysql2/promise";
+import Redis from "ioredis";
 import { Shared } from "../../src/index.ts";
 import type { User } from "./data.ts";
+import { REDIS_KEY_PREFIX } from "./data.ts";
 
-export type Methodology = "shared" | "sqlite" | "mysql";
+export type Methodology = "shared" | "sqlite" | "mysql" | "redis";
+
+/** How MySQL/Redis are reached: over TCP or a Unix socket. */
+export type Transport = "tcp" | "socket";
 
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
+
+/** Unix socket paths (mounted from ./sockets in docker-compose). */
+const MYSQL_SOCKET = new URL("./sockets/mysql/mysqld.sock", import.meta.url).pathname;
+const REDIS_SOCKET = new URL("./sockets/redis/redis.sock", import.meta.url).pathname;
+
+/**
+ * Unix sockets over Docker volumes only work when Docker runs natively (Linux).
+ * On macOS/Windows, Docker Desktop runs in a VM and the volume sync does not
+ * carry real socket connections, so connecting would hang. Throw a clear error
+ * instead of silently hanging.
+ */
+function assertSocketSupported(): void {
+  if (process.platform !== "linux") {
+    throw new Error(
+      `Unix-socket transport is only supported on Linux (got ${process.platform}). ` +
+        "Docker Desktop on macOS/Windows runs in a VM and cannot expose container " +
+        "Unix sockets to the host. Use the 'tcp' transport instead.",
+    );
+  }
+}
 
 /** Shared-memory key under which the user record is stored. */
 const SHARED_KEY = "real-world:user";
 
 export interface ApiOptions {
   methodology: Methodology;
+  /** Transport for MySQL/Redis ("tcp" or "socket"). Ignored for shared/sqlite. */
+  transport?: Transport;
   /** Shared-memory options (only used for "shared"). */
   shared?: {
     initialSize?: number;
@@ -36,15 +64,25 @@ export interface ApiOptions {
 
 /**
  * Build an Elysia app for the given methodology. Each worker creates its own
- * instance so the benchmark can run the three methodologies independently.
+ * instance so the benchmark can run the methodologies independently.
+ *
+ * MySQL/Redis connections are established here (before the benchmark runs) so
+ * the connection handshake is not counted as per-request overhead.
  */
-export function buildApi(opts: ApiOptions) {
+export async function buildApi(opts: ApiOptions) {
   const { methodology } = opts;
+  const transport: Transport = opts.transport ?? "tcp";
+
+  // Only MySQL/Redis use the transport; shared/sqlite ignore it.
+  if (transport === "socket" && (methodology === "mysql" || methodology === "redis")) {
+    assertSocketSupported();
+  }
 
   // --- Backend setup -------------------------------------------------------
   let sharedRef: ReturnType<typeof Shared<User>> | null = null;
   let sqlite: Database | null = null;
   let mysqlConn: mysql.Connection | null = null;
+  let redis: Redis | null = null;
 
   if (methodology === "shared") {
     // The main thread seeds the shared value before spawning workers; here we
@@ -61,8 +99,21 @@ export function buildApi(opts: ApiOptions) {
   } else if (methodology === "sqlite") {
     sqlite = new Database(SQLITE_PATH, { readonly: true });
   } else if (methodology === "mysql") {
-    // Lazily connect on first request so worker startup is not blocked by the
-    // network handshake.
+    // Establish the connection up front so the handshake is not part of the
+    // measured per-request cost.
+    mysqlConn = await mysql.createConnection(
+      transport === "socket"
+        ? { socketPath: MYSQL_SOCKET, user: "bench", password: "bench", database: "bench" }
+        : { host: "127.0.0.1", port: 3306, user: "bench", password: "bench", database: "bench" },
+    );
+  } else if (methodology === "redis") {
+    // Establish the connection up front so the handshake is not part of the
+    // measured per-request cost.
+    redis = new Redis(
+      transport === "socket"
+        ? { path: REDIS_SOCKET }
+        : { host: "127.0.0.1", port: 6379 },
+    );
   }
 
   const app = new Elysia().get("/user/:id", async ({ params }) => {
@@ -91,16 +142,7 @@ export function buildApi(opts: ApiOptions) {
         } satisfies User;
       }
       case "mysql": {
-        if (!mysqlConn) {
-          mysqlConn = await mysql.createConnection({
-            host: "127.0.0.1",
-            port: 3306,
-            user: "bench",
-            password: "bench",
-            database: "bench",
-          });
-        }
-        const [rows] = await mysqlConn.execute<mysql.RowDataPacket[]>(
+        const [rows] = await mysqlConn!.execute<mysql.RowDataPacket[]>(
           "SELECT id, name, email, role, active, score FROM users WHERE id = ?",
           [id],
         );
@@ -116,6 +158,11 @@ export function buildApi(opts: ApiOptions) {
           active: row.active === 1,
           score: row.score,
         } satisfies User;
+      }
+      case "redis": {
+        const raw = await redis!.get(`${REDIS_KEY_PREFIX}${id}`);
+        if (!raw) return new Response("not found", { status: 404 });
+        return JSON.parse(raw) as User;
       }
     }
   });

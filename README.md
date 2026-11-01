@@ -28,6 +28,31 @@ A TypeScript library for the **Bun** runtime that enables sharing data between w
 > onward. Core shared-memory operations (including `SharedArrayBuffer.grow()`)
 > work on earlier versions, but the automatic worker buffer-sharing does not.
 
+## 📈 Real-world benchmark
+
+`bun run bench:real` compares four methodologies for serving a "get user"
+request through an [Elysia](https://elysiajs.com) mini API. Requests are built
+by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
+is benchmarked sequentially with 4 workers. See
+[`bench/real-world/README.md`](bench/real-world/README.md) for setup.
+
+Measured on Linux (Bun 1.4.4, 100,000 requests per methodology, sorted by
+speed; MySQL/Redis benchmarked over both TCP and Unix socket):
+
+| Methodology | Transport | Requests | Elapsed (ms) | req/s      | vs. shared |
+|-------------|-----------|----------|--------------|------------|------------|
+| `shared`    | —         | 100,000  | 52           | 1,925,042  | —          |
+| `sqlite`    | —         | 100,000  | 187          | 535,469    | 3.6× slower |
+| `redis`     | socket    | 100,000  | 1,688        | 59,233     | 32.5× slower |
+| `mysql`     | socket    | 100,000  | 1,823        | 54,861     | 35.1× slower |
+| `redis`     | tcp       | 100,000  | 2,863        | 34,923     | 55.1× slower |
+| `mysql`     | tcp       | 100,000  | 3,281        | 30,476     | 63.2× slower |
+
+Shared memory is the fastest by a wide margin: ~3.6× faster than a live SQLite
+read and ~33–63× faster than live MySQL/Redis reads. Unix sockets are
+significantly faster than TCP for MySQL/Redis (~1.7×), but both remain far
+slower than shared memory.
+
 ## ✨ Features
 
 - 🚀 **Zero-copy** shared memory between workers/threads via `SharedArrayBuffer`
@@ -45,16 +70,6 @@ bun add bun-shared-memory
 ```
 
 See [SPEC.md](./SPEC.md) for the full specification.
-
-## Status
-
-✅ **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
-
-✅ **Read cache**: reads are cached per worker and invalidated cross-worker via a per-key version counter.
-
-✅ **Reference counting & defragmentation**: workers acquire/release references to shared objects/arrays (released on GC), the main thread tracks which worker holds what, and a defragmentation pass reclaims dead space when free space is low.
-
-✅ **M4 — Worker integration**: a worker can simply call `Shared()` and automatically share the same buffers as the main thread. Both sides call `init()` — the main thread answers buffer requests, each worker requests the shared buffers — no manual buffer serialization needed.
 
 ## 📊 Stats
 
@@ -382,29 +397,8 @@ valid for the lifetime of the buffer.
 
 ### Real-world benchmark
 
-`bun run bench:real` compares three methodologies for serving a "get user"
-request through an [Elysia](https://elysiajs.com) mini API:
-
-- **shared** — reads from shared memory (`bun-shared-memory`)
-- **sqlite** — reads live from a SQLite database
-- **mysql** — reads live from a MySQL database (Docker)
-
-Requests are built by hand and passed directly to `app.fetch()` (no HTTP
-server). Each methodology is benchmarked sequentially; 4 workers are spawned
-per methodology and the request count is split evenly across them. See
-[`bench/real-world/README.md`](bench/real-world/README.md) for setup.
-
-Measured on a MacBook (Bun 1.4.4, 50,000 requests per methodology):
-
-| Methodology | Requests | Elapsed (ms) | req/s      | vs. shared |
-|-------------|----------|--------------|------------|------------|
-| `shared`    | 50,000   | 18           | 2,789,757  | —          |
-| `sqlite`    | 50,000   | 85           | 587,073    | 4.8× slower |
-| `mysql`     | 50,000   | 2,898        | 17,256     | 161.7× slower |
-
-Shared memory is the fastest by a wide margin: ~4.8× faster than a live SQLite
-read and ~162× faster than a live MySQL read (the latter dominated by network
-I/O per request).
+See [📈 Real-world benchmark](#-real-world-benchmark) at the top of this
+README for the measured results.
 
 ## 🤝 Contributing
 
