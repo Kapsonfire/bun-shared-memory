@@ -34,8 +34,15 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Usage
 
+Always call `init()` first — on both the main thread and in every worker. It
+sets up the shared-memory handshake and (optionally) configures the buffers.
+
 ```ts
-import { Shared } from "bun-shared-memory";
+import { Shared, init } from "bun-shared-memory";
+
+// Main thread: call init() once at startup. It creates the shared memory
+// (with the given buffer sizes) and answers buffer requests from workers.
+await init({ initialSize: 64 * 1024, maxByteLength: 4 * 1024 * 1024 * 1024 });
 
 // Get a wrapper to a named value in shared memory.
 // If it doesn't exist, create it with the provided initial value.
@@ -66,6 +73,10 @@ const user2 = await Shared<User>("user-2", async () => {
   return await fetchUser();
 });
 ```
+
+In a worker, `await init()` requests the shared buffers from the main thread
+and reconstructs the same memory, so `Shared()` reads/writes the same data as
+the main thread. See [Worker integration](#worker-integration) below.
 
 ## Synchronization
 
@@ -147,7 +158,7 @@ defragmented — no manual setup needed.
 import { Shared, init } from "bun-shared-memory";
 
 // Main thread: init() starts the coordinator automatically.
-init();
+await init();
 const user = Shared("user-1", { name: "Alice" });
 const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 ```
@@ -192,8 +203,11 @@ workers, and each worker requests the shared buffers from the main thread.
 // main.ts
 import { Shared, init } from "bun-shared-memory";
 
+// Always call init() first. It creates the shared memory (with the given
+// buffer sizes) and answers buffer requests from every new worker.
+await init({ initialSize: 64 * 1024, maxByteLength: 4 * 1024 * 1024 * 1024 });
+
 const user = Shared("user-1", { name: "Alice", age: 30 });
-init(); // answer buffer requests from every new worker
 ```
 
 ```ts
@@ -223,6 +237,11 @@ buffer-request listener and starts the refcount coordinator (auto-maintenance
 > `Shared()` in a worker without `init()` throws an error rather than silently
 > creating a separate, unshared memory.
 
+The coordinator's maintenance timer is unref'd, so it does not keep the
+process alive — the process exits naturally once no other work is pending
+(e.g. after the last worker closes). You don't need to call `stopInit()` or
+`process.exit()` to terminate.
+
 A complete runnable example is in [`examples/worker/`](examples/worker/).
 
 ## Memory budget
@@ -233,20 +252,27 @@ index entry). A single `SharedArrayBuffer` can be at most **4 GiB**. By default
 each buffer grows independently up to its own `maxByteLength`, so the _total_
 memory can be several times that.
 
-To cap the **total** memory across all buffers, pass `maxTotalBytes` when
-creating the memory (or to `init()`):
+Configure the buffers when calling `init()` — pass `initialSize` (each
+buffer's starting size, avoiding a grow on first use) and `maxByteLength`
+(each buffer's cap). To cap the **total** memory across all buffers, pass
+`maxTotalBytes`:
 
 ```ts
-import { SharedMemory, init } from "bun-shared-memory";
+import { init } from "bun-shared-memory";
 
-// Total budget of 4 GiB shared across all buffers. Each buffer's own
-// maxByteLength is min(4 GiB, maxTotalBytes), and the sum of all buffers'
-// physical sizes is additionally capped at maxTotalBytes.
-const mem = new SharedMemory({ maxTotalBytes: 4 * 1024 * 1024 * 1024 });
-
-// Or set it when initializing the shared-memory handshake:
-await init({ maxTotalBytes: 4 * 1024 * 1024 * 1024 });
+// Each buffer starts at 64 KiB and grows up to 4 GiB; the sum of all buffers'
+// physical sizes is additionally capped at 4 GiB (maxTotalBytes).
+await init({
+  initialSize: 64 * 1024,
+  maxByteLength: 4 * 1024 * 1024 * 1024,
+  maxTotalBytes: 4 * 1024 * 1024 * 1024,
+});
 ```
+
+`maxTotalBytes` caps the **sum** of all buffers' physical sizes, so the total
+stays within the budget. If a write would exceed the budget, a `RangeError` is
+thrown. Without `maxTotalBytes`, each buffer simply grows up to its own
+`maxByteLength`.
 
 The budget is shared dynamically — buffers grow as needed, but only while the
 sum of all buffers stays within `maxTotalBytes`. If a write would exceed the

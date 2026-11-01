@@ -10,12 +10,12 @@
  */
 import { Shared, init } from "../../src/index.ts";
 
+// Always call init() first. It creates the shared memory (with the given
+// buffer sizes) and answers buffer requests from every new worker.
+await init({ initialSize: 64 * 1024, maxByteLength: 4 * 1024 * 1024 * 1024 });
+
 // Create a shared value on the main thread.
 const counter = Shared("counter", { value: 0 });
-
-// Answer buffer requests from every new worker. Call this once, after the
-// first SharedMemory exists (or it will be created from default options).
-init();
 
 // Spawn a worker. It calls `await init()` itself to receive the shared buffers.
 const worker = new Worker(new URL("./worker.ts", import.meta.url), {
