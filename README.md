@@ -227,6 +227,26 @@ The budget is shared dynamically — buffers grow as needed, but only while the
 sum of all buffers stays within `maxTotalBytes`. If a write would exceed the
 budget, a `RangeError` is thrown.
 
+## Array capacity
+
+By default an array is stored with exactly as many slots as it has elements,
+so the first `push` must relocate the array (with doubled capacity) to make
+room. To avoid that, reserve extra capacity up front with `arrayCapacity`:
+
+```ts
+import { Shared } from "shared-memory";
+
+// Reserve 100 slots so the first ~90 pushes append in place without moving.
+const arr = Shared<number[]>("arr-cap", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], {
+  arrayCapacity: 100,
+});
+```
+
+`arrayCapacity` is the initial capacity (in elements) reserved for arrays when
+they are first stored. `push` appends in place until the capacity is
+exhausted, then the array is relocated with doubled capacity. It defaults to
+the array's length.
+
 ## Development
 
 ```bash
@@ -243,7 +263,7 @@ bun run bench      # run benchmarks
 every supported data type and its arrays:
 
 - **Primitives**: `number`, `string`, `boolean`, `bigint` (read + write)
-- **Arrays**: `number[]`, `string[]`, `boolean[]`, `bigint[]`, `mixed[]` (index read, index write, push)
+- **Arrays**: `number[]`, `string[]`, `boolean[]`, `bigint[]`, `mixed[]` (index read, index write)
 - **Objects**: property read/write and array-property access
 
 Each benchmark reports ops/sec for the native and shared paths, plus the

@@ -54,11 +54,15 @@ Stores string data. **Append-only**: new strings (or new versions of grown strin
 Stores array data. **Append-only**, same principle as the StringTable.
 
 - Each entry: `{ elementOffset, elementCount }`.
-- When an array grows (e.g. `push`), a new copy is appended and the reference in the DataTable is updated.
+- Arrays reserve **capacity padding** (extra slots beyond their length) so
+  `push` appends in place without moving the array. When the padding is
+  exhausted, the array is relocated with doubled capacity and the reference in
+  the DataTable is updated. `pop` just decrements the length in place.
 
 ## Growth Strategy
 
-- **Strings/arrays**: append a new copy to the append-only table, update the reference in the DataTable. No shifting of other data.
+- **Strings**: append a new copy to the append-only table, update the reference in the DataTable. No shifting of other data.
+- **Arrays**: `push` writes into reserved capacity padding (O(1) amortized); only when the padding is exhausted is the array relocated with doubled capacity. `pop` decrements the length in place.
 - **DataTable**: grows by appending new value slots at the end. Since references are fixed-size, existing entries don't move.
 - **Index Table**: grows by adding new key entries.
 
@@ -112,12 +116,19 @@ user.tags.push("b"); // appends to ArrayTable, updates DataTable ref
 
 All shared-memory operations are protected by a re-entrant `Atomics`-based
 `Mutex` (`src/mutex.ts`). The mutex uses a single Int32 cell in a
-`SharedArrayBuffer`:
+`SharedArrayBuffer` that encodes the lock state: **0** = free, **1** = held
+(no waiters), **2** = held (waiters present).
 
-- `lock()` claims the cell with `Atomics.compareExchange` (0 → 1), falling
-  back to `Atomics.wait` so a thread sleeps instead of busy-spinning while
-  the lock is held elsewhere.
-- `unlock()` stores 0 and calls `Atomics.notify` to wake one waiter.
+- `lock()` claims the cell with `Atomics.compareExchange` (0 → 1). On failure
+  it marks the cell as "has waiters" (1 → 2) and falls back to `Atomics.wait`
+  so the thread sleeps instead of busy-spinning while the lock is held
+  elsewhere. The waiter re-checks the cell after marking it 2, so a release
+  between the failed acquire and the `wait` is not lost (the `wait` returns
+  immediately with "not-equal" and the loop retries).
+- `unlock()` releases the cell with `Atomics.exchange` (→ 0). It only calls
+  `Atomics.notify` when the previous value was 2 (waiters present), waking all
+  of them; in the uncontended case (cell was 1) the expensive `notify` is
+  skipped entirely.
 - Re-entrancy is tracked per-thread via a module-level depth map, so a locked
   operation may safely call another locked operation (e.g. `updateValue`
   calling `readValue`/`writeValue`).
