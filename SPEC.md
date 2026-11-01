@@ -33,7 +33,7 @@ Bun supports worker threads, but passing data between them typically requires st
 
 - No distributed/shared memory across processes (only threads within a single process).
 - No persistence or disk-backed storage.
-- No automatic garbage collection of shared memory (manual lifecycle management).
+- No automatic garbage collection of shared memory in the core (manual lifecycle management). Reference counting + defragmentation are available as an opt-in component (`RefCountCoordinator`/`RefCountTracker`), not wired into the core automatically.
 
 ## Proposed API (Draft)
 
