@@ -68,16 +68,6 @@ bun add bun-shared-memory
 
 See [SPEC.md](./SPEC.md) for the full specification.
 
-## Status
-
-✅ **M3 — Synchronization**: `Atomics`-based locking (`Mutex`) and notifications (`Notifier`) between workers, integrated into all shared-memory operations.
-
-✅ **Read cache**: reads are cached per worker and invalidated cross-worker via a per-key version counter.
-
-✅ **Reference counting & defragmentation**: workers acquire/release references to shared objects/arrays (released on GC), the main thread tracks which worker holds what, and a defragmentation pass reclaims dead space when free space is low.
-
-✅ **M4 — Worker integration**: a worker can simply call `Shared()` and automatically share the same buffers as the main thread. Both sides call `init()` — the main thread answers buffer requests, each worker requests the shared buffers — no manual buffer serialization needed.
-
 ## 📊 Stats
 
 | | |
