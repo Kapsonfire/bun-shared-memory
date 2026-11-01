@@ -15,7 +15,7 @@
  */
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
-import mysql from "mysql2/promise";
+import { SQL } from "bun";
 import Redis from "ioredis";
 import { Shared } from "../../src/index.ts";
 import type { User } from "./data.ts";
@@ -81,7 +81,7 @@ export async function buildApi(opts: ApiOptions) {
   // --- Backend setup -------------------------------------------------------
   let sharedRef: ReturnType<typeof Shared<User>> | null = null;
   let sqlite: Database | null = null;
-  let mysqlConn: mysql.Connection | null = null;
+  let mysql: SQL | null = null;
   let redis: Redis | null = null;
 
   if (methodology === "shared") {
@@ -100,11 +100,12 @@ export async function buildApi(opts: ApiOptions) {
     sqlite = new Database(SQLITE_PATH, { readonly: true });
   } else if (methodology === "mysql") {
     // Establish the connection up front so the handshake is not part of the
-    // measured per-request cost.
-    mysqlConn = await mysql.createConnection(
+    // measured per-request cost. Bun's native SQL client (Bun.SQL) is used
+    // with tagged-template queries; Unix sockets are selected via ?socket=.
+    mysql = new SQL(
       transport === "socket"
-        ? { socketPath: MYSQL_SOCKET, user: "bench", password: "bench", database: "bench" }
-        : { host: "127.0.0.1", port: 3306, user: "bench", password: "bench", database: "bench" },
+        ? `mysql://bench:bench@127.0.0.1/bench?socket=${MYSQL_SOCKET}`
+        : "mysql://bench:bench@127.0.0.1:3306/bench",
     );
   } else if (methodology === "redis") {
     // Establish the connection up front so the handshake is not part of the
@@ -142,13 +143,19 @@ export async function buildApi(opts: ApiOptions) {
         } satisfies User;
       }
       case "mysql": {
-        const [rows] = await mysqlConn!.execute<mysql.RowDataPacket[]>(
-          "SELECT id, name, email, role, active, score FROM users WHERE id = ?",
-          [id],
-        );
-        const row = rows[0] as
-          | { id: number; name: string; email: string; role: string; active: number; score: number }
-          | undefined;
+        const rows = await mysql!`
+          SELECT id, name, email, role, active, score
+          FROM users
+          WHERE id = ${id}
+        ` as {
+          id: number;
+          name: string;
+          email: string;
+          role: string;
+          active: number;
+          score: number;
+        }[];
+        const row = rows[0];
         if (!row) return new Response("not found", { status: 404 });
         return {
           id: row.id,
