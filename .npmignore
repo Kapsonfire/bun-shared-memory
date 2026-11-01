@@ -1,0 +1,20 @@
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# Dependencies
+node_modules/
+
+# Dev / CI
+bench/
+benchlogs/
+test/
+examples/
+*.test.ts
+
+# Docs (kept out of the published package; README/LICENSE are always included)
+AGENTS.md
+BENCH.md
+DESIGN.md
+REFCOUNT.md
+SPEC.md

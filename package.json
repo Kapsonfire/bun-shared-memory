@@ -1,15 +1,40 @@
 {
-  "name": "shared-memory",
-  "module": "index.ts",
+  "name": "bun-shared-memory",
+  "version": "0.1.0",
+  "description": "Share data between Bun workers/threads using SharedArrayBuffer (zero-copy, 4-buffer architecture, Atomics-based synchronization).",
   "type": "module",
-  "private": true,
+  "module": "index.ts",
+  "types": "index.ts",
   "exports": {
-    ".": "./index.ts"
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    }
   },
+  "files": [
+    "index.ts",
+    "src/"
+  ],
   "scripts": {
     "typecheck": "bun check",
     "test": "bun test",
     "bench": "bun bench/bench.ts"
+  },
+  "keywords": [
+    "bun",
+    "shared-memory",
+    "sharedarraybuffer",
+    "worker",
+    "threads",
+    "atomics",
+    "zero-copy"
+  ],
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/bun": "latest"
