@@ -316,6 +316,10 @@ export class RefCountCoordinator {
         this.mem.withLock(() => this.mem.defragment());
       }
     }, intervalMs);
+    // Unref the timer so it does not keep the process alive. The coordinator
+    // keeps draining events and defragmenting while the process runs, but the
+    // process can still exit naturally when no other work is pending.
+    (this.maintenanceTimer as unknown as { unref?: () => void }).unref?.();
     return () => this.stopAutoMaintenance();
   }
 

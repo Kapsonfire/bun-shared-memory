@@ -174,6 +174,12 @@ and call `startAutoMaintenance(intervalMs)` manually. `stopAutoMaintenance()`
 stops the timer. `needsDefrag()` is also available for manual checks, and
 `defragment()` can be called directly under `withLock`.
 
+The maintenance timer is **unref'd**, so it does not keep the process alive.
+The coordinator keeps draining events and defragmenting while the process
+runs, but the process can still exit naturally when no other work is pending
+(e.g. after the last worker closes). You do not need to call `stopInit()` or
+`process.exit()` to let the process terminate.
+
 ### Worker registration
 
 Workers are registered automatically via Bun's `process.on("worker", ...)`
