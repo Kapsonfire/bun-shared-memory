@@ -7,3 +7,6 @@ node_modules/
 
 # Secrets / auth
 .npmrc
+
+# Generated benchmark database
+bench/real-world/bench.db
