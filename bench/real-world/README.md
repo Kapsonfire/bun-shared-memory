@@ -47,6 +47,15 @@ by speed (fastest first) and a relative comparison against shared memory. It
 also writes the full results to `benchlogs/<timestamp>-<commit>-real.md` (one
 file per run, following the same convention as the micro benchmarks).
 
+### Fair comparison
+
+MySQL and Redis connections are **opened once per worker and reused** for all
+requests (lazily on the first request) — they are **not** re-established per
+request. Each of the 4 workers holds its own persistent connection, so the
+measured cost is the actual query/read over an established connection, not the
+connection handshake. This keeps the comparison fair against shared memory,
+which also has no per-request setup cost.
+
 ### Transport: TCP vs Unix socket
 
 MySQL and Redis can be reached over TCP or a Unix socket:
