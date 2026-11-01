@@ -380,6 +380,32 @@ per-worker LRU cache grows dynamically (configurable via `internCapacity` /
 reaches capacity. Because the StringTable is append-only, cached references stay
 valid for the lifetime of the buffer.
 
+### Real-world benchmark
+
+`bun run bench:real` compares three methodologies for serving a "get user"
+request through an [Elysia](https://elysiajs.com) mini API:
+
+- **shared** — reads from shared memory (`bun-shared-memory`)
+- **sqlite** — reads live from a SQLite database
+- **mysql** — reads live from a MySQL database (Docker)
+
+Requests are built by hand and passed directly to `app.fetch()` (no HTTP
+server). Each methodology is benchmarked sequentially; 4 workers are spawned
+per methodology and the request count is split evenly across them. See
+[`bench/real-world/README.md`](bench/real-world/README.md) for setup.
+
+Measured on a MacBook (Bun 1.4.4, 50,000 requests per methodology):
+
+| Methodology | Requests | Elapsed (ms) | req/s      | vs. shared |
+|-------------|----------|--------------|------------|------------|
+| `shared`    | 50,000   | 18           | 2,789,757  | —          |
+| `sqlite`    | 50,000   | 85           | 587,073    | 4.8× slower |
+| `mysql`     | 50,000   | 2,898        | 17,256     | 161.7× slower |
+
+Shared memory is the fastest by a wide margin: ~4.8× faster than a live SQLite
+read and ~162× faster than a live MySQL read (the latter dominated by network
+I/O per request).
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please open an issue or pull request.

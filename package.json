@@ -18,7 +18,10 @@
   "scripts": {
     "typecheck": "bun check",
     "test": "bun test",
-    "bench": "bun bench/bench.ts"
+    "bench": "bun bench/bench.ts",
+    "bench:real": "bun bench/real-world/run.ts",
+    "bench:real:seed": "bun bench/real-world/seed.ts",
+    "bench:real:mysql": "docker compose -f bench/real-world/docker-compose.yml up -d"
   },
   "keywords": [
     "bun",
@@ -41,7 +44,9 @@
     "access": "public"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "elysia": "^1.4.30",
+    "mysql2": "^3.24.6"
   },
   "peerDependencies": {
     "typescript": "^7"
