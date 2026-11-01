@@ -7,8 +7,7 @@
  * Requires the MySQL and Redis containers to be up (see docker-compose.yml).
  */
 import { Database } from "bun:sqlite";
-import { SQL } from "bun";
-import Redis from "ioredis";
+import { SQL, RedisClient } from "bun";
 import { makeUser, REDIS_KEY_PREFIX, SEED_ROWS } from "./data.ts";
 
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
@@ -64,15 +63,18 @@ async function seedMysql(): Promise<void> {
 }
 
 async function seedRedis(): Promise<void> {
-  const redis = new Redis({ host: "127.0.0.1", port: 6379 });
+  const redis = new RedisClient("redis://127.0.0.1:6379");
+  await redis.connect();
   const keys = await redis.keys(`${REDIS_KEY_PREFIX}*`);
   if (keys.length > 0) await redis.del(...keys);
-  const pipeline = redis.pipeline();
+  // Bulk-insert via MSET (Bun's native client has no pipeline; MSET sets all
+  // key/value pairs in a single command).
+  const pairs: string[] = [];
   for (let i = 1; i <= SEED_ROWS; i++) {
-    pipeline.set(`${REDIS_KEY_PREFIX}${i}`, JSON.stringify(makeUser(i)));
+    pairs.push(`${REDIS_KEY_PREFIX}${i}`, JSON.stringify(makeUser(i)));
   }
-  await pipeline.exec();
-  await redis.quit();
+  await redis.mset(...pairs);
+  redis.close();
   console.log(`Redis seeded: ${SEED_ROWS} rows`);
 }
 

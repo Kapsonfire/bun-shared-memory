@@ -15,8 +15,7 @@
  */
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
-import { SQL } from "bun";
-import Redis from "ioredis";
+import { SQL, RedisClient } from "bun";
 import { Shared } from "../../src/index.ts";
 import type { User } from "./data.ts";
 import { REDIS_KEY_PREFIX } from "./data.ts";
@@ -82,7 +81,7 @@ export async function buildApi(opts: ApiOptions) {
   let sharedRef: ReturnType<typeof Shared<User>> | null = null;
   let sqlite: Database | null = null;
   let mysql: SQL | null = null;
-  let redis: Redis | null = null;
+  let redis: RedisClient | null = null;
 
   if (methodology === "shared") {
     // The main thread seeds the shared value before spawning workers; here we
@@ -109,12 +108,14 @@ export async function buildApi(opts: ApiOptions) {
     );
   } else if (methodology === "redis") {
     // Establish the connection up front so the handshake is not part of the
-    // measured per-request cost.
-    redis = new Redis(
+    // measured per-request cost. Bun's native Redis client (Bun.redis) is
+    // used; Unix sockets are selected via the redis+unix:// URL scheme.
+    redis = new RedisClient(
       transport === "socket"
-        ? { path: REDIS_SOCKET }
-        : { host: "127.0.0.1", port: 6379 },
+        ? `redis+unix://${REDIS_SOCKET}`
+        : "redis://127.0.0.1:6379",
     );
+    await redis.connect();
   }
 
   const app = new Elysia().get("/user/:id", async ({ params }) => {
