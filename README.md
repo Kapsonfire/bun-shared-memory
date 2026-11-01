@@ -2,6 +2,11 @@
 
 A TypeScript library for the **Bun** runtime that enables sharing data between workers/threads using `SharedArrayBuffer`.
 
+> **Requires Bun ≥ 1.4.0.** The worker integration (M4) relies on the
+> `process.on("worker")` handshake, which only works reliably from Bun 1.4.0
+> onward. Core shared-memory operations (including `SharedArrayBuffer.grow()`)
+> work on earlier versions, but the automatic worker buffer-sharing does not.
+
 See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Status
