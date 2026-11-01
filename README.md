@@ -206,11 +206,12 @@ onMessage((e) => {
 
 `init()` is safe to call on both sides: in the main thread it registers the
 buffer-request listener and starts the refcount coordinator (auto-maintenance
-+ worker auto-registration), and in a worker it performs the request/response
-handshake, reconstructs the shared buffers, and creates a refcount tracker —
-so reference counting works automatically. `Shared()` never overwrites a value
-that already exists in shared memory, so a worker reading a key created by the
-main thread gets the existing value rather than its own initial value.
+
+- worker auto-registration), and in a worker it performs the request/response
+  handshake, reconstructs the shared buffers, and creates a refcount tracker —
+  so reference counting works automatically. `Shared()` never overwrites a value
+  that already exists in shared memory, so a worker reading a key created by the
+  main thread gets the existing value rather than its own initial value.
 
 > **Note:** a worker must call `await init()` before using `Shared()`. Calling
 > `Shared()` in a worker without `init()` throws an error rather than silently
