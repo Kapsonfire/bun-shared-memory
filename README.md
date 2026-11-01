@@ -36,19 +36,22 @@ by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
 is benchmarked sequentially with 4 workers. See
 [`bench/real-world/README.md`](bench/real-world/README.md) for setup.
 
-Measured on a MacBook (Bun 1.4.4, 100,000 requests per methodology, sorted by
-speed; the Unix-socket run is skipped on macOS):
+Measured on Linux (Bun 1.4.4, 100,000 requests per methodology, sorted by
+speed; MySQL/Redis benchmarked over both TCP and Unix socket):
 
 | Methodology | Transport | Requests | Elapsed (ms) | req/s      | vs. shared |
 |-------------|-----------|----------|--------------|------------|------------|
-| `shared`    | —         | 100,000  | 31           | 3,271,475  | —          |
-| `sqlite`    | —         | 100,000  | 180          | 555,932    | 5.9× slower |
-| `redis`     | tcp       | 100,000  | 5,376        | 18,600     | 175.9× slower |
-| `mysql`     | tcp       | 100,000  | 5,837        | 17,133     | 190.9× slower |
+| `shared`    | —         | 100,000  | 52           | 1,925,042  | —          |
+| `sqlite`    | —         | 100,000  | 187          | 535,469    | 3.6× slower |
+| `redis`     | socket    | 100,000  | 1,688        | 59,233     | 32.5× slower |
+| `mysql`     | socket    | 100,000  | 1,823        | 54,861     | 35.1× slower |
+| `redis`     | tcp       | 100,000  | 2,863        | 34,923     | 55.1× slower |
+| `mysql`     | tcp       | 100,000  | 3,281        | 30,476     | 63.2× slower |
 
-Shared memory is the fastest by a wide margin: ~6× faster than a live SQLite
-read and ~176–191× faster than live MySQL/Redis reads (the latter two dominated
-by network I/O per request).
+Shared memory is the fastest by a wide margin: ~3.6× faster than a live SQLite
+read and ~33–63× faster than live MySQL/Redis reads. Unix sockets are
+significantly faster than TCP for MySQL/Redis (~1.7×), but both remain far
+slower than shared memory.
 
 ## ✨ Features
 
