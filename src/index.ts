@@ -14,6 +14,7 @@ export {
   getDefaultMemory,
   setDefaultMemory,
   hasDefaultMemory,
+  getDefaultTracker,
   init,
   stopInit,
   onMessage,

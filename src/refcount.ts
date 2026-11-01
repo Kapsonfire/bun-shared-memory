@@ -172,7 +172,18 @@ export class RefCountCoordinator {
     } = {},
   ) {
     this.mem = mem;
-    this.buffer = buffer ?? new RefCountBuffer();
+    // Reuse the memory's shared refCount buffer if present, so the same SAB is
+    // exported to workers; otherwise create a fresh one and attach it to the
+    // memory so it can be shared.
+    this.buffer =
+      buffer ??
+      (mem.refCountBuffer !== null
+        ? new RefCountBuffer(mem.refCountBuffer)
+        : (() => {
+            const b = new RefCountBuffer();
+            mem.attachRefCountBuffer(b.sab);
+            return b;
+          })());
     this.defragThreshold = opts.defragThreshold ?? 0.1;
     // Start periodic maintenance automatically so refcount events are drained
     // and dead space is reclaimed without an explicit call.

@@ -131,6 +131,23 @@ reference-counting system tracks which workers hold references to which
 objects/arrays, and a **defragmentation** pass reclaims memory when free space
 runs low.
 
+When you use the worker integration (`init()`), this is wired up automatically:
+`init()` starts a `RefCountCoordinator` on the main thread (auto-maintenance +
+auto-registration of workers) and a `RefCountTracker` in each worker, so
+`read()` acquires references that are released on GC and dead space is
+defragmented — no manual setup needed.
+
+```ts
+import { Shared, init } from "shared-memory";
+
+// Main thread: init() starts the coordinator automatically.
+init();
+const user = Shared("user-1", { name: "Alice" });
+const copy = user.read(); // acquires a ref; released when `copy` is GC'd
+```
+
+You can also wire it up manually (e.g. when not using `init()`):
+
 ```ts
 import {
   SharedMemory,
@@ -188,11 +205,12 @@ onMessage((e) => {
 ```
 
 `init()` is safe to call on both sides: in the main thread it registers the
-buffer-request listener, and in a worker it performs the request/response
-handshake and resolves once the buffers have arrived. `Shared()` never
-overwrites a value that already exists in shared memory, so a worker reading a
-key created by the main thread gets the existing value rather than its own
-initial value.
+buffer-request listener and starts the refcount coordinator (auto-maintenance
++ worker auto-registration), and in a worker it performs the request/response
+handshake, reconstructs the shared buffers, and creates a refcount tracker —
+so reference counting works automatically. `Shared()` never overwrites a value
+that already exists in shared memory, so a worker reading a key created by the
+main thread gets the existing value rather than its own initial value.
 
 > **Note:** a worker must call `await init()` before using `Shared()`. Calling
 > `Shared()` in a worker without `init()` throws an error rather than silently

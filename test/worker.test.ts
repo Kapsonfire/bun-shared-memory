@@ -113,6 +113,73 @@ describe("Worker integration (M4)", () => {
     expect(hasDefaultMemory()).toBe(true);
   });
 
+  test("init() starts the refcount coordinator and shares the refcount buffer", async () => {
+    // Reset the singleton so init() creates a fresh memory + coordinator.
+    setDefaultMemory(new SharedMemory());
+    expect(getDefaultMemory().refCountBuffer).toBeNull();
+
+    await init();
+
+    // The coordinator attaches the 5th refcount buffer to the memory so it is
+    // exported to workers.
+    expect(getDefaultMemory().refCountBuffer).not.toBeNull();
+
+    // The exported buffers include the refcount buffer.
+    const buffers = getDefaultMemory().exportBuffers();
+    expect(buffers.refCount).not.toBeNull();
+
+    stopInit();
+  });
+
+  test("a worker receives the refcount buffer and can report refcount events", async () => {
+    setDefaultMemory(new SharedMemory());
+    await init();
+
+    const workerCode = `
+      import { Shared, init, onMessage, getDefaultMemory } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      await init();
+      onMessage((e) => {
+        if (e.data === "check") {
+          const mem = getDefaultMemory();
+          self.postMessage({
+            hasRefCount: mem.refCountBuffer !== null,
+            // read() acquires a refcount event via the default tracker.
+            value: Shared("m4-gc", { name: "x" }).read(),
+          });
+        }
+      });
+    `;
+
+    const result = await new Promise<{
+      hasRefCount: boolean;
+      value: { name: string };
+    }>((resolve) => {
+      const worker = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(workerCode),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      worker.onmessage = (e) => {
+        const data = e.data as
+          | { __sharedMemoryRequest?: boolean }
+          | { hasRefCount: boolean; value: { name: string } };
+        if (!("__sharedMemoryRequest" in data)) {
+          resolve(data as { hasRefCount: boolean; value: { name: string } });
+        }
+      };
+      worker.postMessage("check");
+    });
+
+    expect(result.hasRefCount).toBe(true);
+    expect(result.value).toEqual({ name: "x" });
+
+    stopInit();
+  });
+
   test("a worker calling Shared() without init() throws instead of creating unshared buffers", async () => {
     const workerCode = `
       import { Shared } from ${JSON.stringify(

@@ -15,7 +15,7 @@ import {
   type ValueSlot,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
-import { getDefaultMemory } from "./worker.ts";
+import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -297,7 +297,7 @@ export function Shared<T>(
   const ref = createSharedRef<T>(
     mem,
     key,
-    options.refCount,
+    options.refCount ?? getDefaultTracker() ?? undefined,
     options.arrayCapacity,
   );
   registry.set(key, ref as SharedRef<unknown>);

@@ -1,4 +1,9 @@
 import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
+import {
+  RefCountBuffer,
+  RefCountCoordinator,
+  RefCountTracker,
+} from "./refcount.ts";
 
 /**
  * Worker integration (M4).
@@ -83,6 +88,7 @@ export async function init(options?: SharedMemoryOptions): Promise<void> {
       setDefaultMemory(new SharedMemory(options));
     }
     initMain();
+    startCoordinator();
     return;
   }
   await initWorker();
@@ -95,6 +101,46 @@ export async function init(options?: SharedMemoryOptions): Promise<void> {
 export function stopInit(): void {
   if (Bun.isMainThread) {
     stopMain();
+    stopCoordinator();
+  }
+}
+
+/** The main-thread RefCountCoordinator, started by `init()`. */
+let coordinator: RefCountCoordinator | null = null;
+/** Cleanup function returned by `coordinator.autoRegister()`. */
+let unregisterWorkers: (() => void) | null = null;
+
+/** The worker-side RefCountTracker, created from the shared refcount buffer. */
+let workerTracker: RefCountTracker | null = null;
+
+/** Get the worker's default RefCountTracker, or null if not available. */
+export function getDefaultTracker(): RefCountTracker | null {
+  return workerTracker;
+}
+
+/**
+ * Start the reference-counting coordinator on the main thread.
+ *
+ * Creates a `RefCountCoordinator` over the default memory (attaching the 5th
+ * refcount buffer so it is shared with workers) and starts automatic
+ * maintenance: refcount events are drained and dead space is defragmented
+ * when free space is low. Also auto-registers workers so their references are
+ * released on close/crash.
+ */
+function startCoordinator(): void {
+  if (coordinator !== null) return;
+  const mem = getDefaultMemory();
+  coordinator = new RefCountCoordinator(mem);
+  unregisterWorkers = coordinator.autoRegister();
+}
+
+/** Stop the coordinator's maintenance timer and worker listener. */
+function stopCoordinator(): void {
+  if (coordinator !== null) {
+    coordinator.stopAutoMaintenance();
+    unregisterWorkers?.();
+    unregisterWorkers = null;
+    coordinator = null;
   }
 }
 
@@ -189,7 +235,18 @@ function installMessageWrapper(): void {
         }
       | undefined;
     if (msg && msg.__sharedMemoryInit && msg.buffers) {
-      setDefaultMemory(SharedMemory.fromBuffers(msg.buffers));
+      const mem = SharedMemory.fromBuffers(msg.buffers);
+      setDefaultMemory(mem);
+      // Create the worker-side refcount tracker from the shared refcount
+      // buffer, so read() acquires references that the main thread's
+      // coordinator can reclaim.
+      if (msg.buffers.refCount) {
+        const rcBuffer = new RefCountBuffer(msg.buffers.refCount);
+        workerTracker = new RefCountTracker(
+          rcBuffer,
+          rcBuffer.allocateWorkerId(),
+        );
+      }
       pendingInitResolve?.();
       pendingInitResolve = null;
       // Forward any messages that arrived before the init reply.

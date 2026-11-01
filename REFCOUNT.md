@@ -143,6 +143,11 @@ eagerly on every release.
 
 ## API
 
+When using the worker integration, `init()` wires this up automatically: on
+the main thread it creates a `RefCountCoordinator` (auto-maintenance +
+auto-registration) and in each worker a `RefCountTracker`, so `read()` acquires
+references and dead space is defragmented with no manual setup.
+
 ```ts
 // Worker: acquire a reference when reading
 const user = Shared<User>("user-1", { name: "Alice" });

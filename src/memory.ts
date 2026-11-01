@@ -184,6 +184,7 @@ export interface SharedMemoryOptions {
     stringTable?: SharedArrayBuffer;
     arrayTable?: SharedArrayBuffer;
     layoutVersion?: SharedArrayBuffer;
+    refCount?: SharedArrayBuffer;
   };
 }
 
@@ -211,6 +212,13 @@ export class SharedMemory {
   readonly layoutVersion: Int32Array;
   /** Cross-worker mutex protecting all read/write operations. */
   readonly lock: Mutex;
+  /**
+   * The 5th shared buffer: reference-counting ring buffer + heartbeat +
+   * global refcount table. Shared with workers so they can report acquire/
+   * release events to the main thread's coordinator. Optional; created lazily
+   * by the coordinator when auto-GC is enabled.
+   */
+  readonly refCountBuffer: SharedArrayBuffer | null;
 
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
@@ -281,6 +289,7 @@ export class SharedMemory {
         new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
     );
     this.lock = options?.lock ?? new Mutex();
+    this.refCountBuffer = buffers?.refCount ?? null;
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
     this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
   }
@@ -288,6 +297,17 @@ export class SharedMemory {
   /** Run `fn` while holding the shared lock. */
   withLock<T>(fn: () => T): T {
     return this.lock.withLock(fn);
+  }
+
+  /**
+   * Attach the reference-counting buffer (5th SAB) to this memory so it is
+   * included in `exportBuffers()`. No-op if a buffer is already attached.
+   */
+  attachRefCountBuffer(sab: SharedArrayBuffer): void {
+    if (this.refCountBuffer === null) {
+      (this as { refCountBuffer: SharedArrayBuffer | null }).refCountBuffer =
+        sab;
+    }
   }
 
   /**
@@ -301,6 +321,7 @@ export class SharedMemory {
     arrayTable: SharedArrayBuffer;
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
+    refCount: SharedArrayBuffer | null;
   } {
     return {
       indexTable: this.indexTable.buffer,
@@ -309,6 +330,7 @@ export class SharedMemory {
       arrayTable: this.arrayTable.buffer,
       layoutVersion: this.layoutVersion.buffer as SharedArrayBuffer,
       lock: this.lock.buffer as SharedArrayBuffer,
+      refCount: this.refCountBuffer,
     };
   }
 
@@ -323,9 +345,17 @@ export class SharedMemory {
     arrayTable: SharedArrayBuffer;
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
+    refCount?: SharedArrayBuffer | null;
   }): SharedMemory {
     return new SharedMemory({
-      buffers,
+      buffers: {
+        indexTable: buffers.indexTable,
+        dataTable: buffers.dataTable,
+        stringTable: buffers.stringTable,
+        arrayTable: buffers.arrayTable,
+        layoutVersion: buffers.layoutVersion,
+        refCount: buffers.refCount ?? undefined,
+      },
       lock: new Mutex(buffers.lock),
     });
   }
