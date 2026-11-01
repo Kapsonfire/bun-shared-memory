@@ -1,4 +1,4 @@
-# shared-memory
+# bun-shared-memory
 
 A TypeScript library for the **Bun** runtime that enables sharing data between workers/threads using `SharedArrayBuffer`.
 
@@ -6,6 +6,12 @@ A TypeScript library for the **Bun** runtime that enables sharing data between w
 > `process.on("worker")` handshake, which only works reliably from Bun 1.4.0
 > onward. Core shared-memory operations (including `SharedArrayBuffer.grow()`)
 > work on earlier versions, but the automatic worker buffer-sharing does not.
+
+## Install
+
+```sh
+bun add bun-shared-memory
+```
 
 See [SPEC.md](./SPEC.md) for the full specification.
 
@@ -29,7 +35,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 ## Usage
 
 ```ts
-import { Shared } from "shared-memory";
+import { Shared } from "bun-shared-memory";
 
 // Get a wrapper to a named value in shared memory.
 // If it doesn't exist, create it with the provided initial value.
@@ -94,7 +100,7 @@ layout cache must be invalidated (e.g. via a layout version cell).
 A re-entrant cross-worker mutex. Share the same buffer across workers.
 
 ```ts
-import { Mutex } from "shared-memory";
+import { Mutex } from "bun-shared-memory";
 
 const mutex = new Mutex();
 // pass mutex.buffer to other workers, then:
@@ -115,7 +121,7 @@ mutex.withLock(() => {
 A cross-worker notification primitive built on `Atomics.wait`/`Atomics.notify`.
 
 ```ts
-import { Notifier } from "shared-memory";
+import { Notifier } from "bun-shared-memory";
 
 const notifier = new Notifier();
 // pass notifier.buffer to other workers, then:
@@ -138,7 +144,7 @@ auto-registration of workers) and a `RefCountTracker` in each worker, so
 defragmented — no manual setup needed.
 
 ```ts
-import { Shared, init } from "shared-memory";
+import { Shared, init } from "bun-shared-memory";
 
 // Main thread: init() starts the coordinator automatically.
 init();
@@ -154,7 +160,7 @@ import {
   RefCountCoordinator,
   RefCountTracker,
   RefCountBuffer,
-} from "shared-memory";
+} from "bun-shared-memory";
 
 // Main thread: coordinate refcounts and auto-register workers.
 const mem = new SharedMemory();
@@ -184,7 +190,7 @@ workers, and each worker requests the shared buffers from the main thread.
 
 ```ts
 // main.ts
-import { Shared, init } from "shared-memory";
+import { Shared, init } from "bun-shared-memory";
 
 const user = Shared("user-1", { name: "Alice", age: 30 });
 init(); // answer buffer requests from every new worker
@@ -192,7 +198,7 @@ init(); // answer buffer requests from every new worker
 
 ```ts
 // worker.ts
-import { Shared, init, onMessage } from "shared-memory";
+import { Shared, init, onMessage } from "bun-shared-memory";
 
 await init(); // request the shared buffers from the main thread
 
@@ -231,7 +237,7 @@ To cap the **total** memory across all buffers, pass `maxTotalBytes` when
 creating the memory (or to `init()`):
 
 ```ts
-import { SharedMemory, init } from "shared-memory";
+import { SharedMemory, init } from "bun-shared-memory";
 
 // Total budget of 4 GiB shared across all buffers. Each buffer's own
 // maxByteLength is min(4 GiB, maxTotalBytes), and the sum of all buffers'
@@ -253,7 +259,7 @@ so the first `push` must relocate the array (with doubled capacity) to make
 room. To avoid that, reserve extra capacity up front with `arrayCapacity`:
 
 ```ts
-import { Shared } from "shared-memory";
+import { Shared } from "bun-shared-memory";
 
 // Reserve 100 slots so the first ~90 pushes append in place without moving.
 const arr = Shared<number[]>("arr-cap", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], {
