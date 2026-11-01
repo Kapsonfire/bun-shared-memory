@@ -8,7 +8,7 @@ Compares four methodologies for serving a "get user" request through an
 | `shared`    | Shared memory (`bun-shared-memory`) |
 | `sqlite`    | Live read from a SQLite database |
 | `mysql`     | Live read from a MySQL database (Docker) via Bun's native SQL client |
-| `redis`     | Live read from a Redis database (Docker) |
+| `redis`     | Live read from a Redis database (Docker) via Bun's native Redis client |
 
 The benchmark does **not** send real HTTP requests. A `Request` object is built
 by hand and passed directly to `app.fetch()`, which runs the route handler
