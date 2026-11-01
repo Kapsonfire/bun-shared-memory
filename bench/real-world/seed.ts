@@ -7,7 +7,7 @@
  * Requires the MySQL and Redis containers to be up (see docker-compose.yml).
  */
 import { Database } from "bun:sqlite";
-import mysql from "mysql2/promise";
+import { SQL } from "bun";
 import Redis from "ioredis";
 import { makeUser, REDIS_KEY_PREFIX, SEED_ROWS } from "./data.ts";
 
@@ -40,14 +40,8 @@ async function seedSqlite(): Promise<void> {
 }
 
 async function seedMysql(): Promise<void> {
-  const conn = await mysql.createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: "bench",
-    password: "bench",
-    database: "bench",
-  });
-  await conn.query(`
+  const mysql = new SQL("mysql://bench:bench@127.0.0.1:3306/bench");
+  await mysql`
     CREATE TABLE IF NOT EXISTS users (
       id INT PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
@@ -56,16 +50,16 @@ async function seedMysql(): Promise<void> {
       active TINYINT(1) NOT NULL,
       score INT NOT NULL
     )
-  `);
-  await conn.query("DELETE FROM users");
+  `;
+  await mysql`DELETE FROM users`;
   for (let i = 1; i <= SEED_ROWS; i++) {
     const u = makeUser(i);
-    await conn.query(
-      "INSERT INTO users (id, name, email, role, active, score) VALUES (?, ?, ?, ?, ?, ?)",
-      [u.id, u.name, u.email, u.role, u.active ? 1 : 0, u.score],
-    );
+    await mysql`
+      INSERT INTO users (id, name, email, role, active, score)
+      VALUES (${u.id}, ${u.name}, ${u.email}, ${u.role}, ${u.active ? 1 : 0}, ${u.score})
+    `;
   }
-  await conn.end();
+  mysql.close();
   console.log(`MySQL seeded: ${SEED_ROWS} rows`);
 }
 
