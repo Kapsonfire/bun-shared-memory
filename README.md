@@ -36,18 +36,18 @@ by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
 is benchmarked sequentially with 4 workers. See
 [`bench/real-world/README.md`](bench/real-world/README.md) for setup.
 
-Measured on a MacBook (Bun 1.4.4, 50,000 requests per methodology, sorted by
-speed):
+Measured on a MacBook (Bun 1.4.4, 100,000 requests per methodology, TCP,
+sorted by speed):
 
 | Methodology | Requests | Elapsed (ms) | req/s      | vs. shared |
 |-------------|----------|--------------|------------|------------|
-| `shared`    | 50,000   | 18           | 2,740,884  | —          |
-| `sqlite`    | 50,000   | 93           | 535,692    | 5.1× slower |
-| `redis`     | 50,000   | 2,840        | 17,606     | 155.7× slower |
-| `mysql`     | 50,000   | 2,956        | 16,917     | 162.0× slower |
+| `shared`    | 100,000  | 32           | 3,108,498  | —          |
+| `sqlite`    | 100,000  | 188          | 531,668    | 5.8× slower |
+| `redis`     | 100,000  | 5,459        | 18,318     | 169.7× slower |
+| `mysql`     | 100,000  | 5,828        | 17,159     | 181.2× slower |
 
-Shared memory is the fastest by a wide margin: ~5× faster than a live SQLite
-read and ~156–162× faster than live MySQL/Redis reads (the latter two dominated
+Shared memory is the fastest by a wide margin: ~6× faster than a live SQLite
+read and ~170–181× faster than live MySQL/Redis reads (the latter two dominated
 by network I/O per request).
 
 ## ✨ Features
