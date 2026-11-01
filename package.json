@@ -49,8 +49,5 @@
     "elysia": "^1.4.30",
     "ioredis": "^6.0.0",
     "mysql2": "^3.24.6"
-  },
-  "peerDependencies": {
-    "typescript": "^7"
   }
 }
