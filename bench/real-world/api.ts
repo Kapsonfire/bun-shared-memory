@@ -7,6 +7,7 @@
  *   - "shared"  — reads from shared memory (bun-shared-memory)
  *   - "sqlite"  — reads live from a SQLite database
  *   - "mysql"   — reads live from a MySQL database
+ *   - "redis"   — reads live from a Redis database
  *
  * The benchmark never starts an HTTP server. Instead it builds a `Request`
  * object by hand and calls `app.fetch(request)` directly, which runs the
@@ -15,10 +16,12 @@
 import { Elysia } from "elysia";
 import { Database } from "bun:sqlite";
 import mysql from "mysql2/promise";
+import Redis from "ioredis";
 import { Shared } from "../../src/index.ts";
 import type { User } from "./data.ts";
+import { REDIS_KEY_PREFIX } from "./data.ts";
 
-export type Methodology = "shared" | "sqlite" | "mysql";
+export type Methodology = "shared" | "sqlite" | "mysql" | "redis";
 
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
 
@@ -36,7 +39,7 @@ export interface ApiOptions {
 
 /**
  * Build an Elysia app for the given methodology. Each worker creates its own
- * instance so the benchmark can run the three methodologies independently.
+ * instance so the benchmark can run the methodologies independently.
  */
 export function buildApi(opts: ApiOptions) {
   const { methodology } = opts;
@@ -45,6 +48,7 @@ export function buildApi(opts: ApiOptions) {
   let sharedRef: ReturnType<typeof Shared<User>> | null = null;
   let sqlite: Database | null = null;
   let mysqlConn: mysql.Connection | null = null;
+  let redis: Redis | null = null;
 
   if (methodology === "shared") {
     // The main thread seeds the shared value before spawning workers; here we
@@ -61,6 +65,9 @@ export function buildApi(opts: ApiOptions) {
   } else if (methodology === "sqlite") {
     sqlite = new Database(SQLITE_PATH, { readonly: true });
   } else if (methodology === "mysql") {
+    // Lazily connect on first request so worker startup is not blocked by the
+    // network handshake.
+  } else if (methodology === "redis") {
     // Lazily connect on first request so worker startup is not blocked by the
     // network handshake.
   }
@@ -116,6 +123,14 @@ export function buildApi(opts: ApiOptions) {
           active: row.active === 1,
           score: row.score,
         } satisfies User;
+      }
+      case "redis": {
+        if (!redis) {
+          redis = new Redis({ host: "127.0.0.1", port: 6379 });
+        }
+        const raw = await redis.get(`${REDIS_KEY_PREFIX}${id}`);
+        if (!raw) return new Response("not found", { status: 404 });
+        return JSON.parse(raw) as User;
       }
     }
   });

@@ -1,6 +1,6 @@
-# MySQL service for the real-world benchmark.
+# MySQL + Redis services for the real-world benchmark.
 #
-# Start it with:
+# Start them with:
 #   docker compose -f bench/real-world/docker-compose.yml up -d
 #
 # The benchmark connects with the credentials below (see run.ts / api.ts).
@@ -17,6 +17,17 @@ services:
       - "3306:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: bun-shared-memory-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 2s
       retries: 30

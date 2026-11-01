@@ -28,6 +28,9 @@ export const USER: User = {
 /** Number of rows to seed into SQLite/MySQL (only one is read per request). */
 export const SEED_ROWS = 1000;
 
+/** Redis key prefix under which user records are stored. */
+export const REDIS_KEY_PREFIX = "real-world:user:";
+
 /** Build a user row for a given id (used to seed the DBs). */
 export function makeUser(id: number): User {
   return {

@@ -1,12 +1,13 @@
 /**
  * Real-world benchmark runner.
  *
- * Compares three methodologies for serving a "get user" request through an
+ * Compares four methodologies for serving a "get user" request through an
  * Elysia mini API:
  *
  *   1. shared — reads from shared memory (bun-shared-memory)
  *   2. sqlite — reads live from a SQLite database
  *   3. mysql  — reads live from a MySQL database (Docker)
+ *   4. redis  — reads live from a Redis database (Docker)
  *
  * Each methodology is benchmarked sequentially (not concurrently). For each
  * one, 4 workers are spawned; the total request count is split evenly across
@@ -14,7 +15,7 @@
  * (no HTTP server).
  *
  * Run:
- *   docker compose -f bench/real-world/docker-compose.yml up -d   # MySQL
+ *   docker compose -f bench/real-world/docker-compose.yml up -d   # MySQL + Redis
  *   bun bench/real-world/seed.ts                                   # seed DBs
  *   bun bench/real-world/run.ts [requests]                         # benchmark
  */
@@ -89,8 +90,8 @@ async function runMethodology(methodology: Methodology): Promise<MethodResult> {
   return { methodology, elapsedMs: totalElapsed, count: totalCount };
 }
 
-// --- Run all three methodologies sequentially ------------------------------
-const order: Methodology[] = ["shared", "sqlite", "mysql"];
+// --- Run all methodologies sequentially ------------------------------------
+const order: Methodology[] = ["shared", "sqlite", "mysql", "redis"];
 const outcomes: MethodResult[] = [];
 
 for (const m of order) {
@@ -121,7 +122,7 @@ for (const o of outcomes) {
 const shared = table["shared"];
 if (shared) {
   console.log("");
-  for (const m of ["sqlite", "mysql"] as const) {
+  for (const m of ["sqlite", "mysql", "redis"] as const) {
     const t = table[m];
     if (!t) continue;
     const ratio = shared.ops / t.ops;
