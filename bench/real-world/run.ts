@@ -14,20 +14,25 @@
  * them and each worker processes its share by calling `app.fetch()` directly
  * (no HTTP server).
  *
+ * MySQL/Redis can be reached over TCP or a Unix socket (see docker-compose):
+ *
+ *   bun bench/real-world/run.ts [requests] [tcp|socket]
+ *
  * Run:
  *   docker compose -f bench/real-world/docker-compose.yml up -d   # MySQL + Redis
  *   bun bench/real-world/seed.ts                                   # seed DBs
- *   bun bench/real-world/run.ts [requests]                         # benchmark
+ *   bun bench/real-world/run.ts 100000 socket                      # benchmark
  */
 import { Shared, init } from "../../src/index.ts";
 import { SHARED_USER_KEY } from "./api.ts";
 import { USER } from "./data.ts";
-import type { Methodology } from "./api.ts";
+import type { Methodology, Transport } from "./api.ts";
 
 const WORKERS_PER_METHOD = 4;
 const DEFAULT_REQUESTS = 100_000;
 
 const totalRequests = Number(process.argv[2] ?? DEFAULT_REQUESTS);
+const transport: Transport = process.argv[3] === "socket" ? "socket" : "tcp";
 
 // --- Shared-memory setup ---------------------------------------------------
 // Seed the shared user record on the main thread and start the worker
@@ -54,13 +59,14 @@ async function runMethodology(methodology: Methodology): Promise<MethodResult> {
     workers.push(worker);
 
     results.push(
-      new Promise<MethodResult>((resolve) => {
+      new Promise<MethodResult>((resolve, reject) => {
         worker.onmessage = (e) => {
           const msg = e.data as {
             type: string;
             methodology: Methodology;
             elapsedMs: number;
             count: number;
+            message?: string;
           };
           if (msg.type === "result") {
             resolve({
@@ -68,6 +74,12 @@ async function runMethodology(methodology: Methodology): Promise<MethodResult> {
               elapsedMs: msg.elapsedMs,
               count: msg.count,
             });
+          } else if (msg.type === "error") {
+            reject(
+              new Error(
+                `[${msg.methodology}] worker error: ${msg.message ?? "unknown"}`,
+              ),
+            );
           }
         };
       }),
@@ -77,12 +89,16 @@ async function runMethodology(methodology: Methodology): Promise<MethodResult> {
     worker.postMessage({
       type: "bench",
       methodology,
+      transport,
       count: perWorker,
       userId: 1 + w * 10,
     });
   }
 
-  const resultsArr = await Promise.all(results);
+  const resultsArr = await Promise.all(results).catch((err) => {
+    for (const w of workers) w.terminate();
+    throw err;
+  });
   for (const w of workers) w.terminate();
 
   const totalElapsed = Math.max(...resultsArr.map((r) => r.elapsedMs));
@@ -103,14 +119,20 @@ for (const m of order) {
 }
 
 // --- Report -----------------------------------------------------------------
+// Sort by speed (req/s descending) so the fastest methodology is first.
+const sorted = [...outcomes].sort(
+  (a, b) => b.count / b.elapsedMs - a.count / a.elapsedMs,
+);
+
 console.log("\n── Real-world benchmark ────────────────────────────────────");
 console.log(`Requests per methodology: ${totalRequests.toLocaleString()}`);
 console.log(`Workers per methodology:  ${WORKERS_PER_METHOD}`);
+console.log(`Transport (mysql/redis):  ${transport}`);
 console.log("");
 console.log("| Methodology | Requests | Elapsed (ms) | req/s      |");
 console.log("|-------------|----------|--------------|------------|");
 const table: Record<string, { reqs: number; ms: number; ops: number }> = {};
-for (const o of outcomes) {
+for (const o of sorted) {
   const ops = Math.round(o.count / (o.elapsedMs / 1000));
   table[o.methodology] = { reqs: o.count, ms: o.elapsedMs, ops };
   console.log(
@@ -129,5 +151,67 @@ if (shared) {
     console.log(
       `${m.padEnd(7)} is ${ratio.toFixed(1)}× slower than shared memory`,
     );
+  }
+}
+
+// --- Write benchlog ---------------------------------------------------------
+// Persist the results to benchlogs/<timestamp>-<commit>-real.md so each run
+// has its own file (matching the convention of the micro benchmarks, with a
+// "-real" suffix to distinguish the real-world benchmark).
+const { commit, timestamp } = currentCommit();
+const logDir = new URL("../../benchlogs/", import.meta.url);
+const logFile = new URL(`${timestamp}-${commit}-real.md`, logDir);
+
+const lines: string[] = [];
+lines.push(`# Real-world benchmark ${commit}`);
+lines.push("");
+lines.push(`Date: ${new Date().toISOString()}`);
+lines.push(`Platform: ${process.platform} (${process.arch})`);
+lines.push(`Requests per methodology: ${totalRequests}`);
+lines.push(`Workers per methodology: ${WORKERS_PER_METHOD}`);
+lines.push(`Transport (mysql/redis): ${transport}`);
+lines.push("");
+lines.push("| Methodology | Requests | Elapsed (ms) | req/s |");
+lines.push("|-------------|----------|--------------|-------|");
+for (const o of sorted) {
+  const ops = Math.round(o.count / (o.elapsedMs / 1000));
+  lines.push(
+    `| ${o.methodology} | ${o.count} | ${o.elapsedMs.toFixed(0)} | ${ops} |`,
+  );
+}
+lines.push("");
+lines.push("## vs. shared memory");
+if (shared) {
+  for (const m of ["sqlite", "mysql", "redis"] as const) {
+    const t = table[m];
+    if (!t) continue;
+    lines.push(`- ${m}: ${(shared.ops / t.ops).toFixed(1)}× slower`);
+  }
+}
+
+await Bun.write(logFile, lines.join("\n") + "\n");
+console.log(`\nWrote benchmark log to benchlogs/${timestamp}-${commit}-real.md`);
+
+/**
+ * Resolve the current git commit hash (short form) and its committer date as
+ * a Unix timestamp, or "unknown"/0 if git is unavailable.
+ */
+function currentCommit(): { commit: string; timestamp: number } {
+  try {
+    const hashOut = Bun.spawnSync({
+      cmd: ["git", "rev-parse", "--short", "HEAD"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const commit = hashOut.stdout.toString().trim() || "unknown";
+    const tsOut = Bun.spawnSync({
+      cmd: ["git", "show", "-s", "--format=%ct", "HEAD"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const timestamp = Number(tsOut.stdout.toString().trim()) || 0;
+    return { commit, timestamp };
+  } catch {
+    return { commit: "unknown", timestamp: 0 };
   }
 }

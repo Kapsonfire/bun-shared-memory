@@ -23,13 +23,38 @@ import { REDIS_KEY_PREFIX } from "./data.ts";
 
 export type Methodology = "shared" | "sqlite" | "mysql" | "redis";
 
+/** How MySQL/Redis are reached: over TCP or a Unix socket. */
+export type Transport = "tcp" | "socket";
+
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
+
+/** Unix socket paths (mounted from ./sockets in docker-compose). */
+const MYSQL_SOCKET = new URL("./sockets/mysql/mysqld.sock", import.meta.url).pathname;
+const REDIS_SOCKET = new URL("./sockets/redis/redis.sock", import.meta.url).pathname;
+
+/**
+ * Unix sockets over Docker volumes only work when Docker runs natively (Linux).
+ * On macOS/Windows, Docker Desktop runs in a VM and the volume sync does not
+ * carry real socket connections, so connecting would hang. Throw a clear error
+ * instead of silently hanging.
+ */
+function assertSocketSupported(): void {
+  if (process.platform !== "linux") {
+    throw new Error(
+      `Unix-socket transport is only supported on Linux (got ${process.platform}). ` +
+        "Docker Desktop on macOS/Windows runs in a VM and cannot expose container " +
+        "Unix sockets to the host. Use the 'tcp' transport instead.",
+    );
+  }
+}
 
 /** Shared-memory key under which the user record is stored. */
 const SHARED_KEY = "real-world:user";
 
 export interface ApiOptions {
   methodology: Methodology;
+  /** Transport for MySQL/Redis ("tcp" or "socket"). Ignored for shared/sqlite. */
+  transport?: Transport;
   /** Shared-memory options (only used for "shared"). */
   shared?: {
     initialSize?: number;
@@ -43,6 +68,12 @@ export interface ApiOptions {
  */
 export function buildApi(opts: ApiOptions) {
   const { methodology } = opts;
+  const transport: Transport = opts.transport ?? "tcp";
+
+  // Only MySQL/Redis use the transport; shared/sqlite ignore it.
+  if (transport === "socket" && (methodology === "mysql" || methodology === "redis")) {
+    assertSocketSupported();
+  }
 
   // --- Backend setup -------------------------------------------------------
   let sharedRef: ReturnType<typeof Shared<User>> | null = null;
@@ -99,13 +130,11 @@ export function buildApi(opts: ApiOptions) {
       }
       case "mysql": {
         if (!mysqlConn) {
-          mysqlConn = await mysql.createConnection({
-            host: "127.0.0.1",
-            port: 3306,
-            user: "bench",
-            password: "bench",
-            database: "bench",
-          });
+          mysqlConn = await mysql.createConnection(
+            transport === "socket"
+              ? { socketPath: MYSQL_SOCKET, user: "bench", password: "bench", database: "bench" }
+              : { host: "127.0.0.1", port: 3306, user: "bench", password: "bench", database: "bench" },
+          );
         }
         const [rows] = await mysqlConn.execute<mysql.RowDataPacket[]>(
           "SELECT id, name, email, role, active, score FROM users WHERE id = ?",
@@ -126,7 +155,11 @@ export function buildApi(opts: ApiOptions) {
       }
       case "redis": {
         if (!redis) {
-          redis = new Redis({ host: "127.0.0.1", port: 6379 });
+          redis = new Redis(
+            transport === "socket"
+              ? { path: REDIS_SOCKET }
+              : { host: "127.0.0.1", port: 6379 },
+          );
         }
         const raw = await redis.get(`${REDIS_KEY_PREFIX}${id}`);
         if (!raw) return new Response("not found", { status: 404 });

@@ -38,11 +38,27 @@ bun bench/real-world/seed.ts
 
 ```sh
 # Optional: number of requests per methodology (default 100_000).
-bun bench/real-world/run.ts 100000
+# Optional: transport for MySQL/Redis — "tcp" (default) or "socket".
+bun bench/real-world/run.ts 100000 tcp
 ```
 
-The runner prints a per-methodology table (requests, elapsed ms, req/s) and a
-relative comparison against shared memory.
+The runner prints a per-methodology table (requests, elapsed ms, req/s) sorted
+by speed (fastest first) and a relative comparison against shared memory. It
+also writes the full results to `benchlogs/<timestamp>-<commit>-real.md` (one
+file per run, following the same convention as the micro benchmarks).
+
+### Transport: TCP vs Unix socket
+
+MySQL and Redis can be reached over TCP or a Unix socket:
+
+- **`tcp`** (default) — connects to `127.0.0.1:3306` / `127.0.0.1:6379`.
+- **`socket`** — connects via the Unix sockets mounted from `./sockets`
+  (`sockets/mysql/mysqld.sock`, `sockets/redis/redis.sock`).
+
+> **Note:** the `socket` transport only works on **Linux**, where Docker runs
+> natively and container Unix sockets are reachable from the host. On
+> macOS/Windows, Docker Desktop runs in a VM and cannot expose container Unix
+> sockets to the host, so the runner throws a clear error instead of hanging.
 
 ## Files
 

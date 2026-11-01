@@ -28,6 +28,28 @@ A TypeScript library for the **Bun** runtime that enables sharing data between w
 > onward. Core shared-memory operations (including `SharedArrayBuffer.grow()`)
 > work on earlier versions, but the automatic worker buffer-sharing does not.
 
+## 📈 Real-world benchmark
+
+`bun run bench:real` compares four methodologies for serving a "get user"
+request through an [Elysia](https://elysiajs.com) mini API. Requests are built
+by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
+is benchmarked sequentially with 4 workers. See
+[`bench/real-world/README.md`](bench/real-world/README.md) for setup.
+
+Measured on a MacBook (Bun 1.4.4, 50,000 requests per methodology, sorted by
+speed):
+
+| Methodology | Requests | Elapsed (ms) | req/s      | vs. shared |
+|-------------|----------|--------------|------------|------------|
+| `shared`    | 50,000   | 18           | 2,740,884  | —          |
+| `sqlite`    | 50,000   | 93           | 535,692    | 5.1× slower |
+| `redis`     | 50,000   | 2,840        | 17,606     | 155.7× slower |
+| `mysql`     | 50,000   | 2,956        | 16,917     | 162.0× slower |
+
+Shared memory is the fastest by a wide margin: ~5× faster than a live SQLite
+read and ~156–162× faster than live MySQL/Redis reads (the latter two dominated
+by network I/O per request).
+
 ## ✨ Features
 
 - 🚀 **Zero-copy** shared memory between workers/threads via `SharedArrayBuffer`
@@ -382,31 +404,8 @@ valid for the lifetime of the buffer.
 
 ### Real-world benchmark
 
-`bun run bench:real` compares four methodologies for serving a "get user"
-request through an [Elysia](https://elysiajs.com) mini API:
-
-- **shared** — reads from shared memory (`bun-shared-memory`)
-- **sqlite** — reads live from a SQLite database
-- **mysql** — reads live from a MySQL database (Docker)
-- **redis** — reads live from a Redis database (Docker)
-
-Requests are built by hand and passed directly to `app.fetch()` (no HTTP
-server). Each methodology is benchmarked sequentially; 4 workers are spawned
-per methodology and the request count is split evenly across them. See
-[`bench/real-world/README.md`](bench/real-world/README.md) for setup.
-
-Measured on a MacBook (Bun 1.4.4, 50,000 requests per methodology):
-
-| Methodology | Requests | Elapsed (ms) | req/s      | vs. shared |
-|-------------|----------|--------------|------------|------------|
-| `shared`    | 50,000   | 18           | 2,740,884  | —          |
-| `sqlite`    | 50,000   | 93           | 535,692    | 5.1× slower |
-| `mysql`     | 50,000   | 2,956        | 16,917     | 162.0× slower |
-| `redis`     | 50,000   | 2,840        | 17,606     | 155.7× slower |
-
-Shared memory is the fastest by a wide margin: ~5× faster than a live SQLite
-read and ~156–162× faster than live MySQL/Redis reads (the latter two dominated
-by network I/O per request).
+See [📈 Real-world benchmark](#-real-world-benchmark) at the top of this
+README for the measured results.
 
 ## 🤝 Contributing
 
