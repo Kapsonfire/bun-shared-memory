@@ -5,6 +5,9 @@
 # Dependencies
 node_modules/
 
+# Secrets / auth
+.npmrc
+
 # Dev / CI
 bench/
 benchlogs/
