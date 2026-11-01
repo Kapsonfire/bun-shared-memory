@@ -14,7 +14,8 @@
   },
   "files": [
     "index.ts",
-    "src/"
+    "src/",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "typecheck": "bun check",
