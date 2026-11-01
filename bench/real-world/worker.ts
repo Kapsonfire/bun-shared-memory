@@ -54,7 +54,7 @@ workerScope.onmessage = async (e: MessageEvent) => {
       await init();
     }
 
-    const app = buildApi({ methodology, transport });
+    const app = await buildApi({ methodology, transport });
 
     // Warm up the handler (JIT) before measuring.
     for (let i = 0; i < 1000; i++) {

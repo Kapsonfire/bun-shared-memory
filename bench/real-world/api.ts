@@ -65,8 +65,11 @@ export interface ApiOptions {
 /**
  * Build an Elysia app for the given methodology. Each worker creates its own
  * instance so the benchmark can run the methodologies independently.
+ *
+ * MySQL/Redis connections are established here (before the benchmark runs) so
+ * the connection handshake is not counted as per-request overhead.
  */
-export function buildApi(opts: ApiOptions) {
+export async function buildApi(opts: ApiOptions) {
   const { methodology } = opts;
   const transport: Transport = opts.transport ?? "tcp";
 
@@ -96,11 +99,21 @@ export function buildApi(opts: ApiOptions) {
   } else if (methodology === "sqlite") {
     sqlite = new Database(SQLITE_PATH, { readonly: true });
   } else if (methodology === "mysql") {
-    // Lazily connect on first request so worker startup is not blocked by the
-    // network handshake.
+    // Establish the connection up front so the handshake is not part of the
+    // measured per-request cost.
+    mysqlConn = await mysql.createConnection(
+      transport === "socket"
+        ? { socketPath: MYSQL_SOCKET, user: "bench", password: "bench", database: "bench" }
+        : { host: "127.0.0.1", port: 3306, user: "bench", password: "bench", database: "bench" },
+    );
   } else if (methodology === "redis") {
-    // Lazily connect on first request so worker startup is not blocked by the
-    // network handshake.
+    // Establish the connection up front so the handshake is not part of the
+    // measured per-request cost.
+    redis = new Redis(
+      transport === "socket"
+        ? { path: REDIS_SOCKET }
+        : { host: "127.0.0.1", port: 6379 },
+    );
   }
 
   const app = new Elysia().get("/user/:id", async ({ params }) => {
@@ -129,14 +142,7 @@ export function buildApi(opts: ApiOptions) {
         } satisfies User;
       }
       case "mysql": {
-        if (!mysqlConn) {
-          mysqlConn = await mysql.createConnection(
-            transport === "socket"
-              ? { socketPath: MYSQL_SOCKET, user: "bench", password: "bench", database: "bench" }
-              : { host: "127.0.0.1", port: 3306, user: "bench", password: "bench", database: "bench" },
-          );
-        }
-        const [rows] = await mysqlConn.execute<mysql.RowDataPacket[]>(
+        const [rows] = await mysqlConn!.execute<mysql.RowDataPacket[]>(
           "SELECT id, name, email, role, active, score FROM users WHERE id = ?",
           [id],
         );
@@ -154,14 +160,7 @@ export function buildApi(opts: ApiOptions) {
         } satisfies User;
       }
       case "redis": {
-        if (!redis) {
-          redis = new Redis(
-            transport === "socket"
-              ? { path: REDIS_SOCKET }
-              : { host: "127.0.0.1", port: 6379 },
-          );
-        }
-        const raw = await redis.get(`${REDIS_KEY_PREFIX}${id}`);
+        const raw = await redis!.get(`${REDIS_KEY_PREFIX}${id}`);
         if (!raw) return new Response("not found", { status: 404 });
         return JSON.parse(raw) as User;
       }
