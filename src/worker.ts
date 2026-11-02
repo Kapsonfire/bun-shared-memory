@@ -144,6 +144,7 @@ function stopCoordinator(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
 /** The main-thread worker listener, so it can be removed by `stopInit()`. */
 let mainListener:
   | ((worker: {
@@ -166,12 +167,17 @@ function initMain(): void {
   }) => {
     worker.addEventListener("message", (e) => {
       const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
-      if (msg && msg.__sharedMemoryRequest) {
+      if (
+        msg !== null &&
+        typeof msg === "object" &&
+        "__sharedMemoryRequest" in msg
+      ) {
         const mem = getDefaultMemory();
         worker.postMessage({
           __sharedMemoryInit: true,
           buffers: mem.exportBuffers(),
         });
+        return;
       }
     });
   };
@@ -234,7 +240,12 @@ function installMessageWrapper(): void {
           buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
         }
       | undefined;
-    if (msg && msg.__sharedMemoryInit && msg.buffers) {
+    if (
+      msg !== null &&
+      typeof msg === "object" &&
+      "__sharedMemoryInit" in msg &&
+      msg.buffers
+    ) {
       const mem = SharedMemory.fromBuffers(msg.buffers);
       setDefaultMemory(mem);
       // Create the worker-side refcount tracker from the shared refcount

@@ -147,7 +147,7 @@ describe("Defragmentation", () => {
         { memory: mem },
       );
     }
-    const chunksBefore = mem.arrayTable.buffers.length;
+    const chunksBefore = mem.arrayTable.activeChunkCount;
     expect(chunksBefore).toBeGreaterThan(1);
 
     // Overwrite every array with a tiny one, creating dead space.
@@ -158,8 +158,8 @@ describe("Defragmentation", () => {
     mem.withLock(() => mem.defragment());
 
     // The compacted ArrayTable fits in fewer chunks; the excess chunks are
-    // released.
-    const chunksAfter = mem.arrayTable.buffers.length;
+    // marked inactive (their storage is released by the GC).
+    const chunksAfter = mem.arrayTable.activeChunkCount;
     expect(chunksAfter).toBeLessThan(chunksBefore);
 
     // All values are still correct.

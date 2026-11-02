@@ -1,6 +1,6 @@
 {
   "name": "bun-shared-memory",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Share data between Bun workers/threads using SharedArrayBuffer (zero-copy, 4-buffer architecture, Atomics-based synchronization).",
   "type": "module",
   "sideEffects": false,

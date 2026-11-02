@@ -42,12 +42,17 @@ export class SharedBudget {
  * SharedArrayBuffer (<= `chunkMax` bytes). Offsets are logical and continuous
  * across chunks; access methods resolve an offset into (chunk, chunkOffset).
  *
- * All workers sharing the buffer see growth immediately (each chunk is a
- * SharedArrayBuffer shared via postMessage).
+ * All chunks are pre-allocated at construction with `maxByteLength = chunkSize`
+ * but only 4 bytes of actual storage. A chunk is "activated" (grown to its
+ * full `chunkSize`) on first access. Because `SharedArrayBuffer.grow()` is
+ * visible across all workers sharing the buffer, activation needs no
+ * postMessage broadcast.
  */
 interface Chunk {
   buffer: SharedArrayBuffer;
   view: DataView;
+  /** Whether the chunk has been grown to its full size. */
+  active: boolean;
 }
 
 /** Round `n` up to the next power of two (chunk sizes must be powers of two). */
@@ -62,7 +67,7 @@ export class GrowableBuffer {
   private chunks: Chunk[] = [];
   private readonly maxByteLength: number;
   /** Fixed size of every chunk (the minimum growth step). */
-  private readonly chunkSize: number;
+  readonly chunkSize: number;
   /** log2(chunkSize), used for O(1) offset resolution via bit shifts. */
   private readonly chunkShift: number;
   private readonly budget?: SharedBudget;
@@ -79,36 +84,61 @@ export class GrowableBuffer {
     if (typeof initialSizeOrBuffer === "number") {
       this.chunkSize = Math.min(nextPowerOfTwo(chunkSize), maxByteLength);
       this.chunkShift = Math.log2(this.chunkSize);
-      this.addChunk();
+      // Pre-allocate all chunks (4 bytes each, growable to chunkSize).
+      const chunkCount = Math.max(1, Math.ceil(maxByteLength / this.chunkSize));
+      for (let i = 0; i < chunkCount; i++) {
+        const buffer = new SharedArrayBuffer(4, {
+          maxByteLength: this.chunkSize,
+        });
+        this.chunks.push({
+          buffer,
+          view: new DataView(buffer),
+          active: false,
+        });
+      }
     } else if (Array.isArray(initialSizeOrBuffer)) {
       // Reconstruct from a list of chunks. Use the buffers directly (they are
       // already shared via postMessage) so writes are visible across workers.
-      // All chunks must be the same size to keep resolve() O(1); the first
-      // chunk's size defines the chunk size.
-      this.chunkSize = initialSizeOrBuffer[0]?.byteLength ?? chunkSize;
+      // All chunks are pre-allocated at 4 bytes with maxByteLength = chunkSize;
+      // the chunk size is derived from each buffer's maxByteLength (which is
+      // preserved across postMessage), not its current byteLength.
+      this.chunkSize = initialSizeOrBuffer[0]?.maxByteLength ?? chunkSize;
       this.chunkShift = Math.log2(this.chunkSize);
       for (const sab of initialSizeOrBuffer) {
-        this.chunks.push({ buffer: sab, view: new DataView(sab) });
+        this.chunks.push({
+          buffer: sab,
+          view: new DataView(sab),
+          active: sab.byteLength === this.chunkSize,
+        });
         this.budget?.add(sab.byteLength);
       }
     } else {
       // Reconstruct from a single existing buffer. Use it directly so writes
-      // are shared. Its size defines the chunk size.
-      this.chunkSize = initialSizeOrBuffer.byteLength;
+      // are shared. Its size defines the chunk size (prefer maxByteLength so
+      // a pre-allocated 4-byte chunk is interpreted at its full size).
+      this.chunkSize =
+        initialSizeOrBuffer.maxByteLength ?? initialSizeOrBuffer.byteLength;
       this.chunkShift = Math.log2(this.chunkSize);
       this.chunks.push({
         buffer: initialSizeOrBuffer,
         view: new DataView(initialSizeOrBuffer),
+        active: initialSizeOrBuffer.byteLength === this.chunkSize,
       });
       this.budget?.add(initialSizeOrBuffer.byteLength);
     }
   }
 
-  private addChunk(): void {
-    const buffer = new SharedArrayBuffer(this.chunkSize, {
-      maxByteLength: this.chunkSize,
-    });
-    this.chunks.push({ buffer, view: new DataView(buffer) });
+  /**
+   * Activate the chunk at `index` by growing it to its full size. Because
+   * `SharedArrayBuffer.grow()` is visible across all workers, no broadcast is
+   * needed. No-op if the chunk is already active.
+   */
+  private activate(index: number): void {
+    const chunk = this.chunks[index];
+    if (chunk === undefined || chunk.active) return;
+    chunk.buffer.grow(this.chunkSize);
+    chunk.view = new DataView(chunk.buffer);
+    chunk.active = true;
     this.budget?.add(this.chunkSize);
   }
 
@@ -117,7 +147,7 @@ export class GrowableBuffer {
     return this.used;
   }
 
-  /** Total physical capacity across all chunks. */
+  /** Total logical capacity across all chunks (active or not). */
   get capacity(): number {
     return this.chunks.length * this.chunkSize;
   }
@@ -127,9 +157,15 @@ export class GrowableBuffer {
     return this.chunks.map((c) => c.buffer);
   }
 
+  /** Number of chunks that have been activated (grown to full size). */
+  get activeChunkCount(): number {
+    return this.chunks.reduce((n, c) => n + (c.active ? 1 : 0), 0);
+  }
+
   /**
    * Resolve a logical offset into (chunk, offset within that chunk). All
-   * chunks are the same size, so this is O(1).
+   * chunks are the same size, so this is O(1). Activates the chunk if it is
+   * not yet active.
    */
   private resolve(offset: number): { chunk: Chunk; off: number } {
     const index = offset >> this.chunkShift;
@@ -137,21 +173,22 @@ export class GrowableBuffer {
     if (chunk === undefined) {
       throw new RangeError(`Offset ${offset} is beyond the buffer capacity`);
     }
+    this.activate(index);
     return { chunk, off: offset & (this.chunkSize - 1) };
   }
 
   /** Ensure the buffer has room for at least `needed` bytes. */
   ensureCapacity(needed: number): void {
-    if (needed <= this.capacity) return;
     if (needed > this.maxByteLength) {
       throw new RangeError(
         `Shared buffer capacity exceeded: need ${needed} bytes but max is ${this.maxByteLength}`,
       );
     }
-    // Append full chunks until the capacity covers `needed`. Each addChunk
-    // charges the budget (and throws if the total budget would be exceeded).
-    while (this.capacity < needed) {
-      this.addChunk();
+    // All chunks are pre-allocated; just activate the ones needed to cover
+    // `needed`. grow() is visible across workers, so no broadcast is required.
+    const neededChunks = Math.ceil(needed / this.chunkSize);
+    for (let i = 0; i < neededChunks; i++) {
+      this.activate(i);
     }
   }
 
@@ -163,14 +200,14 @@ export class GrowableBuffer {
   /**
    * Reset the used length to `n` bytes. Used by defragmentation after
    * compacting live data to the front of the buffer. Chunks beyond the
-   * compacted region are dropped (their SharedArrayBuffers are released), so
-   * memory is reclaimed after a defragmentation pass.
+   * compacted region are marked inactive (their storage is released by the
+   * GC, which replaces them with fresh chunks).
    */
   reset(n: number): void {
     this.used = n;
     const neededChunks = Math.ceil(n / this.chunkSize);
-    if (this.chunks.length > neededChunks) {
-      this.chunks.length = neededChunks;
+    for (let i = neededChunks; i < this.chunks.length; i++) {
+      this.chunks[i]!.active = false;
     }
   }
 
@@ -180,6 +217,7 @@ export class GrowableBuffer {
 
   getInt32(offset: number): number {
     const index = offset >> this.chunkShift;
+    this.activate(index);
     return this.chunks[index]!.view.getInt32(
       offset & (this.chunkSize - 1),
       true,
@@ -188,6 +226,7 @@ export class GrowableBuffer {
 
   setInt32(offset: number, value: number): void {
     const index = offset >> this.chunkShift;
+    this.activate(index);
     this.chunks[index]!.view.setInt32(
       offset & (this.chunkSize - 1),
       value,
@@ -197,11 +236,13 @@ export class GrowableBuffer {
 
   getUint8(offset: number): number {
     const index = offset >> this.chunkShift;
+    this.activate(index);
     return this.chunks[index]!.view.getUint8(offset & (this.chunkSize - 1));
   }
 
   setUint8(offset: number, value: number): void {
     const index = offset >> this.chunkShift;
+    this.activate(index);
     this.chunks[index]!.view.setUint8(offset & (this.chunkSize - 1), value);
   }
 

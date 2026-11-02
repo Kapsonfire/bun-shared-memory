@@ -208,4 +208,73 @@ describe("Worker integration (M4)", () => {
     expect(result).toContain("error:");
     expect(result).toContain("init()");
   });
+
+  test("a worker can grow a pre-allocated chunk and the main thread sees it", async () => {
+    // Use a tiny chunk size so a worker can exceed the initial capacity with a
+    // modest amount of data. All chunks are pre-allocated at init and shared
+    // with the worker; activation via SharedArrayBuffer.grow() is visible
+    // across workers, so no broadcast is needed.
+    setDefaultMemory(new SharedMemory({ chunkSize: 1024 }));
+    await init();
+
+    const workerCode = `
+      import { Shared, init, onMessage, getDefaultMemory } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      await init();
+      onMessage((e) => {
+        if (e.data === "grow") {
+          // Write a large array that exceeds the initial chunk capacity,
+          // forcing the worker to activate additional pre-allocated chunks.
+          const arr = Shared("m4-chunk-growth", [0]);
+          const big = new Array(5000).fill(0).map((_, i) => i);
+          arr.write(big);
+          self.postMessage({
+            capacity: getDefaultMemory().arrayTable.capacity,
+            length: arr.read().length,
+          });
+        }
+      });
+    `;
+
+    const result = await new Promise<{
+      capacity: number;
+      length: number;
+    }>((resolve) => {
+      const worker = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(workerCode),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      worker.onmessage = (e) => {
+        const data = e.data as
+          | { __sharedMemoryRequest?: boolean }
+          | { capacity: number; length: number };
+        if (
+          data !== null &&
+          typeof data === "object" &&
+          !("__sharedMemoryRequest" in data)
+        ) {
+          resolve(data as { capacity: number; length: number });
+        }
+      };
+      worker.postMessage("grow");
+    });
+
+    // The worker grew the ArrayTable beyond the initial single chunk.
+    expect(result.capacity).toBeGreaterThan(1024);
+    expect(result.length).toBe(5000);
+
+    // The main thread's ArrayTable has the same pre-allocated capacity.
+    const mem = getDefaultMemory();
+    expect(mem.arrayTable.capacity).toBe(result.capacity);
+
+    // The data written by the worker is readable from the main thread.
+    const arr = Shared("m4-chunk-growth", [0]);
+    expect(arr.read().length).toBe(5000);
+
+    stopInit();
+  });
 });

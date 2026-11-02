@@ -296,11 +296,12 @@ describe("SharedMemory total memory budget", () => {
   });
 
   test("maxTotalBytes smaller than the initial buffers throws", () => {
-    // 4 initial buffers of 1024 bytes = 4096, which exceeds a 4096 budget
-    // (the budget check is strict: total must stay within the budget).
-    expect(
-      () => new SharedMemory({ maxTotalBytes: 4095, chunkSize: 1024 }),
-    ).toThrow(RangeError);
+    // With pre-allocated chunks, the initial buffers are only 4 bytes each, so
+    // construction never exceeds the budget. The budget is enforced when
+    // chunks are activated (grown to their full size). A budget smaller than
+    // the chunk size throws as soon as the first chunk is activated.
+    const mem = new SharedMemory({ maxTotalBytes: 1023, chunkSize: 1024 });
+    expect(() => mem.arrayTable.ensureCapacity(1024)).toThrow(RangeError);
   });
 });
 
