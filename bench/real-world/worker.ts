@@ -21,18 +21,20 @@ interface BenchRequest {
   methodology: Methodology;
   /** Transport for MySQL/Redis ("tcp" or "socket"). */
   transport?: Transport;
-  /** Number of requests this worker should process. */
+  /** Number of requests this worker should process per sample. */
   count: number;
   /** The user id to read (rotated across requests). */
   userId: number;
+  /** Number of measured samples; the worker reports the minimum. */
+  samples: number;
 }
 
 interface ResultMessage {
   type: "result";
   methodology: Methodology;
-  /** Total wall-clock time in ms to process all requests. */
+  /** Best (minimum) wall-clock time in ms across all samples. */
   elapsedMs: number;
-  /** Number of requests processed. */
+  /** Number of requests processed per sample. */
   count: number;
 }
 
@@ -46,7 +48,7 @@ workerScope.onmessage = async (e: MessageEvent) => {
   const msg = e.data as BenchRequest;
   if (msg.type !== "bench") return;
 
-  const { methodology, count, userId, transport } = msg;
+  const { methodology, count, userId, transport, samples } = msg;
 
   try {
     // Shared-memory workers must receive the buffers from the main thread.
@@ -61,15 +63,27 @@ workerScope.onmessage = async (e: MessageEvent) => {
       await app.fetch(new Request(`http://localhost/user/${userId}`));
     }
 
-    const start = performance.now();
-    for (let i = 0; i < count; i++) {
-      // Rotate the id so reads hit different rows (like real traffic).
-      const id = userId + (i % 10);
-      await app.fetch(new Request(`http://localhost/user/${id}`));
+    // Run several samples and keep the minimum. CPU contention (other
+    // processes, the IDE, etc.) can only slow a sample down, never speed it
+    // up, so the minimum is the best estimate of the true throughput.
+    let best = Infinity;
+    for (let s = 0; s < samples; s++) {
+      const start = performance.now();
+      for (let i = 0; i < count; i++) {
+        // Rotate the id so reads hit different rows (like real traffic).
+        const id = userId + (i % 10);
+        await app.fetch(new Request(`http://localhost/user/${id}`));
+      }
+      const elapsedMs = performance.now() - start;
+      if (elapsedMs < best) best = elapsedMs;
     }
-    const elapsedMs = performance.now() - start;
 
-    const result: ResultMessage = { type: "result", methodology, elapsedMs, count };
+    const result: ResultMessage = {
+      type: "result",
+      methodology,
+      elapsedMs: best,
+      count,
+    };
     workerScope.postMessage(result);
   } catch (err) {
     const errorMsg: ErrorMessage = {

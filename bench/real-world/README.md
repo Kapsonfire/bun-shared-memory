@@ -63,6 +63,23 @@ by speed (fastest first) and a relative comparison against shared memory. It
 also writes the full results to `benchlogs/<timestamp>-<commit>-real.md` (one
 file per run, following the same convention as the micro benchmarks).
 
+### Stability
+
+The shared-memory methodology is extremely fast (finishes in tens of
+milliseconds), so it is sensitive to CPU contention from other processes (the
+IDE, language servers, etc.). To get a stable, reproducible number, the runner
+takes the **minimum** over several measurements — contention can only slow a
+run down, never speed it up, so the minimum is the best estimate of true
+throughput:
+
+- **Samples per worker** (default 5): each worker runs the full request loop
+  several times and reports its fastest sample.
+- **Runs per methodology** (default 3): each methodology is run several times
+  (each run spawns the 4 workers again) and the fastest run is kept.
+
+For the most reliable results, close or pause CPU-heavy applications (IDE,
+Copilot, language servers) before running.
+
 ### Fair comparison
 
 MySQL and Redis connections are **opened once per worker, before the

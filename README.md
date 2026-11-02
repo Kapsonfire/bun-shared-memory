@@ -37,19 +37,20 @@ is benchmarked sequentially with 4 workers. See
 [`bench/real-world/README.md`](bench/real-world/README.md) for setup.
 
 Measured on Linux (Bun 1.4.4, 100,000 requests per methodology, sorted by
-speed; MySQL/Redis benchmarked over both TCP and Unix socket):
+speed; MySQL/Redis benchmarked over both TCP and Unix socket; each methodology
+is the minimum over 3 runs × 5 samples to filter CPU-contention noise):
 
 | Methodology | Transport | Requests | Elapsed (ms) | req/s      | vs. shared |
 |-------------|-----------|----------|--------------|------------|------------|
-| `shared`    | —         | 100,000  | 35           | 2,819,263  | —          |
-| `sqlite`    | —         | 100,000  | 191          | 524,799    | 5.4× slower |
-| `redis`     | socket    | 100,000  | 1,570        | 63,675     | 44.3× slower |
-| `mysql`     | socket    | 100,000  | 1,632        | 61,261     | 46.0× slower |
-| `redis`     | tcp       | 100,000  | 2,931        | 34,113     | 82.6× slower |
-| `mysql`     | tcp       | 100,000  | 3,075        | 32,522     | 86.7× slower |
+| `shared`    | —         | 100,000  | 21           | 4,876,492  | —          |
+| `sqlite`    | —         | 100,000  | 188          | 531,116    | 9.2× slower |
+| `redis`     | socket    | 100,000  | 1,262        | 79,229     | 61.5× slower |
+| `mysql`     | socket    | 100,000  | 1,605        | 62,322     | 78.2× slower |
+| `redis`     | tcp       | 100,000  | 2,817        | 35,497     | 137.4× slower |
+| `mysql`     | tcp       | 100,000  | 2,976        | 33,602     | 145.1× slower |
 
-Shared memory is the fastest by a wide margin: ~5.4× faster than a live SQLite
-read and ~44–87× faster than live MySQL/Redis reads. Unix sockets are
+Shared memory is the fastest by a wide margin: ~9.2× faster than a live SQLite
+read and ~61–145× faster than live MySQL/Redis reads. Unix sockets are
 significantly faster than TCP for MySQL/Redis (~1.8×), but both remain far
 slower than shared memory.
 

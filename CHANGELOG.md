@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only activates new chunks instead of re-scanning every already-active chunk
   on each write (was O(n) per write as the dataset grew). Writes ~9% faster.
 
+### Changed
+
+- Stabilize the real-world benchmark against CPU contention. The shared-memory
+  methodology finishes in tens of milliseconds, so it is sensitive to load
+  from other processes (IDE, language servers). Each worker now runs several
+  measured samples (default 5) and reports its fastest; each methodology is
+  run several times (default 3) and the fastest run is kept. Because
+  contention can only slow a run down, the minimum is the best estimate of
+  true throughput.
+
 ## [0.1.6] - 2026-11-02
 
 ### Added
