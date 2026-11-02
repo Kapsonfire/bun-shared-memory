@@ -128,6 +128,46 @@ describe("Defragmentation", () => {
     expect(rc).toBe("gamma2");
   });
 
+  test("releases unused chunks after defragmentation", () => {
+    // Use a small chunk size so a few writes span multiple chunks.
+    const mem = new SharedMemory({
+      initialSize: 1024,
+      maxByteLength: 1 << 20,
+      chunkSize: 4096,
+    });
+
+    // Write enough arrays to grow the ArrayTable across several chunks.
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const key = `k${i}`;
+      keys.push(key);
+      Shared(
+        key,
+        Array.from({ length: 50 }, (_, j) => j),
+        { memory: mem },
+      );
+    }
+    const chunksBefore = mem.arrayTable.activeChunkCount;
+    expect(chunksBefore).toBeGreaterThan(1);
+
+    // Overwrite every array with a tiny one, creating dead space.
+    for (let i = 0; i < 100; i++) {
+      Shared(keys[i]!, [i], { memory: mem }).write([i]);
+    }
+
+    mem.withLock(() => mem.defragment());
+
+    // The compacted ArrayTable fits in fewer chunks; the excess chunks are
+    // marked inactive (their storage is released by the GC).
+    const chunksAfter = mem.arrayTable.activeChunkCount;
+    expect(chunksAfter).toBeLessThan(chunksBefore);
+
+    // All values are still correct.
+    for (let i = 0; i < 100; i++) {
+      expect(Shared<number[]>(keys[i]!, [], { memory: mem }).read()[0]).toBe(i);
+    }
+  });
+
   test("preserves arrays that grew via push", () => {
     const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
     const arr = Shared("arr", [1, 2, 3], { memory: mem });
@@ -247,10 +287,10 @@ describe("RefCount across workers", () => {
         lockBuf: mem.lock.buffer,
         refBuf: coord.sab,
         buffers: {
-          indexTable: mem.indexTable.buffer,
-          dataTable: mem.dataTable.buffer,
-          stringTable: mem.stringTable.buffer,
-          arrayTable: mem.arrayTable.buffer,
+          indexTable: mem.indexTable.buffers[0],
+          dataTable: mem.dataTable.buffers[0],
+          stringTable: mem.stringTable.buffers[0],
+          arrayTable: mem.arrayTable.buffers[0],
           layoutVersion: mem.layoutVersion.buffer,
         },
       });
@@ -295,5 +335,30 @@ describe("RefCount across workers", () => {
     expect(coord.refCount(objectId)).toBe(0);
 
     coord.stopAutoMaintenance();
+  });
+});
+
+describe(">4 GiB shared memory", () => {
+  test("the ArrayTable can exceed the 4 GiB single-SAB limit via chunks", () => {
+    // A single SharedArrayBuffer is capped at 4 GiB. With chunking, a buffer
+    // can grow past that by spanning multiple chunks. Use a 1 GiB chunk size
+    // so only a handful of chunks are needed to cross 4 GiB.
+    const mem = new SharedMemory({
+      maxByteLength: 8 * 1024 * 1024 * 1024, // 8 GiB
+      chunkSize: 1024 * 1024 * 1024, // 1 GiB per chunk
+    });
+
+    // Grow the ArrayTable past the 4 GiB single-SAB limit.
+    const over4GiB = 4 * 1024 * 1024 * 1024 + 1024;
+    mem.arrayTable.ensureCapacity(over4GiB);
+
+    // The capacity now exceeds 4 GiB, backed by multiple chunks.
+    expect(mem.arrayTable.capacity).toBeGreaterThan(4 * 1024 * 1024 * 1024);
+    expect(mem.arrayTable.buffers.length).toBeGreaterThan(1);
+
+    // Every chunk is its own SharedArrayBuffer, each within the 4 GiB limit.
+    for (const sab of mem.arrayTable.buffers) {
+      expect(sab.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024 * 1024);
+    }
   });
 });

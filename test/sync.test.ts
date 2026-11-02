@@ -146,10 +146,10 @@ describe("Read cache invalidation across workers", () => {
           key: "cross-cache-1",
           lockBuf: mem.lock.buffer,
           buffers: {
-            indexTable: mem.indexTable.buffer,
-            dataTable: mem.dataTable.buffer,
-            stringTable: mem.stringTable.buffer,
-            arrayTable: mem.arrayTable.buffer,
+            indexTable: mem.indexTable.buffers[0],
+            dataTable: mem.dataTable.buffers[0],
+            stringTable: mem.stringTable.buffers[0],
+            arrayTable: mem.arrayTable.buffers[0],
           },
         });
       });
