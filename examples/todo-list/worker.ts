@@ -36,68 +36,70 @@ function buildApp(port: number) {
 
   const publicDir = join(import.meta.dir, "public");
 
-  return new Elysia()
-    // API routes
-    .get("/api/todos", () => {
-      return parseItems(shared.items);
-    })
-    .post("/api/todos", ({ body }) => {
-      const title = (body as { title?: string }).title?.trim();
-      if (!title) {
-        return new Response("title is required", { status: 400 });
-      }
-      const items = parseItems(shared.items);
-      const created: Todo = {
-        id: shared.nextId,
-        title,
-        done: false,
-        createdAt: Date.now(),
-      };
-      items.push(created);
-      shared.nextId = shared.nextId + 1;
-      shared.items = JSON.stringify(items);
-      return created;
-    })
-    .patch("/api/todos/:id", ({ params, body }) => {
-      const id = Number(params.id);
-      const { title, done } = body as { title?: string; done?: boolean };
-      const items = parseItems(shared.items);
-      const todo = items.find((t) => t.id === id);
-      if (!todo) {
-        return new Response("not found", { status: 404 });
-      }
-      if (typeof title === "string") {
-        const trimmed = title.trim();
-        if (!trimmed) {
-          return new Response("title must not be empty", { status: 400 });
+  return (
+    new Elysia()
+      // API routes
+      .get("/api/todos", () => {
+        return parseItems(shared.items);
+      })
+      .post("/api/todos", ({ body }) => {
+        const title = (body as { title?: string }).title?.trim();
+        if (!title) {
+          return new Response("title is required", { status: 400 });
         }
-        todo.title = trimmed;
-      }
-      if (typeof done === "boolean") {
-        todo.done = done;
-      }
-      shared.items = JSON.stringify(items);
-      return todo;
-    })
-    .delete("/api/todos/:id", ({ params }) => {
-      const id = Number(params.id);
-      const items = parseItems(shared.items);
-      const index = items.findIndex((t) => t.id === id);
-      if (index === -1) {
-        return new Response("not found", { status: 404 });
-      }
-      items.splice(index, 1);
-      shared.items = JSON.stringify(items);
-      return new Response(null, { status: 204 });
-    })
-    // Static frontend (served directly by Elysia)
-    .get("/", () => Bun.file(join(publicDir, "index.html")))
-    .get("/styles.css", () => Bun.file(join(publicDir, "styles.css")))
-    .get("/app.js", () => Bun.file(join(publicDir, "app.js")))
-    .listen({
-      port,
-      reusePort: true,
-    });
+        const items = parseItems(shared.items);
+        const created: Todo = {
+          id: shared.nextId,
+          title,
+          done: false,
+          createdAt: Date.now(),
+        };
+        items.push(created);
+        shared.nextId = shared.nextId + 1;
+        shared.items = JSON.stringify(items);
+        return created;
+      })
+      .patch("/api/todos/:id", ({ params, body }) => {
+        const id = Number(params.id);
+        const { title, done } = body as { title?: string; done?: boolean };
+        const items = parseItems(shared.items);
+        const todo = items.find((t) => t.id === id);
+        if (!todo) {
+          return new Response("not found", { status: 404 });
+        }
+        if (typeof title === "string") {
+          const trimmed = title.trim();
+          if (!trimmed) {
+            return new Response("title must not be empty", { status: 400 });
+          }
+          todo.title = trimmed;
+        }
+        if (typeof done === "boolean") {
+          todo.done = done;
+        }
+        shared.items = JSON.stringify(items);
+        return todo;
+      })
+      .delete("/api/todos/:id", ({ params }) => {
+        const id = Number(params.id);
+        const items = parseItems(shared.items);
+        const index = items.findIndex((t) => t.id === id);
+        if (index === -1) {
+          return new Response("not found", { status: 404 });
+        }
+        items.splice(index, 1);
+        shared.items = JSON.stringify(items);
+        return new Response(null, { status: 204 });
+      })
+      // Static frontend (served directly by Elysia)
+      .get("/", () => Bun.file(join(publicDir, "index.html")))
+      .get("/styles.css", () => Bun.file(join(publicDir, "styles.css")))
+      .get("/app.js", () => Bun.file(join(publicDir, "app.js")))
+      .listen({
+        port,
+        reusePort: true,
+      })
+  );
 }
 
 const port = Number(process.env.PORT ?? 3000);
