@@ -388,4 +388,62 @@ describe("Worker integration (M4)", () => {
     worker.terminate();
     stopInit();
   });
+
+  test("a worker appends to a shared object's string property without corrupting it", async () => {
+    // Regression test for the shared append-cursor bug: when a worker
+    // reconstructs the SharedMemory via fromBuffers(), the per-table append
+    // cursor (used length) must be shared, otherwise the worker writes at
+    // offset 0 and overwrites existing data (e.g. the key string).
+    setDefaultMemory(new SharedMemory({ chunkSize: 1024 }));
+    await init();
+
+    const shared = Shared<{ nextId: number; items: string }>("m4-cursor", {
+      nextId: 1,
+      items: "[]",
+    });
+
+    const workerCode = `
+      import { Shared, init, onMessage } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      await init();
+      onMessage((e) => {
+        if (e.data === "append") {
+          const shared = Shared("m4-cursor", { nextId: 1, items: "[]" });
+          const items = JSON.parse(shared.items);
+          items.push({ id: shared.nextId, title: "from-worker" });
+          shared.nextId = shared.nextId + 1;
+          shared.items = JSON.stringify(items);
+          self.postMessage({ items: shared.items });
+        }
+      });
+    `;
+
+    const result = await new Promise<{ items: string }>((resolve) => {
+      const worker = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(workerCode),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      worker.onmessage = (e) => {
+        const data = e.data as
+          { __sharedMemoryRequest?: boolean } | { items: string };
+        if (data !== null && typeof data === "object" && "items" in data) {
+          resolve(data as { items: string });
+        }
+      };
+      worker.postMessage("append");
+    });
+
+    // The worker appended to the shared string; the main thread sees it.
+    expect(JSON.parse(result.items)).toEqual([{ id: 1, title: "from-worker" }]);
+    expect(JSON.parse(shared.items)).toEqual([{ id: 1, title: "from-worker" }]);
+
+    // The key is still resolvable (not corrupted by the worker's write).
+    expect(shared.nextId).toBe(2);
+
+    stopInit();
+  });
 });

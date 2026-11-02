@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Todo List</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1>Todo List</h1>
+
+      <form id="add-form" class="add-form">
+        <input
+          id="new-todo"
+          type="text"
+          placeholder="Neue Aufgabe…"
+          autocomplete="off"
+          required
+        />
+        <button type="submit">Hinzufügen</button>
+      </form>
+
+      <ul id="todo-list" class="todo-list"></ul>
+
+      <p id="empty" class="empty" hidden>Keine Aufgaben. Füge eine hinzu!</p>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

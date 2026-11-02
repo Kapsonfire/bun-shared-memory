@@ -102,7 +102,13 @@ export class GrowableBuffer {
   /** log2(chunkSize), used for O(1) offset resolution via bit shifts. */
   private readonly chunkShift: number;
   private readonly budget?: SharedBudget;
-  private used = 0;
+  /**
+   * Shared append cursor (used length). Stored in a SharedArrayBuffer so all
+   * workers that reconstruct this buffer from `fromBuffers()` see the same
+   * used length and append at the correct offset instead of overwriting
+   * existing data at offset 0.
+   */
+  private readonly cursor: BigInt64Array;
   /** Smallest chunk index that is not yet active (see `activate`). */
   private nextChunkToActivate = 0;
 
@@ -113,9 +119,13 @@ export class GrowableBuffer {
     chunkSize = 32 * 1024 * 1024, // 32 MiB per chunk
     singleBuffer = false,
     chargeInitial = true,
+    cursorBuffer?: SharedArrayBuffer,
   ) {
     this.singleBuffer = singleBuffer;
     this.budget = budget;
+    this.cursor = new BigInt64Array(
+      cursorBuffer ?? new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT),
+    );
     if (singleBuffer && typeof initialSizeOrBuffer !== "number") {
       const buffer = Array.isArray(initialSizeOrBuffer)
         ? initialSizeOrBuffer[0]
@@ -267,7 +277,12 @@ export class GrowableBuffer {
 
   /** Number of bytes written so far (used length, not buffer capacity). */
   get byteLength(): number {
-    return this.used;
+    return Number(Atomics.load(this.cursor, 0));
+  }
+
+  /** The shared cursor buffer (for export to workers). */
+  get cursorBuffer(): SharedArrayBuffer {
+    return this.cursor.buffer as SharedArrayBuffer;
   }
 
   /** Total logical capacity across all chunks (active or not). */
@@ -373,7 +388,7 @@ export class GrowableBuffer {
 
   /** Mark `n` bytes as used, after writing them at the current offset. */
   advance(n: number): void {
-    this.used += n;
+    Atomics.add(this.cursor, 0, BigInt(n));
   }
 
   /**
@@ -383,7 +398,7 @@ export class GrowableBuffer {
    * `releaseInactiveChunks()`.
    */
   reset(n: number): void {
-    this.used = n;
+    Atomics.store(this.cursor, 0, BigInt(n));
     if (this.singleBuffer) return;
     const neededChunks = Math.ceil(n / this.chunkSize);
     for (let i = 0; i < this.chunks.length; i++) {
