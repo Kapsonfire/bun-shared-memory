@@ -40,14 +40,14 @@ Measured on Linux (Bun 1.4.4, 100,000 requests per methodology, sorted by
 speed; MySQL/Redis benchmarked over both TCP and Unix socket; each methodology
 is the minimum over 3 runs × 5 samples to filter CPU-contention noise):
 
-| Methodology | Transport | Requests | Elapsed (ms) | req/s      | vs. shared |
-|-------------|-----------|----------|--------------|------------|------------|
-| `shared`    | —         | 100,000  | 21           | 4,876,492  | —          |
-| `sqlite`    | —         | 100,000  | 188          | 531,116    | 9.2× slower |
-| `redis`     | socket    | 100,000  | 1,262        | 79,229     | 61.5× slower |
-| `mysql`     | socket    | 100,000  | 1,605        | 62,322     | 78.2× slower |
-| `redis`     | tcp       | 100,000  | 2,817        | 35,497     | 137.4× slower |
-| `mysql`     | tcp       | 100,000  | 2,976        | 33,602     | 145.1× slower |
+| Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared    |
+| ----------- | --------- | -------- | ------------ | --------- | ------------- |
+| `shared`    | —         | 100,000  | 21           | 4,876,492 | —             |
+| `sqlite`    | —         | 100,000  | 188          | 531,116   | 9.2× slower   |
+| `redis`     | socket    | 100,000  | 1,262        | 79,229    | 61.5× slower  |
+| `mysql`     | socket    | 100,000  | 1,605        | 62,322    | 78.2× slower  |
+| `redis`     | tcp       | 100,000  | 2,817        | 35,497    | 137.4× slower |
+| `mysql`     | tcp       | 100,000  | 2,976        | 33,602    | 145.1× slower |
 
 Shared memory is the fastest by a wide margin: ~9.2× faster than a live SQLite
 read and ~61–145× faster than live MySQL/Redis reads. Unix sockets are
@@ -74,16 +74,16 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## 📊 Stats
 
-| | |
-|---|---|
-| **Version** | [![npm version](https://img.shields.io/npm/v/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory) |
-| **Downloads / month** | [![npm downloads](https://img.shields.io/npm/dm/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory) |
-| **Stars** | [![GitHub stars](https://img.shields.io/github/stars/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory) |
-| **Forks** | [![GitHub forks](https://img.shields.io/github/forks/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory) |
-| **Open issues** | [![GitHub issues](https://img.shields.io/github/issues/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/issues) |
-| **Open PRs** | [![GitHub pull requests](https://img.shields.io/github/issues-pr/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/pulls) |
-| **License** | [![License](https://img.shields.io/github/license/Kapsonfire/bun-shared-memory?color=green)](https://github.com/Kapsonfire/bun-shared-memory/blob/main/LICENSE) |
-| **Language** | [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?color=3178c6)](https://www.typescriptlang.org) |
+|                       |                                                                                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Version**           | [![npm version](https://img.shields.io/npm/v/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)                                      |
+| **Downloads / month** | [![npm downloads](https://img.shields.io/npm/dm/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)                                   |
+| **Stars**             | [![GitHub stars](https://img.shields.io/github/stars/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory)                   |
+| **Forks**             | [![GitHub forks](https://img.shields.io/github/forks/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory)                   |
+| **Open issues**       | [![GitHub issues](https://img.shields.io/github/issues/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/issues)          |
+| **Open PRs**          | [![GitHub pull requests](https://img.shields.io/github/issues-pr/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/pulls) |
+| **License**           | [![License](https://img.shields.io/github/license/Kapsonfire/bun-shared-memory?color=green)](https://github.com/Kapsonfire/bun-shared-memory/blob/main/LICENSE)     |
+| **Language**          | [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?color=3178c6)](https://www.typescriptlang.org)                                                        |
 
 ## Data Types
 
