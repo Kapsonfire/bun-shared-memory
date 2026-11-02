@@ -81,14 +81,14 @@ interface Chunk {
 }
 
 /** Round `n` up to the next power of two (chunk sizes must be powers of two). */
-function nextPowerOfTwo(n: number): number {
+export function nextPowerOfTwo(n: number): number {
   if (n <= 0) return 1;
   let p = 1;
   while (p < n) p <<= 1;
   return p;
 }
 
-function largestPowerOfTwo(n: number): number {
+export function largestPowerOfTwo(n: number): number {
   if (n <= 1) return 1;
   return 2 ** Math.floor(Math.log2(n));
 }

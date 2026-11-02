@@ -152,5 +152,8 @@ user-facing worker-to-worker signaling.
   exception: it uses a single growable `SharedArrayBuffer` (capped at 4 GiB).
   `maxTotalBytes` caps the combined physical size of the three chunked tables
   via an atomic `SharedBudget` counter shared across workers, reserving memory
-  before each chunk growth. Configurable via `SharedOptions`.
+  before each chunk growth. Configurable via `SharedOptions`. Size limits are
+  enforced regardless of the configured values: `chunkSize` is at least 4 MiB,
+  `maxTotalBytes`/`maxByteLength` are at least 32 MiB, and `chunkSize` is
+  raised as needed so no table needs more than 1024 chunks.
 - **Multi-chunk strings/arrays**: Strings and arrays are stored contiguously in their append-only tables; a reference stores the offset and length/count. Growth appends new data and updates the reference (no shifting of existing data).

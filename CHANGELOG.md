@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is enforced by an atomic `SharedBudget` counter shared across workers that
   reserves memory before each chunk growth, so the three tables cannot exceed
   the limit even when multiple workers write concurrently.
+- Enforce size limits regardless of the configured values: `chunkSize` is at
+  least 4 MiB, `maxTotalBytes`/`maxByteLength` are at least 32 MiB, and
+  `chunkSize` is raised as needed so no table needs more than 1024 chunks.
+  `SharedMemory.maxByteLength` and `SharedMemory.maxTotalBytes` are now public
+  read-only fields.
 
 ### Performance
 

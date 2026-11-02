@@ -80,8 +80,8 @@ describe("RefCountCoordinator", () => {
   test("calls onDefragment with the new chunk lists after defragmentation", async () => {
     const mem = new SharedMemory({
       initialSize: 1024,
-      maxByteLength: 90000, // just above the ArrayTable size, so defrag triggers
-      chunkSize: 4096,
+      maxByteLength: 32 * 1024 * 1024,
+      chunkSize: 4 * 1024 * 1024,
     });
     let defragResult: {
       indexTable: SharedArrayBuffer[];
@@ -92,6 +92,7 @@ describe("RefCountCoordinator", () => {
     const coord = new RefCountCoordinator(mem, undefined, {
       autoMaintenance: true,
       maintenanceInterval: 5,
+      defragThreshold: 0.5,
       onDefragment: (buffers) => {
         defragResult = buffers;
       },
@@ -100,16 +101,16 @@ describe("RefCountCoordinator", () => {
     // Grow the ArrayTable across several chunks, then overwrite to create
     // dead space so defragmentation replaces inactive chunks.
     const keys: string[] = [];
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 300; i++) {
       const key = `gc-${i}`;
       keys.push(key);
       Shared(
         key,
-        Array.from({ length: 50 }, (_, j) => j),
+        Array.from({ length: 5000 }, (_, j) => j),
         { memory: mem },
       );
     }
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 300; i++) {
       Shared(keys[i]!, [i], { memory: mem }).write([i]);
     }
 
@@ -180,21 +181,21 @@ describe("Defragmentation", () => {
   });
 
   test("releases unused chunks after defragmentation", () => {
-    // Use a small chunk size so a few writes span multiple chunks.
+    // Use the minimum chunk size so a few writes span multiple chunks.
     const mem = new SharedMemory({
       initialSize: 1024,
-      maxByteLength: 1 << 20,
-      chunkSize: 4096,
+      maxByteLength: 32 * 1024 * 1024,
+      chunkSize: 4 * 1024 * 1024,
     });
 
     // Write enough arrays to grow the ArrayTable across several chunks.
     const keys: string[] = [];
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 300; i++) {
       const key = `k${i}`;
       keys.push(key);
       Shared(
         key,
-        Array.from({ length: 50 }, (_, j) => j),
+        Array.from({ length: 5000 }, (_, j) => j),
         { memory: mem },
       );
     }
@@ -202,7 +203,7 @@ describe("Defragmentation", () => {
     expect(chunksBefore).toBeGreaterThan(1);
 
     // Overwrite every array with a tiny one, creating dead space.
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 300; i++) {
       Shared(keys[i]!, [i], { memory: mem }).write([i]);
     }
 

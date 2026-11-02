@@ -336,6 +336,20 @@ StringTable, and ArrayTable, including across workers. If a write would exceed
 the budget, a `RangeError` is thrown before the chunk grows. Without
 `maxTotalBytes`, each table simply grows up to its own `maxByteLength`.
 
+### Size limits
+
+The following limits are enforced regardless of the configured values:
+
+- **`chunkSize` is at least 4 MiB.** A smaller value is raised to 4 MiB.
+- **`maxTotalBytes` / `maxByteLength` are at least 32 MiB.** A smaller value
+  is raised to 32 MiB.
+- **No table uses more than 1024 chunks.** `chunkSize` is raised as needed so
+  that `ceil(maxByteLength / chunkSize) ≤ 1024` (e.g. an 8 GiB table with a
+  4 MiB chunk would need 2048 chunks, so the chunk size is raised to 8 MiB).
+
+These keep the chunk count bounded (so the pre-allocated chunk list stays
+small) and avoid pathological tiny chunks.
+
 ## Array capacity
 
 By default an array is stored with exactly as many slots as it has elements,

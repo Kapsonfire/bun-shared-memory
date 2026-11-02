@@ -1,4 +1,8 @@
-import { GrowableBuffer, SharedBudget } from "./growable-buffer.ts";
+import {
+  GrowableBuffer,
+  SharedBudget,
+  nextPowerOfTwo,
+} from "./growable-buffer.ts";
 import { Mutex } from "./mutex.ts";
 
 /**
@@ -58,6 +62,13 @@ const ARRAY_HEADER = 4;
 
 const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
+const DEFAULT_CHUNK_SIZE = 32 * 1024 * 1024; // 32 MiB per chunk
+/** Minimum size of a single chunk (a chunk is the minimum growth step). */
+const MIN_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
+/** Minimum combined memory budget (maxTotalBytes / maxByteLength). */
+const MIN_MAX_MEMORY = 32 * 1024 * 1024; // 32 MiB
+/** Maximum number of chunks per table (chunkSize must be large enough). */
+const MAX_CHUNKS_PER_TABLE = 1024;
 const DEFAULT_INTERN_CAPACITY = 256;
 const DEFAULT_INTERN_MAX = 1 << 16; // 65536 entries
 
@@ -174,12 +185,20 @@ export function decodeSlot(slot: ValueSlot): unknown {
 
 export interface SharedMemoryOptions {
   initialSize?: number;
+  /** Per-buffer maximum byte length (clamped to at least 32 MiB). */
   maxByteLength?: number;
-  /** Total physical memory budget shared by DataTable, StringTable, and ArrayTable. */
+  /**
+   * Total physical memory budget shared by DataTable, StringTable, and
+   * ArrayTable (clamped to at least 32 MiB).
+   */
   maxTotalBytes?: number;
   /** Internal worker reconstruction option; normally inferred from buffers. */
   indexTableMaxByteLength?: number;
-  /** Size of each growable chunk (the minimum growth step). Default 32 MiB. */
+  /**
+   * Size of each growable chunk (the minimum growth step). Default 32 MiB,
+   * clamped to at least 4 MiB and raised as needed so no table needs more
+   * than 1024 chunks.
+   */
   chunkSize?: number;
   lock?: Mutex;
   internCapacity?: number;
@@ -234,9 +253,11 @@ export class SharedMemory {
   readonly dataTable: GrowableBuffer;
   readonly stringTable: GrowableBuffer;
   readonly arrayTable: GrowableBuffer;
-  private readonly maxByteLength: number;
+  /** Per-buffer maximum byte length (clamped to at least 32 MiB). */
+  readonly maxByteLength: number;
   private readonly indexTableMaxByteLength: number;
-  private readonly maxTotalBytes: number | null;
+  /** Combined memory budget for Data/String/Array tables, or null if unset. */
+  readonly maxTotalBytes: number | null;
   private readonly budgetBuffer: SharedArrayBuffer | null;
   /**
    * Cached Int32Array view over the Index Table, used to read/increment each
@@ -299,14 +320,28 @@ export class SharedMemory {
     ) {
       throw new RangeError("maxTotalBytes must be a non-negative safe integer");
     }
-    const perBufferMax = maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX;
+    // Enforce the minimum memory budget: maxTotalBytes / maxByteLength are
+    // never below 32 MiB.
+    const perBufferMax = Math.max(
+      maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX,
+      MIN_MAX_MEMORY,
+    );
     const indexTableMax = Math.min(
       options?.indexTableMaxByteLength ?? options?.maxByteLength ?? DEFAULT_MAX,
       MAX_INDEX_TABLE_BYTES,
     );
-    const chunkSize = options?.chunkSize;
+    // Enforce the chunk-size limits: at least 4 MiB, and large enough that no
+    // table needs more than MAX_CHUNKS_PER_TABLE chunks.
+    const userChunkSize = options?.chunkSize ?? DEFAULT_CHUNK_SIZE;
+    const chunkSize = Math.max(
+      userChunkSize,
+      MIN_CHUNK_SIZE,
+      nextPowerOfTwo(perBufferMax / MAX_CHUNKS_PER_TABLE),
+    );
     const buffers = options?.buffers;
-    const budgetMax = maxTotal;
+    // The budget is the clamped maxTotalBytes (never below MIN_MAX_MEMORY), so
+    // it stays consistent with perBufferMax.
+    const budgetMax = maxTotal !== undefined ? perBufferMax : undefined;
     const budgetBuffer = buffers?.budget;
     const budget =
       budgetMax !== undefined
