@@ -144,5 +144,13 @@ user-facing worker-to-worker signaling.
 
 - **Index Table keying**: Currently a linear scan comparing stored key strings directly (O(n) lookup). A hash table could improve lookup for many keys — future optimization.
 - **Dead space in append-only tables**: Left as-is (no GC). Reclaiming dead space is a future optimization.
-- **Buffer sizing/growth**: Each buffer starts at `initialSize` (default 1024 bytes) and doubles via `GrowableBuffer.ensureCapacity` up to `maxByteLength` (default 64 MiB). Configurable via `SharedOptions`.
+- **Buffer sizing/growth**: DataTable, StringTable, and ArrayTable are backed
+  by a chunked `GrowableBuffer`: all chunks are pre-allocated at construction
+  (4 bytes each, `maxByteLength = chunkSize`, 32 MiB default) and activated on
+  first access via `SharedArrayBuffer.grow()`. Because `grow()` is visible
+  across all workers, activation needs no broadcast. The Index Table is the
+  exception: it uses a single growable `SharedArrayBuffer` (capped at 4 GiB).
+  `maxTotalBytes` caps the combined physical size of the three chunked tables
+  via an atomic `SharedBudget` counter shared across workers, reserving memory
+  before each chunk growth. Configurable via `SharedOptions`.
 - **Multi-chunk strings/arrays**: Strings and arrays are stored contiguously in their append-only tables; a reference stores the offset and length/count. Growth appends new data and updates the reference (no shifting of existing data).

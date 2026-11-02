@@ -34,6 +34,23 @@ docker compose -f bench/real-world/docker-compose.yml up -d
 bun bench/real-world/seed.ts
 ```
 
+> **Note (MySQL auth):** MySQL 8.4 defaults to the `caching_sha2_password`
+> auth plugin, which Bun's native SQL client cannot use over an insecure
+> connection ("server requested RSA public key retrieval"). If `seed.ts`
+> fails with that error, switch the `bench` user to `mysql_native_password`:
+>
+> ```sh
+> docker exec bun-shared-memory-mysql sh -c \
+>   'printf "[mysqld]\nmysql_native_password=ON\n" > /etc/mysql/conf.d/native-password.cnf'
+> docker restart bun-shared-memory-mysql
+> docker exec bun-shared-memory-mysql mysql -uroot -proot -e \
+>   "ALTER USER 'bench'@'%' IDENTIFIED WITH mysql_native_password BY 'bench'; FLUSH PRIVILEGES;"
+> ```
+>
+> The config file lives inside the container, so it is lost on
+> `docker compose down`/`up` and must be re-applied after recreating the
+> container.
+
 ## Run
 
 ```sh

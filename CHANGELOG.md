@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.7] - 2026-11-02
 
+### Added
+
+- Keep the Index Table in a single growable `SharedArrayBuffer` (capped at
+  4 GiB) instead of the chunked logic, so it stays contiguous and cheap to
+  address. `SharedMemoryOptions.indexTableMaxByteLength` configures its cap
+  (default 4 GiB).
+- `maxTotalBytes` now caps the combined physical size of DataTable,
+  StringTable, and ArrayTable only (the Index Table is excluded). The budget
+  is enforced by an atomic `SharedBudget` counter shared across workers that
+  reserves memory before each chunk growth, so the three tables cannot exceed
+  the limit even when multiple workers write concurrently.
+
 ### Performance
 
 - Reclaim memory from inactive chunks after defragmentation. A
@@ -16,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk lists and the main thread broadcasts them to workers via a
   `__chunkUpdate` message; workers apply them with `applyChunkUpdate()`. This
   only runs during defragmentation (rare), so the hot path is unaffected.
+- Optimize the budget write hot path: `GrowableBuffer` tracks
+  `nextChunkToActivate` (the first not-yet-active chunk) so `ensureCapacity`
+  only activates new chunks instead of re-scanning every already-active chunk
+  on each write (was O(n) per write as the dataset grew). Writes ~9% faster.
 
 ## [0.1.6] - 2026-11-02
 

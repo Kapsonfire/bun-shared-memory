@@ -41,16 +41,16 @@ speed; MySQL/Redis benchmarked over both TCP and Unix socket):
 
 | Methodology | Transport | Requests | Elapsed (ms) | req/s      | vs. shared |
 |-------------|-----------|----------|--------------|------------|------------|
-| `shared`    | —         | 100,000  | 52           | 1,925,042  | —          |
-| `sqlite`    | —         | 100,000  | 187          | 535,469    | 3.6× slower |
-| `redis`     | socket    | 100,000  | 1,688        | 59,233     | 32.5× slower |
-| `mysql`     | socket    | 100,000  | 1,823        | 54,861     | 35.1× slower |
-| `redis`     | tcp       | 100,000  | 2,863        | 34,923     | 55.1× slower |
-| `mysql`     | tcp       | 100,000  | 3,281        | 30,476     | 63.2× slower |
+| `shared`    | —         | 100,000  | 35           | 2,819,263  | —          |
+| `sqlite`    | —         | 100,000  | 191          | 524,799    | 5.4× slower |
+| `redis`     | socket    | 100,000  | 1,570        | 63,675     | 44.3× slower |
+| `mysql`     | socket    | 100,000  | 1,632        | 61,261     | 46.0× slower |
+| `redis`     | tcp       | 100,000  | 2,931        | 34,113     | 82.6× slower |
+| `mysql`     | tcp       | 100,000  | 3,075        | 32,522     | 86.7× slower |
 
-Shared memory is the fastest by a wide margin: ~3.6× faster than a live SQLite
-read and ~33–63× faster than live MySQL/Redis reads. Unix sockets are
-significantly faster than TCP for MySQL/Redis (~1.7×), but both remain far
+Shared memory is the fastest by a wide margin: ~5.4× faster than a live SQLite
+read and ~44–87× faster than live MySQL/Redis reads. Unix sockets are
+significantly faster than TCP for MySQL/Redis (~1.8×), but both remain far
 slower than shared memory.
 
 ## ✨ Features
@@ -306,10 +306,10 @@ A complete runnable example is in [`examples/worker/`](examples/worker/).
 ## Memory budget
 
 The Index Table (including each key's version counter) uses one growable
-`SharedArrayBuffer`, capped at **4 GiB**. The DataTable, StringTable, and
-ArrayTable use chunks and can individually exceed 4 GiB. By default each table
-grows up to its own `maxByteLength`, so the _total_ memory can be several times
-that.
+`SharedArrayBuffer`, capped at **4 GiB** by default (configurable via
+`indexTableMaxByteLength`). The DataTable, StringTable, and ArrayTable use
+chunks and can individually exceed 4 GiB. By default each table grows up to
+its own `maxByteLength`, so the _total_ memory can be several times that.
 
 Configure the buffers when calling `init()` — pass `initialSize` (each
 table's starting size, avoiding a grow on first use) and `maxByteLength`
