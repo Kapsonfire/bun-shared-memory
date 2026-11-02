@@ -128,6 +128,46 @@ describe("Defragmentation", () => {
     expect(rc).toBe("gamma2");
   });
 
+  test("releases unused chunks after defragmentation", () => {
+    // Use a small chunk size so a few writes span multiple chunks.
+    const mem = new SharedMemory({
+      initialSize: 1024,
+      maxByteLength: 1 << 20,
+      chunkSize: 4096,
+    });
+
+    // Write enough arrays to grow the ArrayTable across several chunks.
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const key = `k${i}`;
+      keys.push(key);
+      Shared(
+        key,
+        Array.from({ length: 50 }, (_, j) => j),
+        { memory: mem },
+      );
+    }
+    const chunksBefore = mem.arrayTable.buffers.length;
+    expect(chunksBefore).toBeGreaterThan(1);
+
+    // Overwrite every array with a tiny one, creating dead space.
+    for (let i = 0; i < 100; i++) {
+      Shared(keys[i]!, [i], { memory: mem }).write([i]);
+    }
+
+    mem.withLock(() => mem.defragment());
+
+    // The compacted ArrayTable fits in fewer chunks; the excess chunks are
+    // released.
+    const chunksAfter = mem.arrayTable.buffers.length;
+    expect(chunksAfter).toBeLessThan(chunksBefore);
+
+    // All values are still correct.
+    for (let i = 0; i < 100; i++) {
+      expect(Shared<number[]>(keys[i]!, [], { memory: mem }).read()[0]).toBe(i);
+    }
+  });
+
   test("preserves arrays that grew via push", () => {
     const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
     const arr = Shared("arr", [1, 2, 3], { memory: mem });

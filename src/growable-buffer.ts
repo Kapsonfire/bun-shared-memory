@@ -162,12 +162,16 @@ export class GrowableBuffer {
 
   /**
    * Reset the used length to `n` bytes. Used by defragmentation after
-   * compacting live data to the front of the buffer. The underlying
-   * SharedArrayBuffers are not shrunk (they cannot be), but the tail beyond
-   * `n` is treated as free space for future writes.
+   * compacting live data to the front of the buffer. Chunks beyond the
+   * compacted region are dropped (their SharedArrayBuffers are released), so
+   * memory is reclaimed after a defragmentation pass.
    */
   reset(n: number): void {
     this.used = n;
+    const neededChunks = Math.ceil(n / this.chunkSize);
+    if (this.chunks.length > neededChunks) {
+      this.chunks.length = neededChunks;
+    }
   }
 
   // -------------------------------------------------------------------------
