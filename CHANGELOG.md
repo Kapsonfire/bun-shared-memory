@@ -43,6 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contention can only slow a run down, the minimum is the best estimate of
   true throughput.
 
+### Fixed
+
+- Resolve chunk offsets with an unsigned right shift (`offset >>> chunkShift`)
+  instead of a signed one. A signed 32-bit shift turns offsets at or above
+  2 GiB negative, so reads/writes past 2 GiB (e.g. in a >4 GiB chunked buffer)
+  hit the wrong chunk or threw. The Index Table and the Data/String/Array
+  tables can now be addressed at any offset below the 4 GiB single-SAB cap.
+
 ## [0.1.6] - 2026-11-02
 
 ### Added

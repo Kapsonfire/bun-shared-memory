@@ -318,7 +318,7 @@ export class GrowableBuffer {
     if (this.singleBuffer) {
       return { chunk: this.chunks[0]!, off: offset };
     }
-    const index = offset >> this.chunkShift;
+    const index = offset >>> this.chunkShift;
     const chunk = this.chunks[index];
     if (chunk === undefined) {
       throw new RangeError(`Offset ${offset} is beyond the buffer capacity`);
@@ -435,7 +435,7 @@ export class GrowableBuffer {
 
   getInt32(offset: number): number {
     if (this.singleBuffer) return this.chunks[0]!.view.getInt32(offset, true);
-    const index = offset >> this.chunkShift;
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     return this.chunks[index]!.view.getInt32(
       offset & (this.chunkSize - 1),
@@ -448,7 +448,7 @@ export class GrowableBuffer {
       this.chunks[0]!.view.setInt32(offset, value, true);
       return;
     }
-    const index = offset >> this.chunkShift;
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     this.chunks[index]!.view.setInt32(
       offset & (this.chunkSize - 1),
@@ -459,7 +459,7 @@ export class GrowableBuffer {
 
   getUint8(offset: number): number {
     if (this.singleBuffer) return this.chunks[0]!.view.getUint8(offset);
-    const index = offset >> this.chunkShift;
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     return this.chunks[index]!.view.getUint8(offset & (this.chunkSize - 1));
   }
@@ -469,7 +469,7 @@ export class GrowableBuffer {
       this.chunks[0]!.view.setUint8(offset, value);
       return;
     }
-    const index = offset >> this.chunkShift;
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     this.chunks[index]!.view.setUint8(offset & (this.chunkSize - 1), value);
   }

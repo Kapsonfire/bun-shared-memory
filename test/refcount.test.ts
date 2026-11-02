@@ -459,4 +459,18 @@ describe(">4 GiB shared memory", () => {
       expect(sab.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024 * 1024);
     }
   });
+
+  test("offsets at or above 2 GiB resolve to the correct chunk", () => {
+    // A signed 32-bit right shift (`offset >> chunkShift`) turns offsets
+    // >= 2 GiB negative, so the chunk index must use an unsigned shift.
+    const mem = new SharedMemory({
+      maxByteLength: 8 * 1024 * 1024 * 1024, // 8 GiB
+      chunkSize: 1024 * 1024 * 1024, // 1 GiB per chunk
+    });
+
+    const offset = 2 * 1024 * 1024 * 1024 + 1234; // just past 2 GiB
+    mem.arrayTable.ensureCapacity(offset + 4);
+    mem.arrayTable.setInt32(offset, 123456789);
+    expect(mem.arrayTable.getInt32(offset)).toBe(123456789);
+  });
 });
