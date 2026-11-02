@@ -467,7 +467,11 @@ function createSharedRef<T>(
   // The shape is known from the initial value (if it is an object) or from
   // shared memory (if the key already exists, e.g. in a worker).
   let propNames: string[] | null = null;
-  if (initialValue !== null && typeof initialValue === "object" && !Array.isArray(initialValue)) {
+  if (
+    initialValue !== null &&
+    typeof initialValue === "object" &&
+    !Array.isArray(initialValue)
+  ) {
     propNames = Object.keys(initialValue as Record<string, unknown>);
   } else {
     const layout = mem.withLock(() => mem.getObjectLayout(key));
@@ -1005,4 +1009,3 @@ function createArrayProxy(
     },
   });
 }
-
