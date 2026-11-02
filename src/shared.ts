@@ -178,7 +178,7 @@ function isTrackable(value: unknown): boolean {
 function getTopLevelObjectId(mem: SharedMemory, key: string): number | null {
   const offset = getOffset(mem, key);
   if (offset === null) return null;
-  const type = mem.dataTable.getView().getInt32(offset, true);
+  const type = mem.dataTable.getInt32(offset);
   if (type === 5) {
     return mem.getObjectId(offset);
   }
@@ -517,7 +517,7 @@ function createSharedRef<T>(
       enumerable: false,
       configurable: false,
       get() {
-        return mem.dataTable.buffer;
+        return mem.dataTable.buffers[0];
       },
     });
     const ref = Object.create(proto) as Record<string | symbol, unknown>;
@@ -564,7 +564,7 @@ function createSharedRef<T>(
       if (prop === "write") return t.write;
       if (prop === "update") return t.update;
       if (prop === "key") return t.key;
-      if (prop === "buffer") return mem.dataTable.buffer;
+      if (prop === "buffer") return mem.dataTable.buffers[0];
       if (prop === Symbol.toPrimitive) return () => t.read();
 
       // push/pop on a top-level array: operate directly on the array ref
@@ -635,7 +635,7 @@ function readValue(
     if (offset === null) {
       throw new Error(`No shared value found for key "${key}"`);
     }
-    const type = mem.dataTable.getView().getInt32(offset, true);
+    const type = mem.dataTable.getInt32(offset);
     if (type === 5) {
       // Object block.
       const properties = mem.readObject(offset);
@@ -665,7 +665,7 @@ function writeValue(
   mem.withLock(() => {
     const existing = getOffset(mem, key);
     if (existing !== null) {
-      const type = mem.dataTable.getView().getInt32(existing, true);
+      const type = mem.dataTable.getInt32(existing);
       if (type === 5) {
         // Update existing object's property slots in place.
         const properties = mem.readObject(existing);
