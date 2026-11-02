@@ -28,8 +28,10 @@ export type Transport = "tcp" | "socket";
 const SQLITE_PATH = new URL("./bench.db", import.meta.url).pathname;
 
 /** Unix socket paths (mounted from ./sockets in docker-compose). */
-const MYSQL_SOCKET = new URL("./sockets/mysql/mysqld.sock", import.meta.url).pathname;
-const REDIS_SOCKET = new URL("./sockets/redis/redis.sock", import.meta.url).pathname;
+const MYSQL_SOCKET = new URL("./sockets/mysql/mysqld.sock", import.meta.url)
+  .pathname;
+const REDIS_SOCKET = new URL("./sockets/redis/redis.sock", import.meta.url)
+  .pathname;
 
 /**
  * Unix sockets over Docker volumes only work when Docker runs natively (Linux).
@@ -73,7 +75,10 @@ export async function buildApi(opts: ApiOptions) {
   const transport: Transport = opts.transport ?? "tcp";
 
   // Only MySQL/Redis use the transport; shared/sqlite ignore it.
-  if (transport === "socket" && (methodology === "mysql" || methodology === "redis")) {
+  if (
+    transport === "socket" &&
+    (methodology === "mysql" || methodology === "redis")
+  ) {
     assertSocketSupported();
   }
 
@@ -131,7 +136,14 @@ export async function buildApi(opts: ApiOptions) {
             "SELECT id, name, email, role, active, score FROM users WHERE id = ?",
           )
           .get(id) as
-          | { id: number; name: string; email: string; role: string; active: number; score: number }
+          | {
+              id: number;
+              name: string;
+              email: string;
+              role: string;
+              active: number;
+              score: number;
+            }
           | undefined;
         if (!row) return new Response("not found", { status: 404 });
         return {
@@ -144,11 +156,11 @@ export async function buildApi(opts: ApiOptions) {
         } satisfies User;
       }
       case "mysql": {
-        const rows = await mysql!`
+        const rows = (await mysql!`
           SELECT id, name, email, role, active, score
           FROM users
           WHERE id = ${id}
-        ` as {
+        `) as {
           id: number;
           name: string;
           email: string;

@@ -135,7 +135,9 @@ async function bench(label: string, m: Methodology, t: Transport | null) {
   }
   outcomes.push(best!);
   const ops = Math.round(best!.count / (best!.elapsedMs / 1000));
-  console.log(`${ops.toLocaleString()} req/s (${best!.elapsedMs.toFixed(0)} ms)`);
+  console.log(
+    `${ops.toLocaleString()} req/s (${best!.elapsedMs.toFixed(0)} ms)`,
+  );
 }
 
 await bench("shared", "shared", null);
@@ -163,14 +165,20 @@ console.log(`Workers per methodology:  ${WORKERS_PER_METHOD}`);
 console.log(`Samples per worker:       ${SAMPLES_PER_WORKER} (min kept)`);
 console.log(`Runs per methodology:     ${RUNS_PER_METHOD} (min kept)`);
 console.log("");
-console.log("| Methodology | Transport | Requests | Elapsed (ms) | req/s      |");
-console.log("|-------------|-----------|----------|--------------|------------|");
+console.log(
+  "| Methodology | Transport | Requests | Elapsed (ms) | req/s      |",
+);
+console.log(
+  "|-------------|-----------|----------|--------------|------------|",
+);
 const table: Record<string, { reqs: number; ms: number; ops: number }> = {};
 for (const o of sorted) {
   const ops = Math.round(o.count / (o.elapsedMs / 1000));
   const key = o.transport ? `${o.methodology}:${o.transport}` : o.methodology;
   table[key] = { reqs: o.count, ms: o.elapsedMs, ops };
-  const label = o.transport ? `${o.methodology} (${o.transport})` : o.methodology;
+  const label = o.transport
+    ? `${o.methodology} (${o.transport})`
+    : o.methodology;
   console.log(
     `| ${label.padEnd(11)} | ${(o.transport ?? "—").padEnd(9)} | ${String(o.count).padStart(8)} | ${o.elapsedMs.toFixed(0).padStart(12)} | ${ops.toLocaleString().padStart(10)} |`,
   );
@@ -213,7 +221,9 @@ lines.push("| Methodology | Transport | Requests | Elapsed (ms) | req/s |");
 lines.push("|-------------|-----------|----------|--------------|-------|");
 for (const o of sorted) {
   const ops = Math.round(o.count / (o.elapsedMs / 1000));
-  const label = o.transport ? `${o.methodology} (${o.transport})` : o.methodology;
+  const label = o.transport
+    ? `${o.methodology} (${o.transport})`
+    : o.methodology;
   lines.push(
     `| ${label} | ${o.transport ?? "—"} | ${o.count} | ${o.elapsedMs.toFixed(0)} | ${ops} |`,
   );
@@ -230,7 +240,9 @@ if (shared) {
 }
 
 await Bun.write(logFile, lines.join("\n") + "\n");
-console.log(`\nWrote benchmark log to benchlogs/${timestamp}-${commit}-real.md`);
+console.log(
+  `\nWrote benchmark log to benchlogs/${timestamp}-${commit}-real.md`,
+);
 
 /**
  * Resolve the current git commit hash (short form) and its committer date as

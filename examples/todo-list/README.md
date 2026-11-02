@@ -8,14 +8,15 @@ A simple in-memory todo list with a native HTML/CSS/JS frontend and an
 The app demonstrates `bun-shared-memory` across multiple workers:
 
 - **Main thread** (`index.ts`) seeds the shared todo store and spawns **4
-  Elysia listener workers**.
+  Elysia listener workers**. It hosts nothing itself.
 - **Workers** (`worker.ts`) call `await init()` to receive the shared
-  `SharedArrayBuffer`s from the main thread, then each runs an Elysia API that
-  reads/writes the **same** todo store through `Shared()` (Atomics-synchronized).
-- All 4 workers listen on the **same port** (`3001`) using `reusePort`, so the
-  OS load-balances incoming requests across them.
-- **Frontend** (`public/`) is served on port `3000` and talks to the shared
-  API port.
+  `SharedArrayBuffer`s from the main thread, then each runs an Elysia server
+  that serves the **static frontend** (`public/`) **and** the API on the same
+  port, reading/writing the **same** todo store through `Shared()`
+  (Atomics-synchronized).
+- All 4 workers listen on the **same port** (`3000`) using `reusePort`, so the
+  OS load-balances incoming requests across them. Because the frontend and API
+  share one origin, there are no CORS issues.
 
 Because all workers share the same buffers, a todo added via one worker is
 immediately visible through all others.
@@ -34,7 +35,7 @@ Then open http://localhost:3000
 
 ## API
 
-All 4 workers share one port (`3001`) via `reusePort`:
+All 4 workers share one port (`3000`) via `reusePort`:
 
 | Method | Path             | Description         |
 | ------ | ---------------- | ------------------- |

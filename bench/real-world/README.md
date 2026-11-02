@@ -3,11 +3,11 @@
 Compares four methodologies for serving a "get user" request through an
 [Elysia](https://elysiajs.com) mini API:
 
-| Methodology | Backend |
-|-------------|---------|
-| `shared`    | Shared memory (`bun-shared-memory`) |
-| `sqlite`    | Live read from a SQLite database |
-| `mysql`     | Live read from a MySQL database (Docker) via Bun's native SQL client |
+| Methodology | Backend                                                                |
+| ----------- | ---------------------------------------------------------------------- |
+| `shared`    | Shared memory (`bun-shared-memory`)                                    |
+| `sqlite`    | Live read from a SQLite database                                       |
+| `mysql`     | Live read from a MySQL database (Docker) via Bun's native SQL client   |
 | `redis`     | Live read from a Redis database (Docker) via Bun's native Redis client |
 
 The benchmark does **not** send real HTTP requests. A `Request` object is built
