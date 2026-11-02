@@ -286,9 +286,9 @@ export class RefCountCoordinator {
 
   /** Whether any table has less than `defragThreshold` free space. */
   needsDefrag(): boolean {
-    const max = this.mem.dataTable.buffer.maxByteLength;
-    const free = (b: { buffer: SharedArrayBuffer; byteLength: number }) =>
-      (b.buffer.byteLength - b.byteLength) / max;
+    const max = this.mem.dataTable.capacity;
+    const free = (b: { capacity: number; byteLength: number }) =>
+      (b.capacity - b.byteLength) / max;
     return (
       free(this.mem.dataTable) < this.defragThreshold ||
       free(this.mem.arrayTable) < this.defragThreshold ||

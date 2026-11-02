@@ -247,10 +247,10 @@ describe("RefCount across workers", () => {
         lockBuf: mem.lock.buffer,
         refBuf: coord.sab,
         buffers: {
-          indexTable: mem.indexTable.buffer,
-          dataTable: mem.dataTable.buffer,
-          stringTable: mem.stringTable.buffer,
-          arrayTable: mem.arrayTable.buffer,
+          indexTable: mem.indexTable.buffers[0],
+          dataTable: mem.dataTable.buffers[0],
+          stringTable: mem.stringTable.buffers[0],
+          arrayTable: mem.arrayTable.buffers[0],
           layoutVersion: mem.layoutVersion.buffer,
         },
       });
