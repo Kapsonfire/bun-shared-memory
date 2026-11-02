@@ -305,22 +305,24 @@ A complete runnable example is in [`examples/worker/`](examples/worker/).
 
 ## Memory budget
 
-Shared memory is split across several growable `SharedArrayBuffer`s (the
-index, data, string, and array tables; each key's version counter lives in its
-index entry). A single `SharedArrayBuffer` can be at most **4 GiB**. By default
-each buffer grows independently up to its own `maxByteLength`, so the _total_
-memory can be several times that.
+The Index Table (including each key's version counter) uses one growable
+`SharedArrayBuffer`, capped at **4 GiB**. The DataTable, StringTable, and
+ArrayTable use chunks and can individually exceed 4 GiB. By default each table
+grows up to its own `maxByteLength`, so the _total_ memory can be several times
+that.
 
 Configure the buffers when calling `init()` — pass `initialSize` (each
-buffer's starting size, avoiding a grow on first use) and `maxByteLength`
-(each buffer's cap). To cap the **total** memory across all buffers, pass
-`maxTotalBytes`:
+table's starting size, avoiding a grow on first use) and `maxByteLength`
+(each table's cap). To cap the combined physical memory of DataTable,
+StringTable, and ArrayTable, pass `maxTotalBytes`. The Index Table is excluded
+from this budget. Its growth and chunk growth in workers reserve memory from
+the same atomic budget before allocating, so the three tables cannot exceed it.
 
 ```ts
 import { init } from "bun-shared-memory";
 
-// Each buffer starts at 64 KiB and grows up to 4 GiB; the sum of all buffers'
-// physical sizes is additionally capped at 4 GiB (maxTotalBytes).
+// The Index Table grows up to 4 GiB independently. DataTable, StringTable, and
+// ArrayTable together are capped at 4 GiB.
 await init({
   initialSize: 64 * 1024,
   maxByteLength: 4 * 1024 * 1024 * 1024,
@@ -328,14 +330,10 @@ await init({
 });
 ```
 
-`maxTotalBytes` caps the **sum** of all buffers' physical sizes, so the total
-stays within the budget. If a write would exceed the budget, a `RangeError` is
-thrown. Without `maxTotalBytes`, each buffer simply grows up to its own
-`maxByteLength`.
-
-The budget is shared dynamically — buffers grow as needed, but only while the
-sum of all buffers stays within `maxTotalBytes`. If a write would exceed the
-budget, a `RangeError` is thrown.
+`maxTotalBytes` caps the **sum** of the physical sizes of DataTable,
+StringTable, and ArrayTable, including across workers. If a write would exceed
+the budget, a `RangeError` is thrown before the chunk grows. Without
+`maxTotalBytes`, each table simply grows up to its own `maxByteLength`.
 
 ## Array capacity
 

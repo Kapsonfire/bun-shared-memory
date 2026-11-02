@@ -279,8 +279,7 @@ describe("Worker integration (M4)", () => {
   });
 
   test("a worker applies a chunk update broadcast after defragmentation", async () => {
-    // Use a small chunk size so a few writes span multiple chunks, but large
-    // enough that the Index Table (100 entries) stays within one chunk.
+    // Use a small chunk size so writes span multiple chunks in the data tables.
     setDefaultMemory(new SharedMemory({ chunkSize: 4096 }));
     await init();
 
