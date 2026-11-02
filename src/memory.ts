@@ -211,6 +211,12 @@ export interface SharedMemoryOptions {
     layoutVersion?: SharedArrayBuffer;
     refCount?: SharedArrayBuffer;
     budget?: SharedArrayBuffer;
+    cursors?: {
+      indexTable?: SharedArrayBuffer;
+      dataTable?: SharedArrayBuffer;
+      stringTable?: SharedArrayBuffer;
+      arrayTable?: SharedArrayBuffer;
+    };
   };
 }
 
@@ -223,6 +229,7 @@ function makeBuffer(
   chunkSize?: number,
   singleBuffer = false,
   chargeInitial = true,
+  cursorBuffer?: SharedArrayBuffer,
 ): GrowableBuffer {
   if (buf === undefined) {
     return new GrowableBuffer(
@@ -232,6 +239,7 @@ function makeBuffer(
       chunkSize,
       singleBuffer,
       chargeInitial,
+      cursorBuffer,
     );
   }
   return new GrowableBuffer(
@@ -241,6 +249,7 @@ function makeBuffer(
     chunkSize,
     singleBuffer,
     chargeInitial,
+    cursorBuffer,
   );
 }
 
@@ -359,6 +368,8 @@ export class SharedMemory {
       undefined,
       chunkSize,
       true,
+      true,
+      buffers?.cursors?.indexTable,
     );
     this.dataTable = makeBuffer(
       buffers?.dataTable,
@@ -368,6 +379,7 @@ export class SharedMemory {
       chunkSize,
       false,
       chargeInitial,
+      buffers?.cursors?.dataTable,
     );
     this.stringTable = makeBuffer(
       buffers?.stringTable,
@@ -377,6 +389,7 @@ export class SharedMemory {
       chunkSize,
       false,
       chargeInitial,
+      buffers?.cursors?.stringTable,
     );
     this.arrayTable = makeBuffer(
       buffers?.arrayTable,
@@ -386,6 +399,7 @@ export class SharedMemory {
       chunkSize,
       false,
       chargeInitial,
+      buffers?.cursors?.arrayTable,
     );
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
     this.layoutVersion = new Int32Array(
@@ -453,6 +467,12 @@ export class SharedMemory {
     indexTableMaxByteLength: number;
     maxTotalBytes: number | null;
     budget: SharedArrayBuffer | null;
+    cursors: {
+      indexTable: SharedArrayBuffer;
+      dataTable: SharedArrayBuffer;
+      stringTable: SharedArrayBuffer;
+      arrayTable: SharedArrayBuffer;
+    };
   } {
     return {
       indexTable: this.indexTable.buffers,
@@ -466,6 +486,12 @@ export class SharedMemory {
       indexTableMaxByteLength: this.indexTableMaxByteLength,
       maxTotalBytes: this.maxTotalBytes,
       budget: this.budgetBuffer,
+      cursors: {
+        indexTable: this.indexTable.cursorBuffer,
+        dataTable: this.dataTable.cursorBuffer,
+        stringTable: this.stringTable.cursorBuffer,
+        arrayTable: this.arrayTable.cursorBuffer,
+      },
     };
   }
 
@@ -485,6 +511,12 @@ export class SharedMemory {
     indexTableMaxByteLength?: number;
     maxTotalBytes?: number | null;
     budget?: SharedArrayBuffer | null;
+    cursors?: {
+      indexTable?: SharedArrayBuffer;
+      dataTable?: SharedArrayBuffer;
+      stringTable?: SharedArrayBuffer;
+      arrayTable?: SharedArrayBuffer;
+    };
   }): SharedMemory {
     const indexBuffer = Array.isArray(buffers.indexTable)
       ? buffers.indexTable[0]
@@ -505,6 +537,7 @@ export class SharedMemory {
         layoutVersion: buffers.layoutVersion,
         refCount: buffers.refCount ?? undefined,
         budget: buffers.budget ?? undefined,
+        cursors: buffers.cursors,
       },
       lock: new Mutex(buffers.lock),
     });

@@ -1,0 +1,19 @@
+{
+  "name": "todo-list",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "bun check"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "bun-shared-memory": "0.1.7",
+    "elysia": "^1.4.30"
+  }
+}
