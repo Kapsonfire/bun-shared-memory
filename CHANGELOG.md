@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2 GiB negative, so reads/writes past 2 GiB (e.g. in a >4 GiB chunked buffer)
   hit the wrong chunk or threw. The Index Table and the Data/String/Array
   tables can now be addressed at any offset below the 4 GiB single-SAB cap.
+  Reported by [mizulu](https://github.com/mizulu).
 
 ## [0.1.6] - 2026-11-02
 
