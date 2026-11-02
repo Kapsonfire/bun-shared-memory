@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-11-02
+
+### Fixed
+
+- Share each `GrowableBuffer`'s append cursor across workers. The cursor was a
+  private per-instance field, so when a worker reconstructed `SharedMemory`
+  via `fromBuffers()` its cursor stayed `0` and the first write in that worker
+  wrote at offset `0`, overwriting existing data (e.g. a key string) and
+  corrupting the shared value. The cursor now lives in a `SharedArrayBuffer`
+  (as a `BigInt64Array`) read/written with `Atomics`, so every worker appends
+  at the correct offset. Reported while building the multi-worker todo-list
+  example.
+
 ## [0.1.7] - 2026-11-02
 
 ### Added
@@ -172,6 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[0.1.8]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.4...v0.1.5

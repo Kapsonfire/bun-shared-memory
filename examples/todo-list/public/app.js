@@ -3,11 +3,10 @@ const form = document.getElementById("add-form");
 const input = document.getElementById("new-todo");
 const empty = document.getElementById("empty");
 
-// 4 Elysia API workers share one port (reusePort) and the same todo store.
-const API_PORT = 3001;
-
+// Frontend and API are served from the same origin (same port), so use
+// relative URLs — no CORS.
 function apiUrl(path) {
-  return `http://localhost:${API_PORT}${path}`;
+  return path;
 }
 
 async function request(path, options = {}) {

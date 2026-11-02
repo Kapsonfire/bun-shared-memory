@@ -1,5 +1,6 @@
 import { Elysia } from "elysia";
 import { init, Shared } from "../../src/index.ts";
+import { join } from "node:path";
 
 type Todo = {
   id: number;
@@ -28,12 +29,15 @@ function parseItems(items: string): Todo[] {
   return JSON.parse(items) as Todo[];
 }
 
-function buildApi(port: number) {
+function buildApp(port: number) {
   // Obtain the shared reference. The main thread seeds it before spawning
   // workers, so this never overwrites the existing value.
   const shared = Shared<SharedTodos>(SHARED_KEY, { nextId: 1, items: "[]" });
 
+  const publicDir = join(import.meta.dir, "public");
+
   return new Elysia()
+    // API routes
     .get("/api/todos", () => {
       return parseItems(shared.items);
     })
@@ -86,17 +90,22 @@ function buildApi(port: number) {
       shared.items = JSON.stringify(items);
       return new Response(null, { status: 204 });
     })
-    .get("/", () => new Response("Todo worker"))
+    // Static frontend (served directly by Elysia)
+    .get("/", () => Bun.file(join(publicDir, "index.html")))
+    .get("/styles.css", () => Bun.file(join(publicDir, "styles.css")))
+    .get("/app.js", () => Bun.file(join(publicDir, "app.js")))
     .listen({
       port,
       reusePort: true,
     });
 }
 
-const port = Number(process.env.PORT ?? 3001);
+const port = Number(process.env.PORT ?? 3000);
 
 // Receive the shared buffers from the main thread before using Shared().
 await init();
-buildApi(port);
+buildApp(port);
 
-console.log(`🦊 Todo worker listening on http://localhost:${port} (reusePort)`);
+console.log(
+  `🦊 Todo worker (frontend + API) on http://localhost:${port} (reusePort)`,
+);
