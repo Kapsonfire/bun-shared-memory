@@ -337,3 +337,28 @@ describe("RefCount across workers", () => {
     coord.stopAutoMaintenance();
   });
 });
+
+describe(">4 GiB shared memory", () => {
+  test("the ArrayTable can exceed the 4 GiB single-SAB limit via chunks", () => {
+    // A single SharedArrayBuffer is capped at 4 GiB. With chunking, a buffer
+    // can grow past that by spanning multiple chunks. Use a 1 GiB chunk size
+    // so only a handful of chunks are needed to cross 4 GiB.
+    const mem = new SharedMemory({
+      maxByteLength: 8 * 1024 * 1024 * 1024, // 8 GiB
+      chunkSize: 1024 * 1024 * 1024, // 1 GiB per chunk
+    });
+
+    // Grow the ArrayTable past the 4 GiB single-SAB limit.
+    const over4GiB = 4 * 1024 * 1024 * 1024 + 1024;
+    mem.arrayTable.ensureCapacity(over4GiB);
+
+    // The capacity now exceeds 4 GiB, backed by multiple chunks.
+    expect(mem.arrayTable.capacity).toBeGreaterThan(4 * 1024 * 1024 * 1024);
+    expect(mem.arrayTable.buffers.length).toBeGreaterThan(1);
+
+    // Every chunk is its own SharedArrayBuffer, each within the 4 GiB limit.
+    for (const sab of mem.arrayTable.buffers) {
+      expect(sab.byteLength).toBeLessThanOrEqual(4 * 1024 * 1024 * 1024);
+    }
+  });
+});

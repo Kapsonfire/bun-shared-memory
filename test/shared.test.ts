@@ -269,9 +269,9 @@ describe("SharedMemory string interning", () => {
 
 describe("SharedMemory total memory budget", () => {
   test("maxTotalBytes caps the sum of all buffers, not each buffer", () => {
-    // A small total budget. Each buffer's own maxByteLength is
-    // min(4 GiB, maxTotalBytes) = 8192, but the *sum* of all buffers is capped
-    // at 8192. The 4 initial buffers (1024 each = 4096) fit within the budget.
+    // A small total budget. Each buffer's own maxByteLength is capped at
+    // maxTotalBytes = 8192, but the *sum* of all buffers is capped at 8192.
+    // The 4 initial buffers (1024 each = 4096) fit within the budget.
     const mem = new SharedMemory({ maxTotalBytes: 8192, chunkSize: 1024 });
 
     // Writing enough distinct strings must eventually exceed the total budget

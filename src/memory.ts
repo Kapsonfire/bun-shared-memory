@@ -262,16 +262,15 @@ export class SharedMemory {
 
   constructor(options?: SharedMemoryOptions) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
-    // A single SharedArrayBuffer can be at most 4 GiB. `maxTotalBytes` is a
-    // *total* budget shared across all buffers: each buffer's own maxByteLength
-    // is capped at min(4 GiB, maxTotalBytes), and the sum of all buffers'
-    // physical sizes is additionally capped at maxTotalBytes. Without
-    // maxTotalBytes, each buffer simply grows up to its own maxByteLength.
+    // `maxTotalBytes` is a *total* budget shared across all buffers: each
+    // buffer's own maxByteLength is capped at maxTotalBytes, and the sum of
+    // all buffers' physical sizes is additionally capped at maxTotalBytes.
+    // Without maxTotalBytes, each buffer grows up to its own maxByteLength.
+    // A single SharedArrayBuffer is limited to 4 GiB, but the chunked
+    // GrowableBuffer splits a buffer across multiple chunks, so a buffer can
+    // exceed 4 GiB.
     const maxTotal = options?.maxTotalBytes;
-    const perBufferMax = Math.min(
-      4 * 1024 * 1024 * 1024,
-      maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX,
-    );
+    const perBufferMax = maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX;
     const budget =
       maxTotal !== undefined ? new SharedBudget(maxTotal) : undefined;
     const chunkSize = options?.chunkSize;
