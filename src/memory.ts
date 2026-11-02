@@ -320,6 +320,25 @@ export class SharedMemory {
   }
 
   /**
+   * Apply a chunk update received from the main thread after a
+   * defragmentation pass. Replaces each table's chunk list with the new
+   * buffers and rebuilds the version view (the first Index Table chunk may
+   * have been replaced). Called by workers on the `__chunkUpdate` message.
+   */
+  applyChunkUpdate(buffers: {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  }): void {
+    this.indexTable.applyChunks(buffers.indexTable);
+    this.dataTable.applyChunks(buffers.dataTable);
+    this.stringTable.applyChunks(buffers.stringTable);
+    this.arrayTable.applyChunks(buffers.arrayTable);
+    this.versionView = new Int32Array(this.indexTable.buffers[0]!);
+  }
+
+  /**
    * Attach the reference-counting buffer (5th SAB) to this memory so it is
    * included in `exportBuffers()`. No-op if a buffer is already attached.
    */
@@ -798,7 +817,12 @@ export class SharedMemory {
    *
    * Must be called under the shared lock (or on a single thread).
    */
-  defragment(): void {
+  defragment(): {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  } {
     const stringRemap = new Map<number, number>();
     const arrayRemap = new Map<number, number>();
     const objectRemap = new Map<number, number>();
@@ -964,6 +988,16 @@ export class SharedMemory {
 
     // Phase 7: Invalidate all per-worker caches.
     this.bumpLayoutVersion();
+
+    // Phase 8: Reclaim memory from inactive chunks (beyond the compacted
+    // region). Each inactive chunk is replaced by a fresh 4-byte SAB; the new
+    // chunk lists are returned so the caller can broadcast them to workers.
+    return {
+      indexTable: this.indexTable.releaseInactiveChunks(),
+      dataTable: this.dataTable.releaseInactiveChunks(),
+      stringTable: this.stringTable.releaseInactiveChunks(),
+      arrayTable: this.arrayTable.releaseInactiveChunks(),
+    };
   }
 }
 

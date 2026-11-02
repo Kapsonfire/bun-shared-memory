@@ -161,6 +161,13 @@ export class RefCountCoordinator {
   /** Free-space threshold (fraction of maxByteLength) that triggers defrag. */
   private readonly defragThreshold: number;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Called after a defragmentation pass with the new chunk lists. */
+  private readonly onDefragment?: (buffers: {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  }) => void;
 
   constructor(
     mem: SharedMemory,
@@ -169,9 +176,16 @@ export class RefCountCoordinator {
       defragThreshold?: number;
       autoMaintenance?: boolean;
       maintenanceInterval?: number;
+      onDefragment?: (buffers: {
+        indexTable: SharedArrayBuffer[];
+        dataTable: SharedArrayBuffer[];
+        stringTable: SharedArrayBuffer[];
+        arrayTable: SharedArrayBuffer[];
+      }) => void;
     } = {},
   ) {
     this.mem = mem;
+    this.onDefragment = opts.onDefragment;
     // Reuse the memory's shared refCount buffer if present, so the same SAB is
     // exported to workers; otherwise create a fresh one and attach it to the
     // memory so it can be shared.
@@ -313,7 +327,8 @@ export class RefCountCoordinator {
     this.maintenanceTimer = setInterval(() => {
       this.drainEvents();
       if (this.needsDefrag()) {
-        this.mem.withLock(() => this.mem.defragment());
+        const buffers = this.mem.withLock(() => this.mem.defragment());
+        this.onDefragment?.(buffers);
       }
     }, intervalMs);
     // Unref the timer so it does not keep the process alive. The coordinator

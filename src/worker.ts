@@ -130,7 +130,9 @@ export function getDefaultTracker(): RefCountTracker | null {
 function startCoordinator(): void {
   if (coordinator !== null) return;
   const mem = getDefaultMemory();
-  coordinator = new RefCountCoordinator(mem);
+  coordinator = new RefCountCoordinator(mem, undefined, {
+    onDefragment: (buffers) => broadcastChunkUpdate(buffers),
+  });
   unregisterWorkers = coordinator.autoRegister();
 }
 
@@ -156,6 +158,12 @@ let mainListener:
     }) => void)
   | null = null;
 
+/** Live workers on the main thread, for broadcasting chunk updates. */
+const liveWorkers = new Set<{
+  postMessage: (msg: unknown) => void;
+  addEventListener: (type: string, fn: (e: { data: unknown }) => void) => void;
+}>();
+
 /** Main thread: answer each worker's buffer request. */
 function initMain(): void {
   const listener = (worker: {
@@ -165,6 +173,7 @@ function initMain(): void {
       fn: (e: { data: unknown }) => void,
     ) => void;
   }) => {
+    liveWorkers.add(worker);
     worker.addEventListener("message", (e) => {
       const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
       if (
@@ -190,6 +199,22 @@ function stopMain(): void {
   if (mainListener) {
     process.off("worker", mainListener);
     mainListener = null;
+  }
+  liveWorkers.clear();
+}
+
+/**
+ * Broadcast a chunk update (new chunk lists after a defragmentation pass) to
+ * all live workers. Workers apply it via `applyChunkUpdate()`.
+ */
+function broadcastChunkUpdate(buffers: {
+  indexTable: SharedArrayBuffer[];
+  dataTable: SharedArrayBuffer[];
+  stringTable: SharedArrayBuffer[];
+  arrayTable: SharedArrayBuffer[];
+}): void {
+  for (const worker of liveWorkers) {
+    worker.postMessage({ __chunkUpdate: true, buffers });
   }
 }
 
@@ -239,6 +264,15 @@ function installMessageWrapper(): void {
           __sharedMemoryInit?: boolean;
           buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
         }
+      | {
+          __chunkUpdate?: boolean;
+          buffers?: {
+            indexTable: SharedArrayBuffer[];
+            dataTable: SharedArrayBuffer[];
+            stringTable: SharedArrayBuffer[];
+            arrayTable: SharedArrayBuffer[];
+          };
+        }
       | undefined;
     if (
       msg !== null &&
@@ -262,6 +296,18 @@ function installMessageWrapper(): void {
       pendingInitResolve = null;
       // Forward any messages that arrived before the init reply.
       flush();
+      return;
+    }
+    if (
+      msg !== null &&
+      typeof msg === "object" &&
+      "__chunkUpdate" in msg &&
+      msg.buffers &&
+      hasDefaultMemory()
+    ) {
+      // The main thread replaced inactive chunks after a defragmentation
+      // pass; apply the new chunk lists so this worker sees the replacement.
+      getDefaultMemory().applyChunkUpdate(msg.buffers);
       return;
     }
     if (hasDefaultMemory() && hasHandler) {

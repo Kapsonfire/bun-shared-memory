@@ -32,6 +32,14 @@ export class SharedBudget {
     this.total = newTotal;
     return true;
   }
+
+  /**
+   * Release `size` bytes from the budget (e.g. when a chunk is replaced by a
+   * smaller one). The total never goes below zero.
+   */
+  release(size: number): void {
+    this.total = Math.max(0, this.total - size);
+  }
 }
 
 /**
@@ -163,6 +171,20 @@ export class GrowableBuffer {
   }
 
   /**
+   * Replace the chunk list with `newBuffers` (received from the main thread
+   * after a defragmentation broadcast). Each buffer is either a full-size
+   * active chunk or a fresh 4-byte inactive chunk. Used by workers to stay in
+   * sync with the main thread's chunk replacement.
+   */
+  applyChunks(newBuffers: SharedArrayBuffer[]): void {
+    this.chunks = newBuffers.map((sab) => ({
+      buffer: sab,
+      view: new DataView(sab),
+      active: sab.byteLength === this.chunkSize,
+    }));
+  }
+
+  /**
    * Resolve a logical offset into (chunk, offset within that chunk). All
    * chunks are the same size, so this is O(1). Activates the chunk if it is
    * not yet active.
@@ -200,8 +222,8 @@ export class GrowableBuffer {
   /**
    * Reset the used length to `n` bytes. Used by defragmentation after
    * compacting live data to the front of the buffer. Chunks beyond the
-   * compacted region are marked inactive (their storage is released by the
-   * GC, which replaces them with fresh chunks).
+   * compacted region are marked inactive; their storage is reclaimed by
+   * `releaseInactiveChunks()`.
    */
   reset(n: number): void {
     this.used = n;
@@ -209,6 +231,31 @@ export class GrowableBuffer {
     for (let i = neededChunks; i < this.chunks.length; i++) {
       this.chunks[i]!.active = false;
     }
+  }
+
+  /**
+   * Replace every inactive chunk with a fresh 4-byte SharedArrayBuffer
+   * (growable to `chunkSize`), releasing the old full-size buffer so its
+   * memory can be reclaimed. Returns the new chunk list; the caller must
+   * broadcast it to workers so they see the replacement.
+   *
+   * Because a SharedArrayBuffer cannot be shrunk, reclaiming memory requires
+   * allocating a new buffer. This is only called after defragmentation (rare),
+   * so the resulting broadcast is acceptable.
+   */
+  releaseInactiveChunks(): SharedArrayBuffer[] {
+    for (let i = 0; i < this.chunks.length; i++) {
+      const chunk = this.chunks[i]!;
+      if (chunk.active) continue;
+      // Release the old full-size buffer from the budget and replace it with
+      // a fresh 4-byte chunk.
+      this.budget?.release(this.chunkSize);
+      const buffer = new SharedArrayBuffer(4, {
+        maxByteLength: this.chunkSize,
+      });
+      this.chunks[i] = { buffer, view: new DataView(buffer), active: false };
+    }
+    return this.chunks.map((c) => c.buffer);
   }
 
   // -------------------------------------------------------------------------

@@ -73,7 +73,58 @@ describe("RefCountCoordinator", () => {
     const workerId = coord.registerWorker({});
     buf.pushEvent(workerId, 1, 10);
     coord.drainEvents();
+
     expect(coord.refCount(10)).toBe(1);
+  });
+
+  test("calls onDefragment with the new chunk lists after defragmentation", async () => {
+    const mem = new SharedMemory({
+      initialSize: 1024,
+      maxByteLength: 90000, // just above the ArrayTable size, so defrag triggers
+      chunkSize: 4096,
+    });
+    let defragResult: {
+      indexTable: SharedArrayBuffer[];
+      dataTable: SharedArrayBuffer[];
+      stringTable: SharedArrayBuffer[];
+      arrayTable: SharedArrayBuffer[];
+    } | null = null;
+    const coord = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: true,
+      maintenanceInterval: 5,
+      onDefragment: (buffers) => {
+        defragResult = buffers;
+      },
+    });
+
+    // Grow the ArrayTable across several chunks, then overwrite to create
+    // dead space so defragmentation replaces inactive chunks.
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const key = `gc-${i}`;
+      keys.push(key);
+      Shared(
+        key,
+        Array.from({ length: 50 }, (_, j) => j),
+        { memory: mem },
+      );
+    }
+    for (let i = 0; i < 100; i++) {
+      Shared(keys[i]!, [i], { memory: mem }).write([i]);
+    }
+
+    // Wait for the maintenance timer to run a defragmentation pass and invoke
+    // the onDefragment callback with the new chunk lists.
+    const deadline = Date.now() + 2000;
+    while (defragResult === null && Date.now() < deadline) {
+      await Bun.sleep(10);
+    }
+
+    expect(defragResult).not.toBeNull();
+    expect(defragResult!.arrayTable.some((sab) => sab.byteLength === 4)).toBe(
+      true,
+    );
+    coord.stopAutoMaintenance();
   });
 });
 
@@ -161,6 +212,53 @@ describe("Defragmentation", () => {
     // marked inactive (their storage is released by the GC).
     const chunksAfter = mem.arrayTable.activeChunkCount;
     expect(chunksAfter).toBeLessThan(chunksBefore);
+
+    // All values are still correct.
+    for (let i = 0; i < 100; i++) {
+      expect(Shared<number[]>(keys[i]!, [], { memory: mem }).read()[0]).toBe(i);
+    }
+  });
+
+  test("replaces inactive chunks with fresh 4-byte buffers after defragmentation", () => {
+    const mem = new SharedMemory({
+      initialSize: 1024,
+      maxByteLength: 1 << 20,
+      chunkSize: 4096,
+    });
+
+    // Grow the ArrayTable across several chunks.
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const key = `k${i}`;
+      keys.push(key);
+      Shared(
+        key,
+        Array.from({ length: 50 }, (_, j) => j),
+        { memory: mem },
+      );
+    }
+    const totalChunks = mem.arrayTable.buffers.length;
+    expect(totalChunks).toBeGreaterThan(1);
+
+    // Overwrite every array with a tiny one, creating dead space.
+    for (let i = 0; i < 100; i++) {
+      Shared(keys[i]!, [i], { memory: mem }).write([i]);
+    }
+
+    const result = mem.withLock(() => mem.defragment());
+
+    // The returned chunk lists must have the same length (chunks are
+    // pre-allocated), but the inactive chunks are now fresh 4-byte buffers.
+    expect(result.arrayTable.length).toBe(totalChunks);
+    const inactiveCount = result.arrayTable.filter(
+      (sab) => sab.byteLength === 4,
+    ).length;
+    expect(inactiveCount).toBeGreaterThan(0);
+    // The active chunks keep their full size.
+    const activeCount = result.arrayTable.filter(
+      (sab) => sab.byteLength === mem.arrayTable.chunkSize,
+    ).length;
+    expect(activeCount).toBe(mem.arrayTable.activeChunkCount);
 
     // All values are still correct.
     for (let i = 0; i < 100; i++) {

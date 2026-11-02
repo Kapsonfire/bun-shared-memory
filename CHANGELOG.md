@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-11-02
+
+### Performance
+
+- Reclaim memory from inactive chunks after defragmentation. A
+  `SharedArrayBuffer` cannot be shrunk, so `GrowableBuffer` replaces each
+  inactive chunk with a fresh 4-byte `SharedArrayBuffer`, releasing the old
+  full-size buffer so its memory is freed. `defragment()` returns the new
+  chunk lists and the main thread broadcasts them to workers via a
+  `__chunkUpdate` message; workers apply them with `applyChunkUpdate()`. This
+  only runs during defragmentation (rare), so the hot path is unaffected.
+
 ## [0.1.6] - 2026-11-02
 
 ### Added
@@ -120,6 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[0.1.7]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.3...v0.1.4
