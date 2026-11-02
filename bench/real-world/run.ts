@@ -30,6 +30,10 @@ import type { Methodology, Transport } from "./api.ts";
 
 const WORKERS_PER_METHOD = 4;
 const DEFAULT_REQUESTS = 100_000;
+/** Measured samples per worker; the worker reports the minimum. */
+const SAMPLES_PER_WORKER = 5;
+/** Full runs per methodology (each spawns the workers again); min is kept. */
+const RUNS_PER_METHOD = 3;
 
 const totalRequests = Number(process.argv[2] ?? DEFAULT_REQUESTS);
 
@@ -100,6 +104,7 @@ async function runMethodology(
       transport,
       count: perWorker,
       userId: 1 + w * 10,
+      samples: SAMPLES_PER_WORKER,
     });
   }
 
@@ -121,10 +126,16 @@ const outcomes: MethodResult[] = [];
 
 async function bench(label: string, m: Methodology, t: Transport | null) {
   process.stdout.write(`Benchmarking ${label.padEnd(16)} ... `);
-  const res = await runMethodology(m, t);
-  outcomes.push(res);
-  const ops = Math.round(res.count / (res.elapsedMs / 1000));
-  console.log(`${ops.toLocaleString()} req/s (${res.elapsedMs.toFixed(0)} ms)`);
+  // Run several times and keep the fastest. CPU contention can only slow a
+  // run down, so the minimum is the best estimate of true throughput.
+  let best: MethodResult | null = null;
+  for (let r = 0; r < RUNS_PER_METHOD; r++) {
+    const res = await runMethodology(m, t);
+    if (best === null || res.elapsedMs < best.elapsedMs) best = res;
+  }
+  outcomes.push(best!);
+  const ops = Math.round(best!.count / (best!.elapsedMs / 1000));
+  console.log(`${ops.toLocaleString()} req/s (${best!.elapsedMs.toFixed(0)} ms)`);
 }
 
 await bench("shared", "shared", null);
@@ -149,6 +160,8 @@ const sorted = [...outcomes].sort(
 console.log("\n── Real-world benchmark ────────────────────────────────────");
 console.log(`Requests per methodology: ${totalRequests.toLocaleString()}`);
 console.log(`Workers per methodology:  ${WORKERS_PER_METHOD}`);
+console.log(`Samples per worker:       ${SAMPLES_PER_WORKER} (min kept)`);
+console.log(`Runs per methodology:     ${RUNS_PER_METHOD} (min kept)`);
 console.log("");
 console.log("| Methodology | Transport | Requests | Elapsed (ms) | req/s      |");
 console.log("|-------------|-----------|----------|--------------|------------|");
@@ -193,6 +206,8 @@ lines.push(`Date: ${new Date().toISOString()}`);
 lines.push(`Platform: ${process.platform} (${process.arch})`);
 lines.push(`Requests per methodology: ${totalRequests}`);
 lines.push(`Workers per methodology: ${WORKERS_PER_METHOD}`);
+lines.push(`Samples per worker: ${SAMPLES_PER_WORKER} (min kept)`);
+lines.push(`Runs per methodology: ${RUNS_PER_METHOD} (min kept)`);
 lines.push("");
 lines.push("| Methodology | Transport | Requests | Elapsed (ms) | req/s |");
 lines.push("|-------------|-----------|----------|--------------|-------|");

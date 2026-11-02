@@ -1,52 +1,77 @@
 /**
  * Shared memory budget shared across multiple GrowableBuffers.
  *
- * Tracks the sum of the physical sizes of all participating buffers so a
- * caller can cap the *total* memory used by a set of buffers, rather than
- * capping each buffer independently. Growth is only allowed if the new total
- * stays within the budget.
+ * Tracks the combined physical size of DataTable, StringTable, and ArrayTable.
+ * The counter is shared across workers so each growth reserves against the
+ * same limit.
  */
 export class SharedBudget {
-  private total = 0;
+  private readonly used: BigInt64Array;
 
-  constructor(private readonly max: number) {}
+  constructor(
+    private readonly max: number,
+    buffer = new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT),
+  ) {
+    this.used = new BigInt64Array(buffer);
+  }
+
+  get buffer(): SharedArrayBuffer {
+    return this.used.buffer as SharedArrayBuffer;
+  }
 
   /** Record a buffer's initial physical size. */
   add(size: number): void {
-    this.total += size;
-    if (this.total > this.max) {
+    if (!this.tryReserve(size)) {
+      const total = Atomics.load(this.used, 0) + BigInt(size);
       throw new RangeError(
-        `Shared memory budget exceeded: initial buffers total ${this.total} bytes but the budget is ${this.max}`,
+        `Shared memory budget exceeded: initial buffers total ${total} bytes but the budget is ${this.max}`,
       );
     }
   }
 
   /**
-   * Attempt to grow a buffer from `oldSize` to `newSize`. Returns true and
-   * updates the total if the new total stays within the budget, false
-   * otherwise (the caller must not grow).
+   * Atomically reserve physical memory shared by all tables and workers.
    */
-  tryGrow(oldSize: number, newSize: number): boolean {
-    const newTotal = this.total - oldSize + newSize;
-    if (newTotal > this.max) return false;
-    this.total = newTotal;
-    return true;
+  tryReserve(size: number): boolean {
+    if (size <= 0) return true;
+    const increment = BigInt(size);
+    for (;;) {
+      const current = Atomics.load(this.used, 0);
+      if (current + increment > BigInt(this.max)) return false;
+      if (
+        Atomics.compareExchange(this.used, 0, current, current + increment) ===
+        current
+      ) {
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Release memory reserved for a growth that failed or a reclaimed chunk.
+   */
+  release(size: number): void {
+    if (size <= 0) return;
+    const decrement = BigInt(size);
+    for (;;) {
+      const current = Atomics.load(this.used, 0);
+      const next = current > decrement ? current - decrement : 0n;
+      if (Atomics.compareExchange(this.used, 0, current, next) === current) {
+        return;
+      }
+    }
   }
 }
 
 /**
- * Growable shared memory backed by one or more SharedArrayBuffers (chunks).
+ * Growable shared memory backed by one or more SharedArrayBuffers. Chunked
+ * tables split storage across SABs; the Index Table uses one growable SAB.
+ * Offsets are logical and continuous across chunks.
  *
- * A single SharedArrayBuffer can be at most 4 GiB, so a buffer that needs to
- * grow beyond that is split into multiple chunks. Each chunk is its own
- * SharedArrayBuffer (<= `chunkMax` bytes). Offsets are logical and continuous
- * across chunks; access methods resolve an offset into (chunk, chunkOffset).
- *
- * All chunks are pre-allocated at construction with `maxByteLength = chunkSize`
- * but only 4 bytes of actual storage. A chunk is "activated" (grown to its
- * full `chunkSize`) on first access. Because `SharedArrayBuffer.grow()` is
- * visible across all workers sharing the buffer, activation needs no
- * postMessage broadcast.
+ * In chunked mode, all chunks are pre-allocated with `maxByteLength =
+ * chunkSize` but only 4 bytes of actual storage. A chunk is activated (grown
+ * to its full size) on first access. Because `SharedArrayBuffer.grow()` is
+ * visible across workers, activation needs no postMessage broadcast.
  */
 interface Chunk {
   buffer: SharedArrayBuffer;
@@ -56,33 +81,87 @@ interface Chunk {
 }
 
 /** Round `n` up to the next power of two (chunk sizes must be powers of two). */
-function nextPowerOfTwo(n: number): number {
+export function nextPowerOfTwo(n: number): number {
   if (n <= 0) return 1;
   let p = 1;
   while (p < n) p <<= 1;
   return p;
 }
 
+export function largestPowerOfTwo(n: number): number {
+  if (n <= 1) return 1;
+  return 2 ** Math.floor(Math.log2(n));
+}
+
 export class GrowableBuffer {
   private chunks: Chunk[] = [];
   private readonly maxByteLength: number;
+  private readonly singleBuffer: boolean;
   /** Fixed size of every chunk (the minimum growth step). */
   readonly chunkSize: number;
   /** log2(chunkSize), used for O(1) offset resolution via bit shifts. */
   private readonly chunkShift: number;
   private readonly budget?: SharedBudget;
   private used = 0;
+  /** Smallest chunk index that is not yet active (see `activate`). */
+  private nextChunkToActivate = 0;
 
   constructor(
     initialSizeOrBuffer: number | SharedArrayBuffer | SharedArrayBuffer[],
     maxByteLength: number,
     budget?: SharedBudget,
     chunkSize = 32 * 1024 * 1024, // 32 MiB per chunk
+    singleBuffer = false,
+    chargeInitial = true,
   ) {
-    this.maxByteLength = maxByteLength;
+    this.singleBuffer = singleBuffer;
     this.budget = budget;
+    if (singleBuffer && typeof initialSizeOrBuffer !== "number") {
+      const buffer = Array.isArray(initialSizeOrBuffer)
+        ? initialSizeOrBuffer[0]
+        : initialSizeOrBuffer;
+      if (
+        buffer === undefined ||
+        (Array.isArray(initialSizeOrBuffer) && initialSizeOrBuffer.length !== 1)
+      ) {
+        throw new RangeError(
+          "A single-buffer GrowableBuffer requires exactly one SharedArrayBuffer",
+        );
+      }
+      this.maxByteLength = Math.min(
+        buffer.maxByteLength ?? buffer.byteLength,
+        maxByteLength,
+      );
+      this.chunkSize = this.maxByteLength;
+      this.chunkShift = 0;
+      this.chunks.push({
+        buffer,
+        view: new DataView(buffer),
+        active: buffer.byteLength > 4,
+      });
+      if (chargeInitial) this.budget?.add(buffer.byteLength);
+      return;
+    }
+
+    this.maxByteLength = maxByteLength;
     if (typeof initialSizeOrBuffer === "number") {
-      this.chunkSize = Math.min(nextPowerOfTwo(chunkSize), maxByteLength);
+      if (singleBuffer) {
+        const buffer = new SharedArrayBuffer(4, {
+          maxByteLength,
+        });
+        this.chunkSize = maxByteLength;
+        this.chunkShift = 0;
+        this.chunks.push({
+          buffer,
+          view: new DataView(buffer),
+          active: false,
+        });
+        return;
+      }
+      this.chunkSize = Math.min(
+        nextPowerOfTwo(chunkSize),
+        largestPowerOfTwo(maxByteLength),
+      );
       this.chunkShift = Math.log2(this.chunkSize);
       // Pre-allocate all chunks (4 bytes each, growable to chunkSize).
       const chunkCount = Math.max(1, Math.ceil(maxByteLength / this.chunkSize));
@@ -95,6 +174,7 @@ export class GrowableBuffer {
           view: new DataView(buffer),
           active: false,
         });
+        if (chargeInitial) this.budget?.add(buffer.byteLength);
       }
     } else if (Array.isArray(initialSizeOrBuffer)) {
       // Reconstruct from a list of chunks. Use the buffers directly (they are
@@ -110,7 +190,7 @@ export class GrowableBuffer {
           view: new DataView(sab),
           active: sab.byteLength === this.chunkSize,
         });
-        this.budget?.add(sab.byteLength);
+        if (chargeInitial) this.budget?.add(sab.byteLength);
       }
     } else {
       // Reconstruct from a single existing buffer. Use it directly so writes
@@ -124,7 +204,7 @@ export class GrowableBuffer {
         view: new DataView(initialSizeOrBuffer),
         active: initialSizeOrBuffer.byteLength === this.chunkSize,
       });
-      this.budget?.add(initialSizeOrBuffer.byteLength);
+      if (chargeInitial) this.budget?.add(initialSizeOrBuffer.byteLength);
     }
   }
 
@@ -136,10 +216,53 @@ export class GrowableBuffer {
   private activate(index: number): void {
     const chunk = this.chunks[index];
     if (chunk === undefined || chunk.active) return;
-    chunk.buffer.grow(this.chunkSize);
+    if (this.singleBuffer) {
+      return;
+    }
+    const oldSize = chunk.buffer.byteLength;
+    if (oldSize >= this.chunkSize) {
+      chunk.view = new DataView(chunk.buffer);
+      chunk.active = true;
+      this.advanceNextChunkToActivate(index);
+      return;
+    }
+    const growth = this.chunkSize - oldSize;
+    if (this.budget && !this.budget.tryReserve(growth)) {
+      throw new RangeError(
+        `Shared memory budget exceeded: need ${growth} additional bytes`,
+      );
+    }
+    try {
+      chunk.buffer.grow(this.chunkSize);
+    } catch (error) {
+      if (chunk.buffer.byteLength >= this.chunkSize) {
+        this.budget?.release(growth);
+        chunk.view = new DataView(chunk.buffer);
+        chunk.active = true;
+        this.advanceNextChunkToActivate(index);
+        return;
+      }
+      this.budget?.release(growth);
+      throw error;
+    }
     chunk.view = new DataView(chunk.buffer);
     chunk.active = true;
-    this.budget?.add(this.chunkSize);
+    this.advanceNextChunkToActivate(index);
+  }
+
+  /**
+   * Advance `nextChunkToActivate` past `index` while the following chunks are
+   * already active, so `ensureCapacity` never re-scans active chunks.
+   */
+  private advanceNextChunkToActivate(index: number): void {
+    if (index < this.nextChunkToActivate) return;
+    this.nextChunkToActivate = index + 1;
+    while (
+      this.nextChunkToActivate < this.chunks.length &&
+      this.chunks[this.nextChunkToActivate]!.active
+    ) {
+      this.nextChunkToActivate++;
+    }
   }
 
   /** Number of bytes written so far (used length, not buffer capacity). */
@@ -149,7 +272,9 @@ export class GrowableBuffer {
 
   /** Total logical capacity across all chunks (active or not). */
   get capacity(): number {
-    return this.chunks.length * this.chunkSize;
+    return this.singleBuffer
+      ? this.maxByteLength
+      : this.chunks.length * this.chunkSize;
   }
 
   /** The list of SharedArrayBuffers backing this buffer (for export). */
@@ -157,9 +282,31 @@ export class GrowableBuffer {
     return this.chunks.map((c) => c.buffer);
   }
 
-  /** Number of chunks that have been activated (grown to full size). */
+  /** Number of chunks that have been grown from their initial 4-byte size. */
   get activeChunkCount(): number {
     return this.chunks.reduce((n, c) => n + (c.active ? 1 : 0), 0);
+  }
+
+  /**
+   * Replace the chunk list with `newBuffers` (received from the main thread
+   * after a defragmentation broadcast). Each buffer is either a full-size
+   * active chunk or a fresh 4-byte inactive chunk. Used by workers to stay in
+   * sync with the main thread's chunk replacement.
+   */
+  applyChunks(newBuffers: SharedArrayBuffer[]): void {
+    if (this.singleBuffer && newBuffers.length !== 1) {
+      throw new RangeError(
+        "A single-buffer GrowableBuffer requires exactly one SharedArrayBuffer",
+      );
+    }
+    this.chunks = newBuffers.map((sab) => ({
+      buffer: sab,
+      view: new DataView(sab),
+      active: this.singleBuffer
+        ? sab.byteLength > 4
+        : sab.byteLength === this.chunkSize,
+    }));
+    this.nextChunkToActivate = this.firstInactiveChunk();
   }
 
   /**
@@ -168,7 +315,10 @@ export class GrowableBuffer {
    * not yet active.
    */
   private resolve(offset: number): { chunk: Chunk; off: number } {
-    const index = offset >> this.chunkShift;
+    if (this.singleBuffer) {
+      return { chunk: this.chunks[0]!, off: offset };
+    }
+    const index = offset >>> this.chunkShift;
     const chunk = this.chunks[index];
     if (chunk === undefined) {
       throw new RangeError(`Offset ${offset} is beyond the buffer capacity`);
@@ -184,10 +334,39 @@ export class GrowableBuffer {
         `Shared buffer capacity exceeded: need ${needed} bytes but max is ${this.maxByteLength}`,
       );
     }
+    if (this.singleBuffer) {
+      const chunk = this.chunks[0]!;
+      const oldSize = chunk.buffer.byteLength;
+      if (needed <= oldSize) return;
+      const target = Math.min(
+        this.maxByteLength,
+        Math.max(needed, oldSize * 2),
+      );
+      let growth = target - oldSize;
+      if (this.budget && !this.budget.tryReserve(growth)) {
+        if (target === needed || !this.budget.tryReserve(needed - oldSize)) {
+          throw new RangeError(
+            `Shared memory budget exceeded: need ${needed - oldSize} additional bytes`,
+          );
+        }
+        growth = needed - oldSize;
+      }
+      try {
+        chunk.buffer.grow(oldSize + growth);
+      } catch (error) {
+        this.budget?.release(growth);
+        throw error;
+      }
+      chunk.view = new DataView(chunk.buffer);
+      chunk.active = true;
+      return;
+    }
     // All chunks are pre-allocated; just activate the ones needed to cover
     // `needed`. grow() is visible across workers, so no broadcast is required.
+    // Start from `nextChunkToActivate` so already-active chunks are not
+    // re-scanned on every write (keeps the write hot path O(1) amortized).
     const neededChunks = Math.ceil(needed / this.chunkSize);
-    for (let i = 0; i < neededChunks; i++) {
+    for (let i = this.nextChunkToActivate; i < neededChunks; i++) {
       this.activate(i);
     }
   }
@@ -200,15 +379,54 @@ export class GrowableBuffer {
   /**
    * Reset the used length to `n` bytes. Used by defragmentation after
    * compacting live data to the front of the buffer. Chunks beyond the
-   * compacted region are marked inactive (their storage is released by the
-   * GC, which replaces them with fresh chunks).
+   * compacted region are marked inactive; their storage is reclaimed by
+   * `releaseInactiveChunks()`.
    */
   reset(n: number): void {
     this.used = n;
+    if (this.singleBuffer) return;
     const neededChunks = Math.ceil(n / this.chunkSize);
-    for (let i = neededChunks; i < this.chunks.length; i++) {
-      this.chunks[i]!.active = false;
+    for (let i = 0; i < this.chunks.length; i++) {
+      const chunk = this.chunks[i]!;
+      chunk.active =
+        i < neededChunks && chunk.buffer.byteLength >= this.chunkSize;
     }
+    this.nextChunkToActivate = this.firstInactiveChunk();
+  }
+
+  /**
+   * Replace every inactive chunk with a fresh 4-byte SharedArrayBuffer
+   * (growable to `chunkSize`), releasing the old full-size buffer so its
+   * memory can be reclaimed. Returns the new chunk list; the caller must
+   * broadcast it to workers so they see the replacement.
+   *
+   * Because a SharedArrayBuffer cannot be shrunk, reclaiming memory requires
+   * allocating a new buffer. This is only called after defragmentation (rare),
+   * so the resulting broadcast is acceptable.
+   */
+  releaseInactiveChunks(): SharedArrayBuffer[] {
+    if (this.singleBuffer) return this.chunks.map((c) => c.buffer);
+    for (let i = 0; i < this.chunks.length; i++) {
+      const chunk = this.chunks[i]!;
+      if (chunk.active) continue;
+      // Release the old full-size buffer from the budget and replace it with
+      // a fresh 4-byte chunk.
+      this.budget?.release(Math.max(0, chunk.buffer.byteLength - 4));
+      const buffer = new SharedArrayBuffer(4, {
+        maxByteLength: this.chunkSize,
+      });
+      this.chunks[i] = { buffer, view: new DataView(buffer), active: false };
+    }
+    this.nextChunkToActivate = this.firstInactiveChunk();
+    return this.chunks.map((c) => c.buffer);
+  }
+
+  /** Index of the first chunk that is not active, or `chunks.length`. */
+  private firstInactiveChunk(): number {
+    for (let i = 0; i < this.chunks.length; i++) {
+      if (!this.chunks[i]!.active) return i;
+    }
+    return this.chunks.length;
   }
 
   // -------------------------------------------------------------------------
@@ -216,7 +434,8 @@ export class GrowableBuffer {
   // -------------------------------------------------------------------------
 
   getInt32(offset: number): number {
-    const index = offset >> this.chunkShift;
+    if (this.singleBuffer) return this.chunks[0]!.view.getInt32(offset, true);
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     return this.chunks[index]!.view.getInt32(
       offset & (this.chunkSize - 1),
@@ -225,7 +444,11 @@ export class GrowableBuffer {
   }
 
   setInt32(offset: number, value: number): void {
-    const index = offset >> this.chunkShift;
+    if (this.singleBuffer) {
+      this.chunks[0]!.view.setInt32(offset, value, true);
+      return;
+    }
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     this.chunks[index]!.view.setInt32(
       offset & (this.chunkSize - 1),
@@ -235,13 +458,18 @@ export class GrowableBuffer {
   }
 
   getUint8(offset: number): number {
-    const index = offset >> this.chunkShift;
+    if (this.singleBuffer) return this.chunks[0]!.view.getUint8(offset);
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     return this.chunks[index]!.view.getUint8(offset & (this.chunkSize - 1));
   }
 
   setUint8(offset: number, value: number): void {
-    const index = offset >> this.chunkShift;
+    if (this.singleBuffer) {
+      this.chunks[0]!.view.setUint8(offset, value);
+      return;
+    }
+    const index = offset >>> this.chunkShift;
     this.activate(index);
     this.chunks[index]!.view.setUint8(offset & (this.chunkSize - 1), value);
   }

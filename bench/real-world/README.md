@@ -34,6 +34,23 @@ docker compose -f bench/real-world/docker-compose.yml up -d
 bun bench/real-world/seed.ts
 ```
 
+> **Note (MySQL auth):** MySQL 8.4 defaults to the `caching_sha2_password`
+> auth plugin, which Bun's native SQL client cannot use over an insecure
+> connection ("server requested RSA public key retrieval"). If `seed.ts`
+> fails with that error, switch the `bench` user to `mysql_native_password`:
+>
+> ```sh
+> docker exec bun-shared-memory-mysql sh -c \
+>   'printf "[mysqld]\nmysql_native_password=ON\n" > /etc/mysql/conf.d/native-password.cnf'
+> docker restart bun-shared-memory-mysql
+> docker exec bun-shared-memory-mysql mysql -uroot -proot -e \
+>   "ALTER USER 'bench'@'%' IDENTIFIED WITH mysql_native_password BY 'bench'; FLUSH PRIVILEGES;"
+> ```
+>
+> The config file lives inside the container, so it is lost on
+> `docker compose down`/`up` and must be re-applied after recreating the
+> container.
+
 ## Run
 
 ```sh
@@ -45,6 +62,23 @@ The runner prints a per-methodology table (requests, elapsed ms, req/s) sorted
 by speed (fastest first) and a relative comparison against shared memory. It
 also writes the full results to `benchlogs/<timestamp>-<commit>-real.md` (one
 file per run, following the same convention as the micro benchmarks).
+
+### Stability
+
+The shared-memory methodology is extremely fast (finishes in tens of
+milliseconds), so it is sensitive to CPU contention from other processes (the
+IDE, language servers, etc.). To get a stable, reproducible number, the runner
+takes the **minimum** over several measurements — contention can only slow a
+run down, never speed it up, so the minimum is the best estimate of true
+throughput:
+
+- **Samples per worker** (default 5): each worker runs the full request loop
+  several times and reports its fastest sample.
+- **Runs per methodology** (default 3): each methodology is run several times
+  (each run spawns the 4 workers again) and the fastest run is kept.
+
+For the most reliable results, close or pause CPU-heavy applications (IDE,
+Copilot, language servers) before running.
 
 ### Fair comparison
 

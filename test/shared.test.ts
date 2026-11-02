@@ -268,40 +268,113 @@ describe("SharedMemory string interning", () => {
 });
 
 describe("SharedMemory total memory budget", () => {
-  test("maxTotalBytes caps the sum of all buffers, not each buffer", () => {
-    // A small total budget. Each buffer's own maxByteLength is capped at
-    // maxTotalBytes = 8192, but the *sum* of all buffers is capped at 8192.
-    // The 4 initial buffers (1024 each = 4096) fit within the budget.
-    const mem = new SharedMemory({ maxTotalBytes: 8192, chunkSize: 1024 });
+  test("keeps the Index Table in one growable SharedArrayBuffer", () => {
+    const mem = new SharedMemory({
+      initialSize: 4,
+      maxByteLength: 4096,
+      chunkSize: 16,
+    });
+    const workerMem = SharedMemory.fromBuffers(mem.exportBuffers());
 
-    // Writing enough distinct strings must eventually exceed the total budget
-    // even though no single buffer would exceed its own maxByteLength.
-    let threw = false;
-    try {
-      for (let i = 0; i < 100_000; i++) {
-        mem.storeString(`string-number-${i}-with-some-length`);
-      }
-    } catch (e) {
-      threw = e instanceof RangeError;
+    for (let i = 0; i < 200; i++) {
+      mem.insert(`index-key-${i}`, i);
     }
-    expect(threw).toBe(true);
 
-    // The total physical size never exceeded the budget.
-    const total =
-      mem.indexTable.buffers[0]!.byteLength +
-      mem.dataTable.buffers[0]!.byteLength +
-      mem.stringTable.buffers[0]!.byteLength +
-      mem.arrayTable.buffers[0]!.byteLength;
-    expect(total).toBeLessThanOrEqual(8192);
+    expect(mem.indexTable.buffers).toHaveLength(1);
+    expect(mem.indexTable.buffers[0]!.maxByteLength).toBe(4096);
+    expect(mem.indexTable.buffers[0]!.byteLength).toBeGreaterThan(16);
+    expect(workerMem.lookupIndex("index-key-199")).toBe(199);
+
+    mem.bumpVersion(199);
+    expect(workerMem.getVersion(199)).toBe(1);
   });
 
-  test("maxTotalBytes smaller than the initial buffers throws", () => {
-    // With pre-allocated chunks, the initial buffers are only 4 bytes each, so
-    // construction never exceeds the budget. The budget is enforced when
-    // chunks are activated (grown to their full size). A budget smaller than
-    // the chunk size throws as soon as the first chunk is activated.
+  test("maxTotalBytes caps the combined three-table size", () => {
+    // maxTotalBytes is shared by DataTable, StringTable, and ArrayTable, and
+    // is clamped to at least 32 MiB.
+    const mem = new SharedMemory({ maxTotalBytes: 8192, chunkSize: 1024 });
+    expect(mem.maxTotalBytes).toBe(32 * 1024 * 1024);
+
+    // The three tables share one budget: growing them together up to the
+    // budget succeeds, and exceeding it throws.
+    mem.stringTable.ensureCapacity(8 * 1024 * 1024);
+    mem.arrayTable.ensureCapacity(8 * 1024 * 1024);
+    mem.dataTable.ensureCapacity(8 * 1024 * 1024);
+    // 3 × 8 MiB = 24 MiB fits in the 32 MiB budget; growing the DataTable to
+    // 16 MiB would push the combined physical size past the budget.
+    expect(() => mem.dataTable.ensureCapacity(16 * 1024 * 1024)).toThrow(
+      RangeError,
+    );
+
+    const total = [
+      ...mem.dataTable.buffers,
+      ...mem.stringTable.buffers,
+      ...mem.arrayTable.buffers,
+    ].reduce((sum, buffer) => sum + buffer.byteLength, 0);
+    expect(total).toBeLessThanOrEqual(32 * 1024 * 1024);
+  });
+
+  test("shares maxTotalBytes atomically with reconstructed workers", () => {
+    // maxTotalBytes is clamped to at least 32 MiB.
+    const mem = new SharedMemory({
+      maxTotalBytes: 96,
+      chunkSize: 16,
+    });
+    const workerMem = SharedMemory.fromBuffers(mem.exportBuffers());
+
+    // The clamped budget is shared atomically across workers.
+    expect(workerMem.maxTotalBytes).toBe(32 * 1024 * 1024);
+
+    // Growing the three tables up to the budget succeeds; exceeding it throws.
+    mem.indexTable.ensureCapacity(80);
+    workerMem.stringTable.ensureCapacity(16);
+    mem.arrayTable.ensureCapacity(16);
+    expect(() =>
+      workerMem.dataTable.ensureCapacity(32 * 1024 * 1024 + 1),
+    ).toThrow(RangeError);
+
+    const total = [
+      ...mem.dataTable.buffers,
+      ...mem.stringTable.buffers,
+      ...mem.arrayTable.buffers,
+    ].reduce((sum, buffer) => sum + buffer.byteLength, 0);
+    expect(total).toBeLessThanOrEqual(32 * 1024 * 1024);
+  });
+
+  test("maxTotalBytes prevents table growth beyond the combined budget", () => {
+    // maxTotalBytes is clamped to at least 32 MiB.
     const mem = new SharedMemory({ maxTotalBytes: 1023, chunkSize: 1024 });
-    expect(() => mem.arrayTable.ensureCapacity(1024)).toThrow(RangeError);
+    expect(mem.maxTotalBytes).toBe(32 * 1024 * 1024);
+    // Growing beyond the clamped budget throws.
+    expect(() => mem.arrayTable.ensureCapacity(32 * 1024 * 1024 + 1)).toThrow(
+      RangeError,
+    );
+  });
+});
+
+describe("SharedMemory size limits", () => {
+  test("chunkSize is clamped to at least 4 MiB", () => {
+    const mem = new SharedMemory({ chunkSize: 16 });
+    expect(mem.dataTable.chunkSize).toBe(4 * 1024 * 1024);
+    expect(mem.stringTable.chunkSize).toBe(4 * 1024 * 1024);
+    expect(mem.arrayTable.chunkSize).toBe(4 * 1024 * 1024);
+  });
+
+  test("maxTotalBytes and maxByteLength are clamped to at least 32 MiB", () => {
+    const mem = new SharedMemory({ maxTotalBytes: 96, maxByteLength: 8 });
+    expect(mem.maxTotalBytes).toBe(32 * 1024 * 1024);
+    expect(mem.maxByteLength).toBe(32 * 1024 * 1024);
+  });
+
+  test("chunkSize is large enough that no table needs more than 1024 chunks", () => {
+    // 8 GiB with the minimum 4 MiB chunk would need 2048 chunks, so the chunk
+    // size is raised to keep the chunk count at or below 1024.
+    const mem = new SharedMemory({
+      maxByteLength: 8 * 1024 * 1024 * 1024,
+      chunkSize: 4 * 1024 * 1024,
+    });
+    expect(mem.dataTable.chunkSize).toBe(8 * 1024 * 1024);
+    expect(mem.dataTable.buffers.length).toBeLessThanOrEqual(1024);
   });
 });
 

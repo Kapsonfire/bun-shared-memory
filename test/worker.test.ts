@@ -277,4 +277,115 @@ describe("Worker integration (M4)", () => {
 
     stopInit();
   });
+
+  test("a worker applies a chunk update broadcast after defragmentation", async () => {
+    // Use a small chunk size so writes span multiple chunks in the data tables.
+    setDefaultMemory(new SharedMemory({ chunkSize: 4096 }));
+    await init();
+
+    const workerCode = `
+      import { Shared, init, onMessage, getDefaultMemory } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      await init();
+      onMessage((e) => {
+        if (e.data === "report") {
+          // Report the current chunk sizes so the main thread can verify the
+          // worker applied the chunk update.
+          self.postMessage({
+            arrayChunks: getDefaultMemory().arrayTable.buffers.map(
+              (b) => b.byteLength,
+            ),
+          });
+        } else if (e.data === "read") {
+          const arr = Shared("m4-gc-0", [0]);
+          self.postMessage({ read: arr.read() });
+        }
+      });
+    `;
+
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(workerCode),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+
+    const report = () =>
+      new Promise<{ arrayChunks: number[] }>((resolve) => {
+        const handler = (e: MessageEvent) => {
+          const data = e.data as
+            { __sharedMemoryRequest?: boolean } | { arrayChunks: number[] };
+          if (
+            data !== null &&
+            typeof data === "object" &&
+            !("__sharedMemoryRequest" in data)
+          ) {
+            worker.removeEventListener("message", handler);
+            resolve(data as { arrayChunks: number[] });
+          }
+        };
+        worker.addEventListener("message", handler);
+        worker.postMessage("report");
+      });
+
+    const mem = getDefaultMemory();
+
+    // Grow the ArrayTable across several chunks.
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      const key = `m4-gc-${i}`;
+      keys.push(key);
+      Shared(
+        key,
+        Array.from({ length: 50 }, (_, j) => j),
+        { memory: mem },
+      );
+    }
+    const totalChunks = mem.arrayTable.buffers.length;
+    expect(totalChunks).toBeGreaterThan(1);
+
+    // Overwrite every array with a tiny one, creating dead space.
+    for (let i = 0; i < 100; i++) {
+      Shared(keys[i]!, [i], { memory: mem }).write([i]);
+    }
+
+    // Defragment, which replaces inactive chunks with fresh 4-byte buffers.
+    const result = mem.withLock(() => mem.defragment());
+    const inactiveCount = result.arrayTable.filter(
+      (sab) => sab.byteLength === 4,
+    ).length;
+    expect(inactiveCount).toBeGreaterThan(0);
+
+    // Simulate the main thread broadcasting the new chunk lists to the worker
+    // (the coordinator does this via onDefragment; here we send it directly).
+    worker.postMessage({ __chunkUpdate: true, buffers: result });
+
+    // The worker must now see the replaced chunks.
+    const workerReport = await report();
+    expect(workerReport.arrayChunks.length).toBe(totalChunks);
+    const workerInactive = workerReport.arrayChunks.filter(
+      (n) => n === 4,
+    ).length;
+    expect(workerInactive).toBe(inactiveCount);
+
+    // The worker can still read the compacted data.
+    const workerRead = await new Promise<number[]>((resolve) => {
+      const handler = (e: MessageEvent) => {
+        const data = e.data as
+          { __sharedMemoryRequest?: boolean } | { read: number[] };
+        if (data !== null && typeof data === "object" && "read" in data) {
+          worker.removeEventListener("message", handler);
+          resolve(data.read);
+        }
+      };
+      worker.addEventListener("message", handler);
+      worker.postMessage("read");
+    });
+    expect(workerRead).toEqual([0]);
+
+    worker.terminate();
+    stopInit();
+  });
 });

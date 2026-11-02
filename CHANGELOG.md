@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-11-02
+
+### Added
+
+- Keep the Index Table in a single growable `SharedArrayBuffer` (capped at
+  4 GiB) instead of the chunked logic, so it stays contiguous and cheap to
+  address. `SharedMemoryOptions.indexTableMaxByteLength` configures its cap
+  (default 4 GiB).
+- `maxTotalBytes` now caps the combined physical size of DataTable,
+  StringTable, and ArrayTable only (the Index Table is excluded). The budget
+  is enforced by an atomic `SharedBudget` counter shared across workers that
+  reserves memory before each chunk growth, so the three tables cannot exceed
+  the limit even when multiple workers write concurrently.
+- Enforce size limits regardless of the configured values: `chunkSize` is at
+  least 4 MiB, `maxTotalBytes`/`maxByteLength` are at least 32 MiB, and
+  `chunkSize` is raised as needed so no table needs more than 1024 chunks.
+  `SharedMemory.maxByteLength` and `SharedMemory.maxTotalBytes` are now public
+  read-only fields.
+
+### Performance
+
+- Reclaim memory from inactive chunks after defragmentation. A
+  `SharedArrayBuffer` cannot be shrunk, so `GrowableBuffer` replaces each
+  inactive chunk with a fresh 4-byte `SharedArrayBuffer`, releasing the old
+  full-size buffer so its memory is freed. `defragment()` returns the new
+  chunk lists and the main thread broadcasts them to workers via a
+  `__chunkUpdate` message; workers apply them with `applyChunkUpdate()`. This
+  only runs during defragmentation (rare), so the hot path is unaffected.
+- Optimize the budget write hot path: `GrowableBuffer` tracks
+  `nextChunkToActivate` (the first not-yet-active chunk) so `ensureCapacity`
+  only activates new chunks instead of re-scanning every already-active chunk
+  on each write (was O(n) per write as the dataset grew). Writes ~9% faster.
+
+### Changed
+
+- Stabilize the real-world benchmark against CPU contention. The shared-memory
+  methodology finishes in tens of milliseconds, so it is sensitive to load
+  from other processes (IDE, language servers). Each worker now runs several
+  measured samples (default 5) and reports its fastest; each methodology is
+  run several times (default 3) and the fastest run is kept. Because
+  contention can only slow a run down, the minimum is the best estimate of
+  true throughput.
+
+### Fixed
+
+- Resolve chunk offsets with an unsigned right shift (`offset >>> chunkShift`)
+  instead of a signed one. A signed 32-bit shift turns offsets at or above
+  2 GiB negative, so reads/writes past 2 GiB (e.g. in a >4 GiB chunked buffer)
+  hit the wrong chunk or threw. The Index Table and the Data/String/Array
+  tables can now be addressed at any offset below the 4 GiB single-SAB cap.
+  Reported by [mizulu](https://github.com/mizulu).
+
 ## [0.1.6] - 2026-11-02
 
 ### Added
@@ -120,6 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[0.1.7]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.3...v0.1.4

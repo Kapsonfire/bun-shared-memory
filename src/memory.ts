@@ -1,4 +1,8 @@
-import { GrowableBuffer, SharedBudget } from "./growable-buffer.ts";
+import {
+  GrowableBuffer,
+  SharedBudget,
+  nextPowerOfTwo,
+} from "./growable-buffer.ts";
 import { Mutex } from "./mutex.ts";
 
 /**
@@ -30,10 +34,11 @@ import { Mutex } from "./mutex.ts";
  *   [12..15] reserved
  *   then propertyCount * (nameRef(8 bytes) + valueSlot(16 bytes))
  *
- * Index Table entry (12 bytes):
+ * Index Table entry (16 bytes):
  *   [0..3]   key string offset
  *   [4..7]   key string length
  *   [8..11]  data offset (into DataTable)
+ *   [12..15] key version
  */
 
 export const TYPE_NUMBER = 0;
@@ -51,11 +56,19 @@ const INDEX_ENTRY_SIZE = 16;
 const INDEX_HEADER = 4;
 /** Byte offset of the version field within an index entry. */
 const INDEX_VERSION_OFFSET = 12;
+const MAX_INDEX_TABLE_BYTES = 4 * 1024 * 1024 * 1024;
 /** Size of the objectId header at the start of each array block. */
 const ARRAY_HEADER = 4;
 
 const DEFAULT_INITIAL = 1024;
 const DEFAULT_MAX = 64 * 1024 * 1024; // 64 MiB
+const DEFAULT_CHUNK_SIZE = 32 * 1024 * 1024; // 32 MiB per chunk
+/** Minimum size of a single chunk (a chunk is the minimum growth step). */
+const MIN_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
+/** Minimum combined memory budget (maxTotalBytes / maxByteLength). */
+const MIN_MAX_MEMORY = 32 * 1024 * 1024; // 32 MiB
+/** Maximum number of chunks per table (chunkSize must be large enough). */
+const MAX_CHUNKS_PER_TABLE = 1024;
 const DEFAULT_INTERN_CAPACITY = 256;
 const DEFAULT_INTERN_MAX = 1 << 16; // 65536 entries
 
@@ -172,10 +185,20 @@ export function decodeSlot(slot: ValueSlot): unknown {
 
 export interface SharedMemoryOptions {
   initialSize?: number;
+  /** Per-buffer maximum byte length (clamped to at least 32 MiB). */
   maxByteLength?: number;
-  /** Total memory budget shared across all buffers (see below). */
+  /**
+   * Total physical memory budget shared by DataTable, StringTable, and
+   * ArrayTable (clamped to at least 32 MiB).
+   */
   maxTotalBytes?: number;
-  /** Size of each growable chunk (the minimum growth step). Default 32 MiB. */
+  /** Internal worker reconstruction option; normally inferred from buffers. */
+  indexTableMaxByteLength?: number;
+  /**
+   * Size of each growable chunk (the minimum growth step). Default 32 MiB,
+   * clamped to at least 4 MiB and raised as needed so no table needs more
+   * than 1024 chunks.
+   */
   chunkSize?: number;
   lock?: Mutex;
   internCapacity?: number;
@@ -187,6 +210,7 @@ export interface SharedMemoryOptions {
     arrayTable?: SharedArrayBuffer | SharedArrayBuffer[];
     layoutVersion?: SharedArrayBuffer;
     refCount?: SharedArrayBuffer;
+    budget?: SharedArrayBuffer;
   };
 }
 
@@ -197,11 +221,27 @@ function makeBuffer(
   maxByteLength: number,
   budget?: SharedBudget,
   chunkSize?: number,
+  singleBuffer = false,
+  chargeInitial = true,
 ): GrowableBuffer {
   if (buf === undefined) {
-    return new GrowableBuffer(initial, maxByteLength, budget, chunkSize);
+    return new GrowableBuffer(
+      initial,
+      maxByteLength,
+      budget,
+      chunkSize,
+      singleBuffer,
+      chargeInitial,
+    );
   }
-  return new GrowableBuffer(buf, maxByteLength, budget, chunkSize);
+  return new GrowableBuffer(
+    buf,
+    maxByteLength,
+    budget,
+    chunkSize,
+    singleBuffer,
+    chargeInitial,
+  );
 }
 
 /**
@@ -213,6 +253,12 @@ export class SharedMemory {
   readonly dataTable: GrowableBuffer;
   readonly stringTable: GrowableBuffer;
   readonly arrayTable: GrowableBuffer;
+  /** Per-buffer maximum byte length (clamped to at least 32 MiB). */
+  readonly maxByteLength: number;
+  private readonly indexTableMaxByteLength: number;
+  /** Combined memory budget for Data/String/Array tables, or null if unset. */
+  readonly maxTotalBytes: number | null;
+  private readonly budgetBuffer: SharedArrayBuffer | null;
   /**
    * Cached Int32Array view over the Index Table, used to read/increment each
    * key's version cell (stored as the 4th field of each index entry). Rebuilt
@@ -262,25 +308,57 @@ export class SharedMemory {
 
   constructor(options?: SharedMemoryOptions) {
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
-    // `maxTotalBytes` is a *total* budget shared across all buffers: each
-    // buffer's own maxByteLength is capped at maxTotalBytes, and the sum of
-    // all buffers' physical sizes is additionally capped at maxTotalBytes.
+    // `maxTotalBytes` caps the combined physical size of DataTable,
+    // StringTable, and ArrayTable. IndexTable has its independent 4 GiB cap.
     // Without maxTotalBytes, each buffer grows up to its own maxByteLength.
-    // A single SharedArrayBuffer is limited to 4 GiB, but the chunked
-    // GrowableBuffer splits a buffer across multiple chunks, so a buffer can
-    // exceed 4 GiB.
+    // The Index Table remains a single growable SharedArrayBuffer and is
+    // capped at 4 GiB. The other tables use chunks and can exceed that limit.
     const maxTotal = options?.maxTotalBytes;
-    const perBufferMax = maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX;
-    const budget =
-      maxTotal !== undefined ? new SharedBudget(maxTotal) : undefined;
-    const chunkSize = options?.chunkSize;
+    if (
+      maxTotal !== undefined &&
+      (!Number.isSafeInteger(maxTotal) || maxTotal < 0)
+    ) {
+      throw new RangeError("maxTotalBytes must be a non-negative safe integer");
+    }
+    // Enforce the minimum memory budget: maxTotalBytes / maxByteLength are
+    // never below 32 MiB.
+    const perBufferMax = Math.max(
+      maxTotal ?? options?.maxByteLength ?? DEFAULT_MAX,
+      MIN_MAX_MEMORY,
+    );
+    const indexTableMax = Math.min(
+      options?.indexTableMaxByteLength ?? options?.maxByteLength ?? DEFAULT_MAX,
+      MAX_INDEX_TABLE_BYTES,
+    );
+    // Enforce the chunk-size limits: at least 4 MiB, and large enough that no
+    // table needs more than MAX_CHUNKS_PER_TABLE chunks.
+    const userChunkSize = options?.chunkSize ?? DEFAULT_CHUNK_SIZE;
+    const chunkSize = Math.max(
+      userChunkSize,
+      MIN_CHUNK_SIZE,
+      nextPowerOfTwo(perBufferMax / MAX_CHUNKS_PER_TABLE),
+    );
     const buffers = options?.buffers;
+    // The budget is the clamped maxTotalBytes (never below MIN_MAX_MEMORY), so
+    // it stays consistent with perBufferMax.
+    const budgetMax = maxTotal !== undefined ? perBufferMax : undefined;
+    const budgetBuffer = buffers?.budget;
+    const budget =
+      budgetMax !== undefined
+        ? new SharedBudget(budgetMax, budgetBuffer)
+        : undefined;
+    const chargeInitial = budgetBuffer === undefined;
+    this.maxByteLength = perBufferMax;
+    this.indexTableMaxByteLength = indexTableMax;
+    this.maxTotalBytes = budgetMax ?? null;
+    this.budgetBuffer = budget?.buffer ?? null;
     this.indexTable = makeBuffer(
       buffers?.indexTable,
       initial,
-      perBufferMax,
-      budget,
+      indexTableMax,
+      undefined,
       chunkSize,
+      true,
     );
     this.dataTable = makeBuffer(
       buffers?.dataTable,
@@ -288,6 +366,8 @@ export class SharedMemory {
       perBufferMax,
       budget,
       chunkSize,
+      false,
+      chargeInitial,
     );
     this.stringTable = makeBuffer(
       buffers?.stringTable,
@@ -295,6 +375,8 @@ export class SharedMemory {
       perBufferMax,
       budget,
       chunkSize,
+      false,
+      chargeInitial,
     );
     this.arrayTable = makeBuffer(
       buffers?.arrayTable,
@@ -302,6 +384,8 @@ export class SharedMemory {
       perBufferMax,
       budget,
       chunkSize,
+      false,
+      chargeInitial,
     );
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
     this.layoutVersion = new Int32Array(
@@ -320,6 +404,24 @@ export class SharedMemory {
   }
 
   /**
+   * Apply a buffer update received from the main thread after a
+   * defragmentation pass. Replaces each table's buffers and rebuilds the
+   * version view. Called by workers on the `__chunkUpdate` message.
+   */
+  applyChunkUpdate(buffers: {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  }): void {
+    this.indexTable.applyChunks(buffers.indexTable);
+    this.dataTable.applyChunks(buffers.dataTable);
+    this.stringTable.applyChunks(buffers.stringTable);
+    this.arrayTable.applyChunks(buffers.arrayTable);
+    this.versionView = new Int32Array(this.indexTable.buffers[0]!);
+  }
+
+  /**
    * Attach the reference-counting buffer (5th SAB) to this memory so it is
    * included in `exportBuffers()`. No-op if a buffer is already attached.
    */
@@ -334,8 +436,10 @@ export class SharedMemory {
    * Export all shared buffers (including the lock) so they can be sent to a
    * worker via `postMessage` and reconstructed there with `fromBuffers()`.
    *
-   * Each table is exported as a list of SharedArrayBuffers (chunks), since a
-   * single SharedArrayBuffer is limited to 4 GiB.
+   * Tables are exported as lists for the chunked buffers. The Index Table is
+   * a single growable SharedArrayBuffer, exported as a one-element list. The
+   * optional shared budget counter is included so workers reserve atomically
+   * against the same three-table limit.
    */
   exportBuffers(): {
     indexTable: SharedArrayBuffer[];
@@ -345,6 +449,10 @@ export class SharedMemory {
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
     refCount: SharedArrayBuffer | null;
+    maxByteLength: number;
+    indexTableMaxByteLength: number;
+    maxTotalBytes: number | null;
+    budget: SharedArrayBuffer | null;
   } {
     return {
       indexTable: this.indexTable.buffers,
@@ -354,6 +462,10 @@ export class SharedMemory {
       layoutVersion: this.layoutVersion.buffer as SharedArrayBuffer,
       lock: this.lock.buffer as SharedArrayBuffer,
       refCount: this.refCountBuffer,
+      maxByteLength: this.maxByteLength,
+      indexTableMaxByteLength: this.indexTableMaxByteLength,
+      maxTotalBytes: this.maxTotalBytes,
+      budget: this.budgetBuffer,
     };
   }
 
@@ -369,8 +481,22 @@ export class SharedMemory {
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
     refCount?: SharedArrayBuffer | null;
+    maxByteLength?: number;
+    indexTableMaxByteLength?: number;
+    maxTotalBytes?: number | null;
+    budget?: SharedArrayBuffer | null;
   }): SharedMemory {
+    const indexBuffer = Array.isArray(buffers.indexTable)
+      ? buffers.indexTable[0]
+      : buffers.indexTable;
     return new SharedMemory({
+      maxByteLength: buffers.maxByteLength ?? DEFAULT_MAX,
+      indexTableMaxByteLength:
+        buffers.indexTableMaxByteLength ??
+        indexBuffer?.maxByteLength ??
+        indexBuffer?.byteLength ??
+        DEFAULT_MAX,
+      maxTotalBytes: buffers.maxTotalBytes ?? undefined,
       buffers: {
         indexTable: buffers.indexTable,
         dataTable: buffers.dataTable,
@@ -378,6 +504,7 @@ export class SharedMemory {
         arrayTable: buffers.arrayTable,
         layoutVersion: buffers.layoutVersion,
         refCount: buffers.refCount ?? undefined,
+        budget: buffers.budget ?? undefined,
       },
       lock: new Mutex(buffers.lock),
     });
@@ -798,7 +925,12 @@ export class SharedMemory {
    *
    * Must be called under the shared lock (or on a single thread).
    */
-  defragment(): void {
+  defragment(): {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  } {
     const stringRemap = new Map<number, number>();
     const arrayRemap = new Map<number, number>();
     const objectRemap = new Map<number, number>();
@@ -964,6 +1096,15 @@ export class SharedMemory {
 
     // Phase 7: Invalidate all per-worker caches.
     this.bumpLayoutVersion();
+
+    // Phase 8: Reclaim memory from inactive chunks (beyond the compacted
+    // region). The Index Table is a single growable SAB and is never replaced.
+    return {
+      indexTable: this.indexTable.releaseInactiveChunks(),
+      dataTable: this.dataTable.releaseInactiveChunks(),
+      stringTable: this.stringTable.releaseInactiveChunks(),
+      arrayTable: this.arrayTable.releaseInactiveChunks(),
+    };
   }
 }
 
