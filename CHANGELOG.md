@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-11-02
+
+### Changed
+- Replace the `Proxy` used for object `SharedRef`s with hard-baked
+  `Object.defineProperty` accessor getters/setters, so property reads skip the
+  Proxy trap on the hot path (~3× faster object property reads). Methods
+  (`read`/`write`/`update`/`key`/`buffer`) move to the prototype so the data
+  properties are the only own properties, keeping the JIT shape monomorphic
+  (~2× faster than having the methods as own properties). Arrays, primitives,
+  and unknown shapes still use the Proxy. Fixed shape is enforced via
+  `Object.preventExtensions` plus `configurable: false` accessors.
+- Optimize `copyValue` (the `read()` copy) with `Object.assign` + a `for...in`
+  array pass (~3.5× faster object `read()`).
+- Pass the initial value into `createSharedRef` so the object shape can be
+  baked at creation time.
+
 ## [0.1.4] - 2026-11-01
 
 ### Changed
