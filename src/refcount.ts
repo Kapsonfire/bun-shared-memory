@@ -160,6 +160,8 @@ export class RefCountCoordinator {
   private nextWorkerId = 0;
   /** Free-space threshold (fraction of maxByteLength) that triggers defrag. */
   private readonly defragThreshold: number;
+  /** Minimum number of freed blocks before a table is considered fragmented. */
+  private readonly minFreeBlocks: number;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   /** Called after a defragmentation pass with the new chunk lists. */
   private readonly onDefragment?: (buffers: {
@@ -174,6 +176,7 @@ export class RefCountCoordinator {
     buffer?: RefCountBuffer,
     opts: {
       defragThreshold?: number;
+      minFreeBlocks?: number;
       autoMaintenance?: boolean;
       maintenanceInterval?: number;
       onDefragment?: (buffers: {
@@ -199,6 +202,7 @@ export class RefCountCoordinator {
             return b;
           })());
     this.defragThreshold = opts.defragThreshold ?? 0.1;
+    this.minFreeBlocks = opts.minFreeBlocks ?? 64;
     // Start periodic maintenance automatically so refcount events are drained
     // and dead space is reclaimed without an explicit call.
     if (opts.autoMaintenance ?? true) {
@@ -298,15 +302,32 @@ export class RefCountCoordinator {
     }
   }
 
-  /** Whether any table has less than `defragThreshold` free space. */
+  /**
+   * Whether any table is highly fragmented enough to warrant a defragmentation
+   * pass.
+   *
+   * With the slab allocator, freed blocks are reused immediately, so low free
+   * space alone is not a problem. Defragmentation is only needed when the free
+   * space is fragmented into many blocks that together occupy a significant
+   * share of the buffer (dead space that cannot be reused efficiently).
+   *
+   * A table triggers defrag when it has at least `minFreeBlocks` freed blocks
+   * AND those freed blocks occupy more than `defragThreshold` of the buffer's
+   * capacity (i.e. a large amount of dead space has accumulated).
+   */
   needsDefrag(): boolean {
-    const max = this.mem.dataTable.capacity;
-    const free = (b: { capacity: number; byteLength: number }) =>
-      (b.capacity - b.byteLength) / max;
+    const frag = (b: {
+      capacity: number;
+      freeListStats: () => { count: number; bytes: number };
+    }) => {
+      const { count, bytes } = b.freeListStats();
+      if (count < this.minFreeBlocks) return false;
+      return bytes / b.capacity > this.defragThreshold;
+    };
     return (
-      free(this.mem.dataTable) < this.defragThreshold ||
-      free(this.mem.arrayTable) < this.defragThreshold ||
-      free(this.mem.stringTable) < this.defragThreshold
+      frag(this.mem.dataTable) ||
+      frag(this.mem.arrayTable) ||
+      frag(this.mem.stringTable)
     );
   }
 
