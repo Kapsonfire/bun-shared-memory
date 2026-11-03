@@ -630,9 +630,9 @@ export class SharedMemory {
     }
 
     const bytes = this.encoder.encode(value);
-    const { offset, appended } = this.stringTable.alloc(bytes.byteLength);
+    const { offset, appended, size } = this.stringTable.alloc(bytes.byteLength);
     this.stringTable.writeBytes(offset, bytes);
-    if (appended) this.stringTable.advance(bytes.byteLength);
+    if (appended) this.stringTable.advance(size);
     const ref: StringRef = { offset, length: bytes.byteLength };
 
     // Insert into the cache, growing capacity up to `internMax` before evicting.
@@ -695,14 +695,17 @@ export class SharedMemory {
 
     const bytes = this.encoder.encode(value);
     const size = ARRAY_HEADER + bytes.byteLength;
-    const { offset, appended } = this.arrayTable.alloc(size);
+    const { offset, appended, size: reserved } = this.arrayTable.alloc(size);
     const objectId = this.nextObjectId++;
     this.arrayTable.setInt32(offset, objectId);
     this.arrayTable.writeBytes(offset + ARRAY_HEADER, bytes);
-    if (appended) this.arrayTable.advance(size);
+    if (appended) this.arrayTable.advance(reserved);
     // The first reference is the one being created now.
     this.stringValueRefCounts.set(offset, 1);
-    this.stringValueInternCache.set(value, { offset, length: bytes.byteLength });
+    this.stringValueInternCache.set(value, {
+      offset,
+      length: bytes.byteLength,
+    });
     this.stringValueRefToString.set(offset, value);
     return { offset, length: bytes.byteLength };
   }
@@ -776,7 +779,7 @@ export class SharedMemory {
     const count = slots.length;
     const cap = Math.max(capacity ?? 0, count, 1);
     const size = ARRAY_HEADER + cap * SLOT_SIZE;
-    const { offset, appended } = this.arrayTable.alloc(size);
+    const { offset, appended, size: reserved } = this.arrayTable.alloc(size);
     const objectId = this.nextObjectId++;
     this.arrayTable.setInt32(offset, objectId);
     for (let i = 0; i < count; i++) {
@@ -786,7 +789,7 @@ export class SharedMemory {
         slots[i]!,
       );
     }
-    if (appended) this.arrayTable.advance(size);
+    if (appended) this.arrayTable.advance(reserved);
     return { offset, count, capacity: cap };
   }
 
@@ -830,7 +833,11 @@ export class SharedMemory {
    */
   moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
     const size = ARRAY_HEADER + newCapacity * SLOT_SIZE;
-    const { offset: newOffset, appended } = this.arrayTable.alloc(size);
+    const {
+      offset: newOffset,
+      appended,
+      size: reserved,
+    } = this.arrayTable.alloc(size);
     const objectId = this.getArrayObjectId(ref.offset);
     this.arrayTable.setInt32(newOffset, objectId);
     for (let i = 0; i < ref.count; i++) {
@@ -840,7 +847,7 @@ export class SharedMemory {
         readSlot(this.arrayTable, ref.offset + ARRAY_HEADER + i * SLOT_SIZE),
       );
     }
-    if (appended) this.arrayTable.advance(size);
+    if (appended) this.arrayTable.advance(reserved);
     // The old block is no longer referenced; reuse it via the free list.
     this.freeArray(ref);
     return { offset: newOffset, count: ref.count, capacity: newCapacity };
@@ -893,9 +900,9 @@ export class SharedMemory {
 
   /** Store a single value slot in the DataTable and return its offset. */
   storeValueSlot(slot: ValueSlot): number {
-    const { offset, appended } = this.dataTable.alloc(SLOT_SIZE);
+    const { offset, appended, size } = this.dataTable.alloc(SLOT_SIZE);
     writeSlot(this.dataTable, offset, slot);
-    if (appended) this.dataTable.advance(SLOT_SIZE);
+    if (appended) this.dataTable.advance(size);
     return offset;
   }
 
@@ -918,7 +925,11 @@ export class SharedMemory {
   createObject(properties: Array<[string, ValueSlot]>): number {
     const blockSize =
       OBJECT_HEADER + properties.length * (NAME_REF_SIZE + SLOT_SIZE);
-    const { offset, appended } = this.dataTable.alloc(blockSize);
+    const {
+      offset,
+      appended,
+      size: reserved,
+    } = this.dataTable.alloc(blockSize);
 
     const objectId = this.nextObjectId++;
     this.dataTable.setInt32(offset, TYPE_OBJECT);
@@ -934,7 +945,7 @@ export class SharedMemory {
       writeSlot(this.dataTable, cursor, slot);
       cursor += SLOT_SIZE;
     }
-    if (appended) this.dataTable.advance(blockSize);
+    if (appended) this.dataTable.advance(reserved);
     return offset;
   }
 
@@ -1278,9 +1289,11 @@ export class SharedMemory {
       this.stringValueRefCounts.clear();
       for (const [k, v] of newRefCounts) this.stringValueRefCounts.set(k, v);
       this.stringValueRefToString.clear();
-      for (const [k, v] of newRefToString) this.stringValueRefToString.set(k, v);
+      for (const [k, v] of newRefToString)
+        this.stringValueRefToString.set(k, v);
       this.stringValueInternCache.clear();
-      for (const [k, v] of newInternCache) this.stringValueInternCache.set(k, v);
+      for (const [k, v] of newInternCache)
+        this.stringValueInternCache.set(k, v);
     }
 
     // Phase 4: Compact the StringTable.

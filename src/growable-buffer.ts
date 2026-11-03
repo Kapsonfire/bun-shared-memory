@@ -94,19 +94,12 @@ export function largestPowerOfTwo(n: number): number {
 }
 
 /**
- * Magic marker written into a freed block's bytes [4..7] to detect double
- * frees. A block whose marker is set is already on the free list; freeing it
- * again throws.
- */
-const FREE_MAGIC = 0x5a1b2c3d;
-
-/**
  * Minimum size of a slab-allocated block. The free-list metadata written by
- * `free` (next pointer + FREE_MAGIC + size = 12 bytes) must fit inside the
- * block, otherwise it would overwrite the following block. All blocks are
- * padded up to at least this size.
+ * `free` (next pointer + size = 8 bytes) must fit inside the block, otherwise
+ * it would overwrite the following block. All blocks are padded up to at
+ * least this size.
  */
-const MIN_BLOCK_SIZE = 12;
+const MIN_BLOCK_SIZE = 8;
 
 export { MIN_BLOCK_SIZE };
 
@@ -437,14 +430,15 @@ export class GrowableBuffer {
    * of at least `size` bytes is available (first-fit), otherwise appending at
    * the end of the buffer.
    *
-   * Returns the byte offset of the allocated block. The caller must write the
-   * block's data and then call `advance(size)` only when the block was
-   * appended (not reused), because a reused block is already counted as used.
+   * Returns the byte offset of the allocated block and the actual reserved
+   * (padded) size. The caller must write the block's data and then call
+   * `advance(reserved)` only when the block was appended (not reused), because
+   * a reused block is already counted as used.
    *
-   * @returns the offset, and whether the block was freshly appended (true) or
-   *          reused from the free list (false).
+   * @returns the offset, the reserved size, and whether the block was freshly
+   *          appended (true) or reused from the free list (false).
    */
-  alloc(size: number): { offset: number; appended: boolean } {
+  alloc(size: number): { offset: number; appended: boolean; size: number } {
     // Pad small blocks up to MIN_BLOCK_SIZE so the free-list metadata written
     // by `free` always fits inside the block and never overwrites a neighbour.
     size = Math.max(size, MIN_BLOCK_SIZE);
@@ -460,9 +454,7 @@ export class GrowableBuffer {
         } else {
           this.setInt32(prev, next);
         }
-        // Clear the freed marker so the block is no longer considered freed.
-        this.setInt32(cur + 4, 0);
-        return { offset: cur, appended: false };
+        return { offset: cur, appended: false, size };
       }
       prev = cur;
       cur = next;
@@ -470,7 +462,7 @@ export class GrowableBuffer {
     // No reusable block; append at the end.
     const offset = this.byteLength;
     this.ensureCapacity(offset + size);
-    return { offset, appended: true };
+    return { offset, appended: true, size };
   }
 
   /**
@@ -479,33 +471,37 @@ export class GrowableBuffer {
    * already on the free list throws an Error.
    *
    * The block's first 8 bytes are overwritten with the free-list metadata
-   * (next pointer + freed marker), so the caller must not read the block's
-   * data after freeing it.
+   * (next pointer + size), so the caller must not read the block's data after
+   * freeing it.
    */
   free(offset: number, size: number): void {
     // Pad to MIN_BLOCK_SIZE to match the size `alloc` actually reserved, so
     // `blockSize` reports the real block size for reuse decisions.
     size = Math.max(size, MIN_BLOCK_SIZE);
-    // Double-free detection: a freed block carries a magic marker in bytes
-    // [4..7]. If it is already set, the block is already on the free list.
-    if (this.getInt32(offset + 4) === FREE_MAGIC) {
-      throw new Error(
-        `Double free detected at offset ${offset} (size ${size})`,
-      );
+    // Double-free detection: a block already on the free list must not be
+    // freed again. Walk the list (free is not a hot path, so the O(n) scan is
+    // acceptable).
+    let cur = Atomics.load(this.freeListHead, 0);
+    while (cur !== -1) {
+      if (cur === offset) {
+        throw new Error(
+          `Double free detected at offset ${offset} (size ${size})`,
+        );
+      }
+      cur = this.getInt32(cur);
     }
     const head = Atomics.load(this.freeListHead, 0);
     this.setInt32(offset, head);
-    this.setInt32(offset + 4, FREE_MAGIC);
-    this.setInt32(offset + 8, size);
+    this.setInt32(offset + 4, size);
     Atomics.store(this.freeListHead, 0, offset);
   }
 
   /**
-   * Read the size of a freed block, stored in bytes [8..11] when it was
+   * Read the size of a freed block, stored in bytes [4..7] when it was
    * freed. Used by `alloc` to check whether a freed block is large enough.
    */
   private blockSize(offset: number): number {
-    return this.getInt32(offset + 8);
+    return this.getInt32(offset + 4);
   }
 
   /**
