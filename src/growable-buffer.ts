@@ -93,6 +93,16 @@ export function largestPowerOfTwo(n: number): number {
   return 2 ** Math.floor(Math.log2(n));
 }
 
+/**
+ * Minimum size of a slab-allocated block. The free-list metadata written by
+ * `free` (next pointer + size = 8 bytes) must fit inside the block, otherwise
+ * it would overwrite the following block. All blocks are padded up to at
+ * least this size.
+ */
+const MIN_BLOCK_SIZE = 8;
+
+export { MIN_BLOCK_SIZE };
+
 export class GrowableBuffer {
   private chunks: Chunk[] = [];
   private readonly maxByteLength: number;
@@ -109,6 +119,17 @@ export class GrowableBuffer {
    * existing data at offset 0.
    */
   private readonly cursor: BigInt64Array;
+  /**
+   * Shared head of the free list. Stored in a SharedArrayBuffer so all workers
+   * that reconstruct this buffer from `fromBuffers()` see the same free list
+   * and reuse freed blocks instead of appending at the end.
+   *
+   * The free list is a singly-linked list of freed blocks. Each freed block
+   * stores, in its first 4 bytes, the byte offset of the next free block (or
+   * -1 for the end of the list). The head is the offset of the first free
+   * block, or -1 when the list is empty.
+   */
+  private readonly freeListHead: Int32Array;
   /** Smallest chunk index that is not yet active (see `activate`). */
   private nextChunkToActivate = 0;
 
@@ -120,12 +141,20 @@ export class GrowableBuffer {
     singleBuffer = false,
     chargeInitial = true,
     cursorBuffer?: SharedArrayBuffer,
+    freeListBuffer?: SharedArrayBuffer,
   ) {
     this.singleBuffer = singleBuffer;
     this.budget = budget;
     this.cursor = new BigInt64Array(
       cursorBuffer ?? new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT),
     );
+    this.freeListHead = new Int32Array(
+      freeListBuffer ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+    );
+    // Initialize the free list head to -1 (empty) on first construction.
+    if (freeListBuffer === undefined) {
+      Atomics.store(this.freeListHead, 0, -1);
+    }
     if (singleBuffer && typeof initialSizeOrBuffer !== "number") {
       const buffer = Array.isArray(initialSizeOrBuffer)
         ? initialSizeOrBuffer[0]
@@ -285,6 +314,11 @@ export class GrowableBuffer {
     return this.cursor.buffer as SharedArrayBuffer;
   }
 
+  /** The shared free-list head buffer (for export to workers). */
+  get freeListBuffer(): SharedArrayBuffer {
+    return this.freeListHead.buffer as SharedArrayBuffer;
+  }
+
   /** Total logical capacity across all chunks (active or not). */
   get capacity(): number {
     return this.singleBuffer
@@ -392,6 +426,103 @@ export class GrowableBuffer {
   }
 
   /**
+   * Allocate `size` bytes, reusing a freed block from the free list when one
+   * of at least `size` bytes is available (first-fit), otherwise appending at
+   * the end of the buffer.
+   *
+   * Returns the byte offset of the allocated block and the actual reserved
+   * (padded) size. The caller must write the block's data and then call
+   * `advance(reserved)` only when the block was appended (not reused), because
+   * a reused block is already counted as used.
+   *
+   * @returns the offset, the reserved size, and whether the block was freshly
+   *          appended (true) or reused from the free list (false).
+   */
+  alloc(size: number): { offset: number; appended: boolean; size: number } {
+    // Pad small blocks up to MIN_BLOCK_SIZE so the free-list metadata written
+    // by `free` always fits inside the block and never overwrites a neighbour.
+    size = Math.max(size, MIN_BLOCK_SIZE);
+    // First-fit search over the free list for a block of at least `size`.
+    let prev = -1;
+    let cur = Atomics.load(this.freeListHead, 0);
+    while (cur !== -1) {
+      const next = this.getInt32(cur);
+      if (this.blockSize(cur) >= size) {
+        // Unlink `cur` from the free list.
+        if (prev === -1) {
+          Atomics.store(this.freeListHead, 0, next);
+        } else {
+          this.setInt32(prev, next);
+        }
+        return { offset: cur, appended: false, size };
+      }
+      prev = cur;
+      cur = next;
+    }
+    // No reusable block; append at the end.
+    const offset = this.byteLength;
+    this.ensureCapacity(offset + size);
+    return { offset, appended: true, size };
+  }
+
+  /**
+   * Free a block previously allocated with `alloc`, pushing it onto the free
+   * list so it can be reused. Detects double frees: freeing a block that is
+   * already on the free list throws an Error.
+   *
+   * The block's first 8 bytes are overwritten with the free-list metadata
+   * (next pointer + size), so the caller must not read the block's data after
+   * freeing it.
+   */
+  free(offset: number, size: number): void {
+    // Pad to MIN_BLOCK_SIZE to match the size `alloc` actually reserved, so
+    // `blockSize` reports the real block size for reuse decisions.
+    size = Math.max(size, MIN_BLOCK_SIZE);
+    // Double-free detection: a block already on the free list must not be
+    // freed again. Walk the list (free is not a hot path, so the O(n) scan is
+    // acceptable).
+    let cur = Atomics.load(this.freeListHead, 0);
+    while (cur !== -1) {
+      if (cur === offset) {
+        throw new Error(
+          `Double free detected at offset ${offset} (size ${size})`,
+        );
+      }
+      cur = this.getInt32(cur);
+    }
+    const head = Atomics.load(this.freeListHead, 0);
+    this.setInt32(offset, head);
+    this.setInt32(offset + 4, size);
+    Atomics.store(this.freeListHead, 0, offset);
+  }
+
+  /**
+   * Read the size of a freed block, stored in bytes [4..7] when it was
+   * freed. Used by `alloc` to check whether a freed block is large enough.
+   */
+  private blockSize(offset: number): number {
+    return this.getInt32(offset + 4);
+  }
+
+  /**
+   * Walk the free list and return the number of freed blocks and the total
+   * bytes they occupy. Used to measure fragmentation: many small freed blocks
+   * scattered through the buffer indicate high fragmentation, which a
+   * defragmentation pass can compact.
+   */
+  freeListStats(): { count: number; bytes: number } {
+    let count = 0;
+    let bytes = 0;
+    let cur = Atomics.load(this.freeListHead, 0);
+    while (cur !== -1) {
+      count++;
+      bytes += this.blockSize(cur);
+      cur = this.getInt32(cur);
+    }
+    return { count, bytes };
+  }
+
+  /**
    * Reset the used length to `n` bytes. Used by defragmentation after
    * compacting live data to the front of the buffer. Chunks beyond the
    * compacted region are marked inactive; their storage is reclaimed by
@@ -399,6 +530,9 @@ export class GrowableBuffer {
    */
   reset(n: number): void {
     Atomics.store(this.cursor, 0, BigInt(n));
+    // After compaction the free list's offsets are invalid (blocks moved), so
+    // clear it. Freed blocks are re-added lazily on the next `free`.
+    Atomics.store(this.freeListHead, 0, -1);
     if (this.singleBuffer) return;
     const neededChunks = Math.ceil(n / this.chunkSize);
     for (let i = 0; i < this.chunks.length; i++) {

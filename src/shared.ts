@@ -2,6 +2,8 @@ import {
   SharedMemory,
   TYPE_ARRAY_REF,
   TYPE_BIGINT_STR,
+  TYPE_STRING_REF,
+  TYPE_STRING_VALUE_REF,
   arrayRefSlot,
   bigintSlot,
   bigintStrSlot,
@@ -9,6 +11,7 @@ import {
   decodeSlot,
   numberSlot,
   stringRefSlot,
+  stringValueRefSlot,
   type ArrayRef,
   type ObjectLayout,
   type StringRef,
@@ -55,7 +58,7 @@ function encodeValue(
       }
       return bigintStrSlot(mem.storeString(value.toString()));
     case "string":
-      return stringRefSlot(mem.storeString(value));
+      return stringValueRefSlot(mem.storeStringValue(value));
     default:
       if (Array.isArray(value)) {
         for (const v of value) {
@@ -77,8 +80,10 @@ function encodeValue(
 /** Decode a ValueSlot into a JS value, reading strings/arrays from tables. */
 function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
   switch (slot.type) {
-    case 3: // string-ref
+    case TYPE_STRING_REF: // property-name/string-table ref
       return mem.readString({ offset: slot.a, length: slot.b });
+    case TYPE_STRING_VALUE_REF: // string value in the ArrayTable
+      return mem.readStringValue({ offset: slot.a, length: slot.b });
     case TYPE_BIGINT_STR: // bigint stored as decimal string
       return BigInt(mem.readString({ offset: slot.a, length: slot.b }));
     case 4: // array-ref
@@ -87,6 +92,29 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
         .map((s) => decodeValue(mem, s));
     default:
       return decodeSlot(slot);
+  }
+}
+
+/**
+ * Free the blocks referenced by a value slot (an array block or a string),
+ * so they can be reused by the slab allocator. Called before a slot is
+ * overwritten with a new value. No-op for primitive slots.
+ *
+ * String values are refcounted (see `releaseStringValue`); they are only
+ * freed when their refcount reaches zero.
+ */
+function freeSlotRefs(mem: SharedMemory, slot: ValueSlot): void {
+  switch (slot.type) {
+    case TYPE_STRING_VALUE_REF:
+      // String values live in the ArrayTable and are refcounted; free them
+      // when the last reference is released.
+      mem.releaseStringValue({ offset: slot.a, length: slot.b });
+      break;
+    case TYPE_ARRAY_REF:
+      mem.freeArray({ offset: slot.a, count: slot.b, capacity: slot.c });
+      break;
+    // TYPE_STRING_REF and TYPE_BIGINT_STR reference interned strings in the
+    // append-only StringTable; they are never freed.
   }
 }
 
@@ -361,6 +389,7 @@ function writeProp(
           `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
         );
       }
+      freeSlotRefs(mem, mem.readValueSlot(slotOffset));
       mem.updateValueSlot(slotOffset, encodeValue(mem, val));
       bump(mem, key);
       return;
@@ -384,6 +413,7 @@ function writeProp(
           `Index ${index} out of bounds for array of length ${ref.count}`,
         );
       }
+      freeSlotRefs(mem, mem.readArraySlot(ref, index));
       mem.updateArraySlot(ref, index, encodeValue(mem, val));
       bump(mem, key);
       return;
@@ -677,6 +707,8 @@ function writeValue(
               `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
             );
           }
+          // Free the old referenced blocks (array/string) before overwriting.
+          freeSlotRefs(mem, properties[i]![1]);
           mem.updateObjectSlot(
             existing,
             i,
@@ -696,6 +728,8 @@ function writeValue(
         return;
       }
       // Update a single value slot in place.
+      const oldSlot = mem.readValueSlot(existing);
+      freeSlotRefs(mem, oldSlot);
       mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
       bump(mem, key);
       return;
@@ -822,6 +856,8 @@ function mutateArrayRef(
     // Read the last element before decrementing.
     const lastSlot = mem.readArraySlot(ref, ref.count - 1);
     const result = decodeValue(mem, lastSlot);
+    // Free the removed element's referenced blocks (array/string).
+    freeSlotRefs(mem, lastSlot);
     const next = {
       offset: ref.offset,
       count: ref.count - 1,
@@ -962,6 +998,7 @@ function createArrayProxy(
                   `Index ${index} out of bounds for array of length ${ref.count}`,
                 );
               }
+              freeSlotRefs(mem, mem.readArraySlot(ref, index));
               mem.updateArraySlot(ref, index, encodeValue(mem, val));
               bump(mem, key);
               return true;

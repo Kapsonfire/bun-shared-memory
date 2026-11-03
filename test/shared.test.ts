@@ -246,8 +246,9 @@ describe("SharedMemory string interning", () => {
     const r2 = mem.storeString("hello");
     expect(r2.offset).toBe(r1.offset);
     expect(r2.length).toBe(r1.length);
-    // The StringTable must not grow on a cache hit.
-    expect(mem.stringTable.byteLength).toBe(r1.length);
+    // The StringTable must not grow on a cache hit. The block is padded up to
+    // MIN_BLOCK_SIZE (8 bytes) so the free-list metadata fits inside it.
+    expect(mem.stringTable.byteLength).toBe(8);
   });
 
   test("distinct strings get distinct refs", () => {
