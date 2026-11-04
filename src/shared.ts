@@ -225,6 +225,22 @@ function getOffset(mem: SharedMemory, key: string): number | null {
 }
 
 /**
+ * The per-key cache fields on a SharedRef proxy target that the write hot
+ * paths use to skip Map lookups and DataTable reads. `__offset`/`__type` are
+ * valid only while `__layoutVersion` matches the global layout version;
+ * `__arrayRef` additionally requires `__arrayRefLayoutVersion` to match (it is
+ * bumped on defragmentation and on array growth via `moveArray`).
+ */
+interface WriteTarget {
+  __offset?: number;
+  __layoutVersion: number;
+  __type?: number;
+  __arrayRef?: { offset: number; count: number; capacity: number } | undefined;
+  __arrayRefLayoutVersion: number;
+  __index?: number | undefined;
+}
+
+/**
  * Resolve a key's current DataTable offset, caching it across writes. The
  * cached offset is only reused when the global layout version is unchanged
  * (i.e. no defragmentation has moved the data since it was cached); otherwise
@@ -233,7 +249,7 @@ function getOffset(mem: SharedMemory, key: string): number | null {
 function getCachedOffset(
   mem: SharedMemory,
   key: string,
-  target?: { __offset?: number; __layoutVersion: number; __type?: number },
+  target?: WriteTarget,
 ): number | null {
   if (target !== undefined && target.__offset !== undefined) {
     if (target.__layoutVersion === mem.getLayoutVersion()) {
@@ -241,6 +257,7 @@ function getCachedOffset(
     }
     target.__offset = undefined;
     target.__type = undefined;
+    target.__arrayRef = undefined;
   }
   const cached = offsetCache.get(key);
   if (cached !== undefined) {
@@ -260,6 +277,7 @@ function getCachedOffset(
       target.__offset = offset;
       target.__layoutVersion = mem.getLayoutVersion();
       target.__type = undefined;
+      target.__arrayRef = undefined;
     }
   }
   return offset;
@@ -487,16 +505,19 @@ function writeProp(
   prop: string | symbol,
   val: unknown,
   arrayCapacity?: number,
+  target?: WriteTarget,
 ): void {
   // Inline writeLock to avoid a closure allocation on the hot path.
   mem.beginWrite();
   if (mem.isDefragmenting()) {
     mem.endWrite();
-    mem.withLock(() => writePropInner(mem, key, prop, val, arrayCapacity));
+    mem.withLock(() =>
+      writePropInner(mem, key, prop, val, arrayCapacity, target),
+    );
     return;
   }
   try {
-    writePropInner(mem, key, prop, val, arrayCapacity);
+    writePropInner(mem, key, prop, val, arrayCapacity, target);
   } finally {
     mem.endWrite();
   }
@@ -508,57 +529,82 @@ function writePropInner(
   prop: string | symbol,
   val: unknown,
   arrayCapacity?: number,
+  target?: WriteTarget,
 ): void {
-  // Object property: use the cached layout to write only that slot.
-  const layout = getObjectLayout(mem, key);
-  if (layout !== null) {
-    const slotOffset = layout.properties.get(prop as string);
-    if (slotOffset === undefined) {
-      throw new TypeError(
-        `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-      );
-    }
-    if (typeof val === "number") {
-      // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
-      // and no in-place string reuse; write the float64 directly.
-      mem.updateNumberSlot(slotOffset, val);
-      bump(mem, key);
-      return;
-    }
-    if (typeof val === "string") {
-      // Fast path: short strings are written inline into the slot itself.
-      if (mem.updateInlineStringSlot(slotOffset, val)) {
-        bump(mem, key);
+  // If the slot type is already cached on the target, we can skip the
+  // getObjectLayout Map lookup for top-level arrays (which are never objects).
+  const knownType = target?.__type;
+  if (knownType !== TYPE_ARRAY_REF) {
+    // Object property: use the cached layout to write only that slot.
+    const layout = getObjectLayout(mem, key);
+    if (layout !== null) {
+      const slotOffset = layout.properties.get(prop as string);
+      if (slotOffset === undefined) {
+        throw new TypeError(
+          `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+        );
+      }
+      if (typeof val === "number") {
+        // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
+        // and no in-place string reuse; write the float64 directly.
+        mem.updateNumberSlot(slotOffset, val);
+        bumpTarget(mem, key, target);
         return;
       }
+      if (typeof val === "string") {
+        // Fast path: short strings are written inline into the slot itself.
+        if (mem.updateInlineStringSlot(slotOffset, val)) {
+          bumpTarget(mem, key, target);
+          return;
+        }
+      }
+      const oldSlot = mem.readValueSlot(slotOffset);
+      freeSlotRefs(mem, oldSlot);
+      mem.updateValueSlot(
+        slotOffset,
+        encodeValue(mem, val, arrayCapacity, oldSlot),
+      );
+      bumpTarget(mem, key, target);
+      return;
     }
-    const oldSlot = mem.readValueSlot(slotOffset);
-    freeSlotRefs(mem, oldSlot);
-    mem.updateValueSlot(
-      slotOffset,
-      encodeValue(mem, val, arrayCapacity, oldSlot),
-    );
-    bump(mem, key);
-    return;
   }
 
   // Top-level array index write: update only that array slot.
-  const offset = getCachedOffset(mem, key);
+  const offset = getCachedOffset(mem, key, target);
   if (offset === null) {
     throw new Error(`No shared value found for key "${key}"`);
   }
-  const slotType = mem.dataTable.getInt32(offset);
+  const slotType =
+    target !== undefined && target.__type !== undefined
+      ? target.__type
+      : mem.dataTable.getInt32(offset);
+  if (target !== undefined && target.__type === undefined) {
+    target.__type = slotType;
+  }
   if (
     slotType === TYPE_ARRAY_REF &&
     typeof prop === "string" &&
     /^\d+$/.test(prop)
   ) {
     const index = Number(prop);
-    const ref = {
-      offset: mem.dataTable.getInt32(offset + 4),
-      count: mem.dataTable.getInt32(offset + 8),
-      capacity: mem.dataTable.getInt32(offset + 12),
-    };
+    // Use the cached ArrayRef when it is still valid (same layout version,
+    // i.e. no defragmentation or array growth has moved it). Otherwise
+    // re-read the 3 header Int32s and refresh the cache.
+    let ref = target?.__arrayRef;
+    if (
+      ref === undefined ||
+      target!.__arrayRefLayoutVersion !== mem.getLayoutVersion()
+    ) {
+      ref = {
+        offset: mem.dataTable.getInt32(offset + 4),
+        count: mem.dataTable.getInt32(offset + 8),
+        capacity: mem.dataTable.getInt32(offset + 12),
+      };
+      if (target !== undefined) {
+        target.__arrayRef = ref;
+        target.__arrayRefLayoutVersion = mem.getLayoutVersion();
+      }
+    }
     if (index >= ref.count) {
       throw new RangeError(
         `Index ${index} out of bounds for array of length ${ref.count}`,
@@ -567,19 +613,25 @@ function writePropInner(
     if (typeof val === "number") {
       // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op).
       mem.updateArrayNumberSlot(ref, index, val);
-      bump(mem, key);
+      bumpTarget(mem, key, target);
+      return;
+    }
+    if (typeof val === "boolean") {
+      // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op).
+      mem.updateArrayBooleanSlot(ref, index, val);
+      bumpTarget(mem, key, target);
       return;
     }
     if (typeof val === "string") {
       // Fast path: short strings are written inline into the array slot.
       if (mem.updateArrayInlineStringSlot(ref, index, val)) {
-        bump(mem, key);
+        bumpTarget(mem, key, target);
         return;
       }
     }
     freeSlotRefs(mem, mem.readArraySlot(ref, index));
     mem.updateArraySlot(ref, index, encodeValue(mem, val));
-    bump(mem, key);
+    bumpTarget(mem, key, target);
     return;
   }
 
@@ -603,7 +655,7 @@ function writePropInner(
           capacity: ref.capacity,
         }),
       );
-      bump(mem, key);
+      bumpTarget(mem, key, target);
       return;
     }
   }
@@ -650,6 +702,17 @@ function createSharedRef<T>(
     // Cached slot type for this key, so the write hot path can skip the
     // DataTable type read when the value's type is known to be stable.
     __type: undefined as number | undefined,
+    // Cached ArrayRef for a top-level array value, so the write hot path can
+    // skip re-reading the 3 header Int32s on every index write. Valid only
+    // while the global layout version is unchanged (no defragmentation) and
+    // while the array has not grown past the cached count (checked by the
+    // caller via `index < ref.count`).
+    __arrayRef: undefined as
+      { offset: number; count: number; capacity: number } | undefined,
+    __arrayRefLayoutVersion: -1,
+    // Cached version-cell index for this key, so the write hot path can bump
+    // the version cell without a Map lookup. Stable for the key's lifetime.
+    __index: undefined as number | undefined,
     read: () => {
       const value = copyValue(readValue(mem, key, target)) as T;
       if (tracker && isTrackable(value)) {
@@ -767,7 +830,7 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          writeProp(mem, key, name, v, arrayCapacity);
+          writeProp(mem, key, name, v, arrayCapacity, target);
         },
       });
     }
@@ -801,7 +864,7 @@ function createSharedRef<T>(
     },
     set(t, prop, val) {
       t.__cache = undefined;
-      writeProp(mem, key, prop, val, arrayCapacity);
+      writeProp(mem, key, prop, val, arrayCapacity, t);
       return true;
     },
     deleteProperty() {
@@ -881,7 +944,7 @@ function writeValue(
   key: string,
   value: unknown,
   arrayCapacity?: number,
-  target?: { __offset?: number; __layoutVersion: number; __type?: number },
+  target?: WriteTarget,
 ): void {
   // Inline writeLock to avoid a closure allocation on the hot path.
   mem.beginWrite();
@@ -902,7 +965,7 @@ function writeValueInner(
   key: string,
   value: unknown,
   arrayCapacity?: number,
-  target?: { __offset?: number; __layoutVersion: number; __type?: number },
+  target?: WriteTarget,
 ): void {
   const existing = getCachedOffset(mem, key, target);
   if (existing !== null) {
@@ -942,7 +1005,7 @@ function writeValueInner(
           );
         }
       }
-      bump(mem, key);
+      bumpTarget(mem, key, target);
       return;
     }
     // Update a single value slot in place.
@@ -950,7 +1013,7 @@ function writeValueInner(
       // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
       // and no in-place string reuse; write the float64 directly.
       mem.updateNumberSlot(existing, value);
-      bump(mem, key);
+      bumpTarget(mem, key, target);
       return;
     }
     const isPrimitive = typeof value === "boolean" || typeof value === "bigint";
@@ -962,7 +1025,7 @@ function writeValueInner(
       } else {
         mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
       }
-      bump(mem, key);
+      bumpTarget(mem, key, target);
       return;
     }
     if (typeof value === "string") {
@@ -971,7 +1034,7 @@ function writeValueInner(
       // read the old string ref directly (no ValueSlot object allocation) so
       // storeStringValue can reuse the block in place.
       if (mem.updateInlineStringSlot(existing, value)) {
-        bump(mem, key);
+        bumpTarget(mem, key, target);
         return;
       }
       const oldType = mem.dataTable.getInt32(existing);
@@ -984,7 +1047,7 @@ function writeValueInner(
           : undefined,
       );
       mem.updateValueSlot(existing, stringValueRefSlot(ref));
-      bump(mem, key);
+      bumpTarget(mem, key, target);
       return;
     }
     const oldSlot = mem.readValueSlot(existing);
@@ -993,7 +1056,7 @@ function writeValueInner(
       existing,
       encodeValue(mem, value, arrayCapacity, oldSlot),
     );
-    bump(mem, key);
+    bumpTarget(mem, key, target);
     return;
   }
 
@@ -1011,6 +1074,7 @@ function writeValueInner(
       target.__offset = offset;
       target.__layoutVersion = lv;
       target.__type = undefined;
+      target.__arrayRef = undefined;
     }
     return;
   }
@@ -1024,12 +1088,32 @@ function writeValueInner(
     target.__offset = offset;
     target.__layoutVersion = lv;
     target.__type = undefined;
+    target.__arrayRef = undefined;
   }
 }
 
 /** Bump the version cell for a key, invalidating read caches. */
 function bump(mem: SharedMemory, key: string): void {
   mem.bumpVersion(getIndex(mem, key));
+}
+
+/**
+ * Bump the version cell for a key using the target's cached index, avoiding
+ * the `getIndex` Map lookup on the write hot path. Falls back to `bump` when
+ * the index is not yet cached.
+ */
+function bumpTarget(
+  mem: SharedMemory,
+  key: string,
+  target?: WriteTarget,
+): void {
+  if (target !== undefined && target.__index !== undefined) {
+    mem.bumpVersion(target.__index);
+    return;
+  }
+  const index = getIndex(mem, key);
+  if (target !== undefined) target.__index = index;
+  mem.bumpVersion(index);
 }
 
 /** Atomically update the value for a key. */

@@ -800,6 +800,19 @@ export class SharedMemory {
   }
 
   /**
+   * Fast-path: write a boolean into an array slot directly, avoiding the
+   * ValueSlot object allocation and the 4 separate Int32 writes.
+   */
+  updateArrayBooleanSlot(ref: ArrayRef, index: number, value: boolean): void {
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    buf.setInt32(off, TYPE_BOOLEAN);
+    buf.setInt32(off + 4, value ? 1 : 0);
+    buf.setInt32(off + 8, 0);
+    buf.setInt32(off + 12, 0);
+  }
+
+  /**
    * Fast-path: write a short string inline into an array slot (up to 11
    * UTF-8 bytes), avoiding a heap allocation and the string-table write.
    * Returns true if the string fit inline; false if it must go to the heap.
@@ -861,6 +874,11 @@ export class SharedMemory {
     }
     // The old block is no longer referenced; it is reclaimed by defrag.
     this.freeArray(ref);
+    // The array moved to a new offset, so any cached ArrayRef (e.g. the
+    // per-target `__arrayRef` on the write hot path) is now stale. Bump the
+    // global layout version so those caches are invalidated, exactly as a
+    // defragmentation pass does.
+    this.bumpLayoutVersion();
     return { offset: newOffset, count: ref.count, capacity: newCapacity };
   }
 
