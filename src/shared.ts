@@ -494,6 +494,49 @@ function readObjectProp(
 }
 
 /**
+ * Write a single object-property slot whose offset is already resolved
+ * (cached by the caller, e.g. the accessor setter). Avoids the
+ * `getObjectLayout` Map lookup + `properties.get` per write on the hot path.
+ */
+function writeObjectSlot(
+  mem: SharedMemory,
+  key: string,
+  slotOffset: number,
+  val: unknown,
+  arrayCapacity?: number,
+  target?: WriteTarget,
+): void {
+  if (typeof val === "number") {
+    // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
+    // and no in-place string reuse; write the float64 directly.
+    mem.updateNumberSlot(slotOffset, val);
+    bumpTarget(mem, key, target);
+    return;
+  }
+  if (typeof val === "boolean") {
+    // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op)
+    // and no in-place string reuse; write the 4 Int32s directly.
+    mem.updateBooleanSlot(slotOffset, val);
+    bumpTarget(mem, key, target);
+    return;
+  }
+  if (typeof val === "string") {
+    // Fast path: short strings are written inline into the slot itself.
+    if (mem.updateInlineStringSlot(slotOffset, val)) {
+      bumpTarget(mem, key, target);
+      return;
+    }
+  }
+  const oldSlot = mem.readValueSlot(slotOffset);
+  freeSlotRefs(mem, oldSlot);
+  mem.updateValueSlot(
+    slotOffset,
+    encodeValue(mem, val, arrayCapacity, oldSlot),
+  );
+  bumpTarget(mem, key, target);
+}
+
+/**
  * Write a single property of a shared object value in place.
  *
  * Shared by the proxy `set` handler and the generated accessor setters. Uses
@@ -544,27 +587,7 @@ function writePropInner(
           `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
         );
       }
-      if (typeof val === "number") {
-        // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
-        // and no in-place string reuse; write the float64 directly.
-        mem.updateNumberSlot(slotOffset, val);
-        bumpTarget(mem, key, target);
-        return;
-      }
-      if (typeof val === "string") {
-        // Fast path: short strings are written inline into the slot itself.
-        if (mem.updateInlineStringSlot(slotOffset, val)) {
-          bumpTarget(mem, key, target);
-          return;
-        }
-      }
-      const oldSlot = mem.readValueSlot(slotOffset);
-      freeSlotRefs(mem, oldSlot);
-      mem.updateValueSlot(
-        slotOffset,
-        encodeValue(mem, val, arrayCapacity, oldSlot),
-      );
-      bumpTarget(mem, key, target);
+      writeObjectSlot(mem, key, slotOffset, val, arrayCapacity, target);
       return;
     }
   }
@@ -811,6 +834,12 @@ function createSharedRef<T>(
       // recreate the array proxy on every access. The proxy reads fresh data
       // on each access, so it stays correct without being recreated.
       let arrayProxy: unknown[] | undefined;
+      // Cached object slot offset for this property so writes skip the
+      // getObjectLayout Map lookup + properties.get on the hot path.
+      // Invalidated when the layout version changes (defragmentation moves
+      // the object block).
+      let slotOffset: number | undefined;
+      let slotLayoutVersion = -1;
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
@@ -845,7 +874,45 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          writeProp(mem, key, name, v, arrayCapacity, target);
+          mem.beginWrite();
+          if (mem.isDefragmenting()) {
+            // A defrag pass may move the object block: drop the cached slot
+            // offset so it is re-resolved, and run the write under the mutex.
+            mem.endWrite();
+            slotOffset = undefined;
+            slotLayoutVersion = -1;
+            mem.withLock(() =>
+              writePropInner(mem, key, name, v, arrayCapacity, target),
+            );
+            return;
+          }
+          try {
+            // Write directly to the cached slot offset when still valid,
+            // skipping the getObjectLayout Map lookup + properties.get.
+            if (slotLayoutVersion !== mem.getLayoutVersion()) {
+              slotOffset = undefined;
+              slotLayoutVersion = mem.getLayoutVersion();
+            }
+            if (slotOffset === undefined) {
+              const layout = getObjectLayout(mem, key);
+              if (layout === null) {
+                // Not an object (shouldn't happen for an object accessor).
+                throw new TypeError(
+                  `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+                );
+              }
+              const so = layout.properties.get(name);
+              if (so === undefined) {
+                throw new TypeError(
+                  `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+                );
+              }
+              slotOffset = so;
+            }
+            writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
+          } finally {
+            mem.endWrite();
+          }
         },
       });
     }
