@@ -806,6 +806,11 @@ function createSharedRef<T>(
         version: -1,
         value: undefined,
       };
+      // Stable array proxy for this property, cached across writes. A write
+      // bumps the version and invalidates `fieldCache`, which would otherwise
+      // recreate the array proxy on every access. The proxy reads fresh data
+      // on each access, so it stays correct without being recreated.
+      let arrayProxy: unknown[] | undefined;
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
@@ -819,7 +824,13 @@ function createSharedRef<T>(
           if (fieldCache.version === version) {
             return fieldCache.value;
           }
-          return readObjectProp(
+          // If this property is an array, return the stable cached proxy
+          // (which reads fresh data on each access) instead of recreating it
+          // on every write.
+          if (arrayProxy !== undefined) {
+            return arrayProxy;
+          }
+          const value = readObjectProp(
             mem,
             key,
             name,
@@ -827,6 +838,10 @@ function createSharedRef<T>(
             version,
             arrayCapacity,
           );
+          if (Array.isArray(value)) {
+            arrayProxy = value;
+          }
+          return value;
         },
         set(v: unknown) {
           target.__cache = undefined;
@@ -1278,6 +1293,14 @@ function createArrayProxy(
   prop: string,
   arrayCapacity?: number,
 ): unknown[] {
+  // Cache the object's property slot offset and the array ref so index writes
+  // skip the per-write getObjectLayout Map lookup, properties.get, and the
+  // DataTable header reads. Invalidated when the layout version changes
+  // (defragmentation or array growth via moveArray).
+  let cachedSlotOffset: number | undefined;
+  let cachedRef:
+    { offset: number; count: number; capacity: number } | undefined;
+  let cachedLayoutVersion = -1;
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
       // push/pop on an array property: operate directly on the array ref
@@ -1336,59 +1359,115 @@ function createArrayProxy(
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole object.
       return writeLock(mem, () => {
-        const layout = getObjectLayout(mem, key);
-        if (layout !== null) {
-          const slotOffset = layout.properties.get(prop);
-          if (slotOffset !== undefined) {
-            const propSlot = mem.readValueSlot(slotOffset);
-            if (
-              propSlot.type === TYPE_ARRAY_REF &&
-              typeof arrProp === "string" &&
-              /^\d+$/.test(arrProp)
-            ) {
-              const index = Number(arrProp);
-              const ref = {
-                offset: propSlot.a,
-                count: propSlot.b,
-                capacity: propSlot.c,
-              };
-              if (index >= ref.count) {
-                throw new RangeError(
-                  `Index ${index} out of bounds for array of length ${ref.count}`,
-                );
-              }
-              freeSlotRefs(mem, mem.readArraySlot(ref, index));
-              mem.updateArraySlot(ref, index, encodeValue(mem, val));
+        // Refresh the cached slot offset when the layout version changed
+        // (defragmentation may have moved the object block).
+        if (cachedLayoutVersion !== mem.getLayoutVersion()) {
+          cachedSlotOffset = undefined;
+          cachedRef = undefined;
+          cachedLayoutVersion = mem.getLayoutVersion();
+        }
+        if (cachedSlotOffset === undefined) {
+          const layout = getObjectLayout(mem, key);
+          if (layout === null) {
+            // Fallback: full read-modify-write.
+            return mutateValue<Record<string, unknown>, boolean>(
+              mem,
+              key,
+              (fresh) => {
+                const arr = fresh[prop] as unknown[];
+                (arr as unknown as Record<string | symbol, unknown>)[arrProp] =
+                  val;
+                return true;
+              },
+              arrayCapacity,
+            );
+          }
+          const so = layout.properties.get(prop);
+          if (so === undefined) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          cachedSlotOffset = so;
+        }
+        const propSlot = mem.readValueSlot(cachedSlotOffset);
+        if (
+          propSlot.type === TYPE_ARRAY_REF &&
+          typeof arrProp === "string" &&
+          /^\d+$/.test(arrProp)
+        ) {
+          const index = Number(arrProp);
+          // Use the cached ref when valid; re-read when the array may have
+          // grown past the cached count (push) or the layout changed.
+          let ref = cachedRef;
+          if (
+            ref === undefined ||
+            index >= ref.count ||
+            cachedLayoutVersion !== mem.getLayoutVersion()
+          ) {
+            ref = {
+              offset: propSlot.a,
+              count: propSlot.b,
+              capacity: propSlot.c,
+            };
+            cachedRef = ref;
+          }
+          if (index >= ref.count) {
+            throw new RangeError(
+              `Index ${index} out of bounds for array of length ${ref.count}`,
+            );
+          }
+          if (typeof val === "number") {
+            // Fast path: numbers need no old-slot read (freeSlotRefs is a
+            // no-op) and no in-place string reuse.
+            mem.updateArrayNumberSlot(ref, index, val);
+            bump(mem, key);
+            return true;
+          }
+          if (typeof val === "boolean") {
+            // Fast path: booleans need no old-slot read (freeSlotRefs is a
+            // no-op).
+            mem.updateArrayBooleanSlot(ref, index, val);
+            bump(mem, key);
+            return true;
+          }
+          if (typeof val === "string") {
+            // Fast path: short strings are written inline into the slot.
+            if (mem.updateArrayInlineStringSlot(ref, index, val)) {
               bump(mem, key);
               return true;
             }
-            // Array property length write: shrink/grow in place without
-            // re-encoding the whole object (which would leave a dead slot).
-            if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
-              const newLen = Number(val);
-              if (!Number.isInteger(newLen) || newLen < 0) {
-                throw new RangeError("Invalid array length");
-              }
-              const ref = {
-                offset: propSlot.a,
-                count: propSlot.b,
-                capacity: propSlot.c,
-              };
-              if (newLen <= ref.capacity) {
-                mem.updateValueSlot(
-                  slotOffset,
-                  arrayRefSlot({
-                    offset: ref.offset,
-                    count: newLen,
-                    capacity: ref.capacity,
-                  }),
-                );
-                bump(mem, key);
-                return true;
-              }
-              // Growing beyond capacity falls through to the full read-modify-write.
-            }
           }
+          freeSlotRefs(mem, mem.readArraySlot(ref, index));
+          mem.updateArraySlot(ref, index, encodeValue(mem, val));
+          bump(mem, key);
+          return true;
+        }
+        // Array property length write: shrink/grow in place without
+        // re-encoding the whole object (which would leave a dead slot).
+        if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
+          const newLen = Number(val);
+          if (!Number.isInteger(newLen) || newLen < 0) {
+            throw new RangeError("Invalid array length");
+          }
+          const ref = {
+            offset: propSlot.a,
+            count: propSlot.b,
+            capacity: propSlot.c,
+          };
+          if (newLen <= ref.capacity) {
+            mem.updateValueSlot(
+              cachedSlotOffset,
+              arrayRefSlot({
+                offset: ref.offset,
+                count: newLen,
+                capacity: ref.capacity,
+              }),
+            );
+            bump(mem, key);
+            return true;
+          }
+          // Growing beyond capacity falls through to the full read-modify-write.
         }
         // Fallback: full read-modify-write.
         return mutateValue<Record<string, unknown>, boolean>(
