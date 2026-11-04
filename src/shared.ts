@@ -367,6 +367,44 @@ function readProp(
 }
 
 /**
+ * Read a single object property for the per-property accessor cache, decoding
+ * only the requested slot (not the whole object) and caching the decoded value
+ * in `fieldCache` under the observed version. Array properties are cached as
+ * an array proxy so subsequent reads hit the fast path.
+ *
+ * This is the miss path for the object accessor getters; the hit path returns
+ * `fieldCache.value` directly.
+ */
+function readObjectProp(
+  mem: SharedMemory,
+  key: string,
+  prop: string,
+  fieldCache: { version: number; value: unknown },
+  version: number,
+  arrayCapacity?: number,
+): unknown {
+  const layout = getObjectLayout(mem, key);
+  if (layout === null) {
+    // Not an object (shouldn't happen for an object accessor); fall back.
+    return readProp(mem, key, prop, arrayCapacity);
+  }
+  const slotOffset = layout.properties.get(prop);
+  if (slotOffset === undefined) {
+    throw new TypeError(
+      `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+    );
+  }
+  const slot = mem.readValueSlot(slotOffset);
+  let value = decodeValue(mem, slot);
+  if (Array.isArray(value)) {
+    value = createArrayProxy(mem, key, prop, arrayCapacity);
+  }
+  fieldCache.version = version;
+  fieldCache.value = value;
+  return value;
+}
+
+/**
  * Write a single property of a shared object value in place.
  *
  * Shared by the proxy `set` handler and the generated accessor setters. Uses
@@ -551,29 +589,43 @@ function createSharedRef<T>(
       },
     });
     const ref = Object.create(proto) as Record<string | symbol, unknown>;
+    // Resolve the object's stable version-cell index lazily (the value may not
+    // be written to shared memory until after this accessor is built) and cache
+    // it so the hot getter can load the version cell directly without a Map
+    // lookup or an index→cell computation on every read. The cell index is
+    // stable for the key's lifetime (the Index Table is never reordered).
+    let cellIndex: number | null = null;
     for (const name of propNames) {
+      // Per-property cache slot bound to this getter closure (mirrors
+      // cofusion's per-field `desc.cachedVer`/`desc.cachedVal`). On a cache
+      // hit the getter returns the already-decoded value directly, avoiding
+      // the `readCache` Map hash lookup and the whole-object `v[name]`
+      // extraction on the hot path.
+      const fieldCache: { version: number; value: unknown } = {
+        version: -1,
+        value: undefined,
+      };
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
         get() {
           // Lock-free fast path inlined so the JIT can optimize the hot
           // cache-hit read without a function-call chain.
-          const cached = readCache.get(key);
-          if (
-            cached !== undefined &&
-            cached.version === mem.getVersion(cached.index)
-          ) {
-            const v = cached.value;
-            if (Array.isArray(v)) {
-              return getTopLevelArrayMember(mem, key, v, name, arrayCapacity);
-            }
-            const pv = (v as Record<string | symbol, unknown>)[name];
-            if (Array.isArray(pv)) {
-              return createArrayProxy(mem, key, name, arrayCapacity);
-            }
-            return pv;
+          if (cellIndex === null) {
+            cellIndex = mem.getVersionCellIndex(getIndex(mem, key));
           }
-          return readProp(mem, key, name, arrayCapacity);
+          const version = Atomics.load(mem.versionView, cellIndex);
+          if (fieldCache.version === version) {
+            return fieldCache.value;
+          }
+          return readObjectProp(
+            mem,
+            key,
+            name,
+            fieldCache,
+            version,
+            arrayCapacity,
+          );
         },
         set(v: unknown) {
           target.__cache = undefined;

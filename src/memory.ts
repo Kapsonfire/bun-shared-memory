@@ -292,7 +292,7 @@ export class SharedMemory {
    * on growth. The version is incremented on every write so workers can
    * invalidate their read caches cross-worker.
    */
-  private versionView: Int32Array;
+  versionView: Int32Array;
   /**
    * Global layout version cell. Bumped by the main thread after a
    * defragmentation pass so workers can invalidate cached offsets (indexCache,
@@ -1083,6 +1083,15 @@ export class SharedMemory {
       }
     }
     return null;
+  }
+
+  /**
+   * Int32Array index of a key's version cell within the Index Table buffer.
+   * Stable for the lifetime of the key (the Index Table is never reordered or
+   * replaced), so callers may cache it and load the version directly.
+   */
+  getVersionCellIndex(index: number): number {
+    return versionCellIndex(index);
   }
 
   /** Read the current version for a key index (lock-free). */
