@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-04
+
+### Performance
+
+- Inline the read-cache fast path in `readProp`/`readValue` instead of calling
+  `readCachedValue`, which returned a polymorphic `{hit,value}` union and
+  allocated an object on every cache hit. Keeping the read path monomorphic
+  lets the JIT optimize it: number reads dropped from ~12× to ~6× slower than
+  native, boolean reads from ~8.4× to ~5.5×, and all array index reads
+  improved (array-read summary ~9.7× → ~8.7×).
+- Add `updateBigIntSlot`/`updateArrayBigIntSlot` fast paths that write int64
+  bigints directly into the slot, avoiding the `ValueSlot` object allocation
+  of the generic encode path. `bigint[]` index writes dropped from ~24.8× to
+  ~18× slower than native.
+- Extract the array-proxy set handler body into a named `writeArrayProp`
+  function and inline the `writeLock`, so no closure is allocated per write.
+- Cache the key's version-cell index in the array proxy so writes bump the
+  version without a per-write Map lookup. Object array-prop index writes
+  dropped from ~33.9× to ~29× slower than native.
+- Real-world benchmark: the shared-memory "get user" endpoint improved from
+  ~4.18M to ~5.79M req/s (+39%), widening the gap over the comparison
+  backends (sqlite 6.2×→8.5×, redis 218×→302×, mysql 233×→322× slower than
+  shared memory).
+
 ## [0.2.0] - 2026-11-04
 
 ### Added
