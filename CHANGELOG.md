@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache the key's version-cell index in the array proxy so writes bump the
   version without a per-write Map lookup. Object array-prop index writes
   dropped from ~33.9× to ~29× slower than native.
+- Real-world benchmark: the shared-memory "get user" endpoint improved from
+  ~4.18M to ~5.79M req/s (+39%), widening the gap over the comparison
+  backends (sqlite 6.2×→8.5×, redis 218×→302×, mysql 233×→322× slower than
+  shared memory).
 
 ## [0.2.0] - 2026-11-04
 
