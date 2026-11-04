@@ -5,6 +5,67 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-04
+
+### Added
+
+- Slab allocator for string values and arrays. Overwriting a value no longer
+  leaves the old block as dead space: freed blocks are pushed onto a shared
+  free list (one per table, in a `SharedArrayBuffer`) and reused by later
+  allocations, so the tables grow far less over time and defragmentation runs
+  less often. The free list is shared across workers via
+  `exportBuffers()`/`fromBuffers()`.
+- Inline short strings. Strings up to 11 UTF-8 bytes are packed directly into
+  the 16-byte value slot (type + length in the top 4 bits of `c`, bytes in
+  `a`/`b`/`c`), avoiding a heap allocation and the string-table write on every
+  write. Longer strings still use the slab-allocated ArrayTable with in-place
+  reuse.
+- A complete multi-worker todo-list example (`examples/todo-list/`) that
+  serves both the frontend and the API on a single port via Elysia workers.
+
+### Performance
+
+- Cache each object property getter's stable version-cell index (resolved
+  lazily on first read) and load the version directly via
+  `Atomics.load(mem.versionView, cellIndex)`, replacing the per-read
+  `index === null` check and the `getVersion` → `versionCellIndex` multiply +
+  divide. Object property reads improved a further 3–17%.
+- Cache the top-level array ref and version-cell index on the `SharedRef`
+  target so index writes skip the per-write DataTable header reads, Map
+  lookups, and the generic encode path. `moveArray` now bumps the layout
+  version so the cached ref is invalidated on array growth. Closes the
+  remaining array-write gap: number[]/boolean[]/string[] index writes are now
+  at or above native speed.
+- Cache the array proxy for an object's array property on the accessor getter
+  so it isn't recreated on every write (a write bumps the version and
+  invalidates the field cache), and cache the property slot offset + array ref
+  in the array proxy so index writes skip the per-write `getObjectLayout` Map
+  lookup, `properties.get`, and DataTable header reads. Object array-prop
+  index writes dropped from ~254× to ~33× slower than native.
+
+### Changed
+
+- Raise the defragmentation trigger: a table now triggers a defrag pass when
+  its used length exceeds 80% of capacity (was: when free space fell below
+  10%), and only when at least 64 blocks have been freed. Because writes are
+  lock-free bump allocations, the used length grows monotonically even when
+  the live data set stays the same size; the new threshold defragments only
+  when the buffer is genuinely fragmented. During a defrag pass, lock-free
+  writes fall back to the mutex and in-flight writes are awaited before
+  compacting.
+
+### Fixed
+
+- Fix slab-allocator block corruption in `free()`. `alloc()` padded blocks to
+  `MIN_BLOCK_SIZE` internally but callers advanced the cursor by the unpadded
+  size, so blocks overlapped and `free()`'s metadata overwrote the neighbour
+  block. `alloc()` now returns the actual reserved (padded) size and all
+  callers advance by it. Free-list metadata was also reduced from 12 to 8
+  bytes (next pointer + size) and the magic marker dropped (double-frees are
+  now detected by walking the free list), lowering `MIN_BLOCK_SIZE` from 12 to
+  8 so small string blocks no longer inflate the ArrayTable during
+  defragmentation.
+
 ## [0.1.8] - 2026-11-02
 
 ### Fixed
@@ -185,6 +246,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[0.2.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.5...v0.1.6
