@@ -813,6 +813,20 @@ export class SharedMemory {
   }
 
   /**
+   * Fast-path: write an int64 bigint into an array slot directly, avoiding
+   * the ValueSlot object allocation and the 4 separate Int32 writes.
+   */
+  updateArrayBigIntSlot(ref: ArrayRef, index: number, value: bigint): void {
+    slotView.setBigInt64(0, value, true);
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    buf.setInt32(off, TYPE_BIGINT);
+    buf.setInt32(off + 4, slotView.getInt32(0, true));
+    buf.setInt32(off + 8, slotView.getInt32(4, true));
+    buf.setInt32(off + 12, 0);
+  }
+
+  /**
    * Fast-path: write a short string inline into an array slot (up to 11
    * UTF-8 bytes), avoiding a heap allocation and the string-table write.
    * Returns true if the string fit inline; false if it must go to the heap.
@@ -967,6 +981,19 @@ export class SharedMemory {
     buf.setInt32(offset, TYPE_BOOLEAN);
     buf.setInt32(offset + 4, value ? 1 : 0);
     buf.setInt32(offset + 8, 0);
+    buf.setInt32(offset + 12, 0);
+  }
+
+  /**
+   * Fast-path: write an int64 bigint slot directly into the DataTable,
+   * avoiding the ValueSlot object allocation of the generic path.
+   */
+  updateBigIntSlot(offset: number, value: bigint): void {
+    slotView.setBigInt64(0, value, true);
+    const buf = this.dataTable;
+    buf.setInt32(offset, TYPE_BIGINT);
+    buf.setInt32(offset + 4, slotView.getInt32(0, true));
+    buf.setInt32(offset + 8, slotView.getInt32(4, true));
     buf.setInt32(offset + 12, 0);
   }
 

@@ -443,8 +443,14 @@ function readProp(
   prop: string | symbol,
   arrayCapacity?: number,
 ): unknown {
-  const fast = readCachedValue(mem, key);
-  const value = fast.hit ? fast.value : readValue(mem, key);
+  // Inline the read-cache fast path (instead of calling readCachedValue, which
+  // returns a polymorphic {hit,value} union and allocates an object on every
+  // cache hit). Keeping this monomorphic lets the JIT optimize the hot read.
+  const cached = readCache.get(key);
+  const value =
+    cached !== undefined && cached.version === mem.getVersion(cached.index)
+      ? cached.value
+      : readValue(mem, key);
   if (Array.isArray(value)) {
     return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
   }
@@ -517,6 +523,13 @@ function writeObjectSlot(
     // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op)
     // and no in-place string reuse; write the 4 Int32s directly.
     mem.updateBooleanSlot(slotOffset, val);
+    bumpTarget(mem, key, target);
+    return;
+  }
+  if (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64) {
+    // Fast path: int64 bigints are written directly, avoiding the ValueSlot
+    // object allocation of the generic path.
+    mem.updateBigIntSlot(slotOffset, val);
     bumpTarget(mem, key, target);
     return;
   }
@@ -642,6 +655,13 @@ function writePropInner(
     if (typeof val === "boolean") {
       // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op).
       mem.updateArrayBooleanSlot(ref, index, val);
+      bumpTarget(mem, key, target);
+      return;
+    }
+    if (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64) {
+      // Fast path: int64 bigints are written directly, avoiding the
+      // ValueSlot object allocation of the generic path.
+      mem.updateArrayBigIntSlot(ref, index, val);
       bumpTarget(mem, key, target);
       return;
     }
@@ -958,22 +978,6 @@ function createSharedRef<T>(
 }
 
 /**
- * Lock-free fast path: if the cached version matches the current version cell,
- * the cached value is still valid. Returns the cached value, or a miss marker.
- * Kept small so the JIT can inline it into hot accessor getters.
- */
-function readCachedValue(
-  mem: SharedMemory,
-  key: string,
-): { hit: true; value: unknown } | { hit: false } {
-  const cached = readCache.get(key);
-  if (cached !== undefined && cached.version === mem.getVersion(cached.index)) {
-    return { hit: true, value: cached.value };
-  }
-  return { hit: false };
-}
-
-/**
  * Read the full value for a key from shared memory, using the read cache.
  *
  * When `cacheTarget` is provided (the proxy target), the cache entry is also
@@ -987,10 +991,13 @@ function readValue(
     __cache?: { version: number; value: unknown; index: number };
   },
 ): unknown {
-  const fast = readCachedValue(mem, key);
-  if (fast.hit) return fast.value;
-
+  // Inline the read-cache fast path (see readProp) to avoid the polymorphic
+  // {hit,value} union returned by readCachedValue.
   const cached = readCache.get(key);
+  if (cached !== undefined && cached.version === mem.getVersion(cached.index)) {
+    return cached.value;
+  }
+
   const index = cached !== undefined ? cached.index : getIndex(mem, key);
   const version = mem.getVersion(index);
 
@@ -1104,6 +1111,10 @@ function writeValueInner(
       // no-op) and no in-place string reuse.
       if (typeof value === "boolean") {
         mem.updateBooleanSlot(existing, value);
+      } else if (value >= MIN_INT64 && value <= MAX_INT64) {
+        // Fast path: int64 bigints are written directly, avoiding the
+        // ValueSlot object allocation of the generic path.
+        mem.updateBigIntSlot(existing, value);
       } else {
         mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
       }
@@ -1368,6 +1379,151 @@ function createArrayProxy(
   let cachedRef:
     { offset: number; count: number; capacity: number } | undefined;
   let cachedLayoutVersion = -1;
+  // Cached version-cell index for this key, so writes can bump the version
+  // cell without a Map lookup on every write. Stable for the key's lifetime.
+  let cachedIndex: number | undefined;
+
+  /** Bump the key's version cell using the cached index (resolved lazily). */
+  function bumpCached(): void {
+    if (cachedIndex === undefined) {
+      cachedIndex = getIndex(mem, key);
+    }
+    mem.bumpVersion(cachedIndex);
+  }
+
+  /**
+   * Write a single array-property slot in place. Defined once (not per call)
+   * so the set handler can inline the writeLock without allocating a closure
+   * on every write. Mutates the cached slot offset/ref/layout version.
+   */
+  function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
+    // Refresh the cached slot offset when the layout version changed
+    // (defragmentation may have moved the object block).
+    if (cachedLayoutVersion !== mem.getLayoutVersion()) {
+      cachedSlotOffset = undefined;
+      cachedRef = undefined;
+      cachedLayoutVersion = mem.getLayoutVersion();
+    }
+    if (cachedSlotOffset === undefined) {
+      const layout = getObjectLayout(mem, key);
+      if (layout === null) {
+        // Fallback: full read-modify-write.
+        return mutateValue<Record<string, unknown>, boolean>(
+          mem,
+          key,
+          (fresh) => {
+            const arr = fresh[prop] as unknown[];
+            (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
+            return true;
+          },
+          arrayCapacity,
+        );
+      }
+      const so = layout.properties.get(prop);
+      if (so === undefined) {
+        throw new TypeError(
+          `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+        );
+      }
+      cachedSlotOffset = so;
+    }
+    const propSlot = mem.readValueSlot(cachedSlotOffset);
+    if (
+      propSlot.type === TYPE_ARRAY_REF &&
+      typeof arrProp === "string" &&
+      /^\d+$/.test(arrProp)
+    ) {
+      const index = Number(arrProp);
+      // Use the cached ref when valid; re-read when the array may have
+      // grown past the cached count (push) or the layout changed.
+      let ref = cachedRef;
+      if (
+        ref === undefined ||
+        index >= ref.count ||
+        cachedLayoutVersion !== mem.getLayoutVersion()
+      ) {
+        ref = {
+          offset: propSlot.a,
+          count: propSlot.b,
+          capacity: propSlot.c,
+        };
+        cachedRef = ref;
+      }
+      if (index >= ref.count) {
+        throw new RangeError(
+          `Index ${index} out of bounds for array of length ${ref.count}`,
+        );
+      }
+      if (typeof val === "number") {
+        // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op).
+        mem.updateArrayNumberSlot(ref, index, val);
+        bumpCached();
+        return true;
+      }
+      if (typeof val === "boolean") {
+        // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op).
+        mem.updateArrayBooleanSlot(ref, index, val);
+        bumpCached();
+        return true;
+      }
+      if (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64) {
+        // Fast path: int64 bigints are written directly, avoiding the
+        // ValueSlot object allocation of the generic path.
+        mem.updateArrayBigIntSlot(ref, index, val);
+        bumpCached();
+        return true;
+      }
+      if (typeof val === "string") {
+        // Fast path: short strings are written inline into the slot.
+        if (mem.updateArrayInlineStringSlot(ref, index, val)) {
+          bumpCached();
+          return true;
+        }
+      }
+      freeSlotRefs(mem, mem.readArraySlot(ref, index));
+      mem.updateArraySlot(ref, index, encodeValue(mem, val));
+      bumpCached();
+      return true;
+    }
+    // Array property length write: shrink/grow in place without re-encoding
+    // the whole object (which would leave a dead slot).
+    if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
+      const newLen = Number(val);
+      if (!Number.isInteger(newLen) || newLen < 0) {
+        throw new RangeError("Invalid array length");
+      }
+      const ref = {
+        offset: propSlot.a,
+        count: propSlot.b,
+        capacity: propSlot.c,
+      };
+      if (newLen <= ref.capacity) {
+        mem.updateValueSlot(
+          cachedSlotOffset,
+          arrayRefSlot({
+            offset: ref.offset,
+            count: newLen,
+            capacity: ref.capacity,
+          }),
+        );
+        bumpCached();
+        return true;
+      }
+      // Growing beyond capacity falls through to the full read-modify-write.
+    }
+    // Fallback: full read-modify-write.
+    return mutateValue<Record<string, unknown>, boolean>(
+      mem,
+      key,
+      (fresh) => {
+        const arr = fresh[prop] as unknown[];
+        (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
+        return true;
+      },
+      arrayCapacity,
+    );
+  }
+
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
       // push/pop on an array property: operate directly on the array ref
@@ -1424,130 +1580,18 @@ function createArrayProxy(
     },
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
-      // decoding and re-encoding the whole object.
-      return writeLock(mem, () => {
-        // Refresh the cached slot offset when the layout version changed
-        // (defragmentation may have moved the object block).
-        if (cachedLayoutVersion !== mem.getLayoutVersion()) {
-          cachedSlotOffset = undefined;
-          cachedRef = undefined;
-          cachedLayoutVersion = mem.getLayoutVersion();
-        }
-        if (cachedSlotOffset === undefined) {
-          const layout = getObjectLayout(mem, key);
-          if (layout === null) {
-            // Fallback: full read-modify-write.
-            return mutateValue<Record<string, unknown>, boolean>(
-              mem,
-              key,
-              (fresh) => {
-                const arr = fresh[prop] as unknown[];
-                (arr as unknown as Record<string | symbol, unknown>)[arrProp] =
-                  val;
-                return true;
-              },
-              arrayCapacity,
-            );
-          }
-          const so = layout.properties.get(prop);
-          if (so === undefined) {
-            throw new TypeError(
-              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-            );
-          }
-          cachedSlotOffset = so;
-        }
-        const propSlot = mem.readValueSlot(cachedSlotOffset);
-        if (
-          propSlot.type === TYPE_ARRAY_REF &&
-          typeof arrProp === "string" &&
-          /^\d+$/.test(arrProp)
-        ) {
-          const index = Number(arrProp);
-          // Use the cached ref when valid; re-read when the array may have
-          // grown past the cached count (push) or the layout changed.
-          let ref = cachedRef;
-          if (
-            ref === undefined ||
-            index >= ref.count ||
-            cachedLayoutVersion !== mem.getLayoutVersion()
-          ) {
-            ref = {
-              offset: propSlot.a,
-              count: propSlot.b,
-              capacity: propSlot.c,
-            };
-            cachedRef = ref;
-          }
-          if (index >= ref.count) {
-            throw new RangeError(
-              `Index ${index} out of bounds for array of length ${ref.count}`,
-            );
-          }
-          if (typeof val === "number") {
-            // Fast path: numbers need no old-slot read (freeSlotRefs is a
-            // no-op) and no in-place string reuse.
-            mem.updateArrayNumberSlot(ref, index, val);
-            bump(mem, key);
-            return true;
-          }
-          if (typeof val === "boolean") {
-            // Fast path: booleans need no old-slot read (freeSlotRefs is a
-            // no-op).
-            mem.updateArrayBooleanSlot(ref, index, val);
-            bump(mem, key);
-            return true;
-          }
-          if (typeof val === "string") {
-            // Fast path: short strings are written inline into the slot.
-            if (mem.updateArrayInlineStringSlot(ref, index, val)) {
-              bump(mem, key);
-              return true;
-            }
-          }
-          freeSlotRefs(mem, mem.readArraySlot(ref, index));
-          mem.updateArraySlot(ref, index, encodeValue(mem, val));
-          bump(mem, key);
-          return true;
-        }
-        // Array property length write: shrink/grow in place without
-        // re-encoding the whole object (which would leave a dead slot).
-        if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
-          const newLen = Number(val);
-          if (!Number.isInteger(newLen) || newLen < 0) {
-            throw new RangeError("Invalid array length");
-          }
-          const ref = {
-            offset: propSlot.a,
-            count: propSlot.b,
-            capacity: propSlot.c,
-          };
-          if (newLen <= ref.capacity) {
-            mem.updateValueSlot(
-              cachedSlotOffset,
-              arrayRefSlot({
-                offset: ref.offset,
-                count: newLen,
-                capacity: ref.capacity,
-              }),
-            );
-            bump(mem, key);
-            return true;
-          }
-          // Growing beyond capacity falls through to the full read-modify-write.
-        }
-        // Fallback: full read-modify-write.
-        return mutateValue<Record<string, unknown>, boolean>(
-          mem,
-          key,
-          (fresh) => {
-            const arr = fresh[prop] as unknown[];
-            (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
-            return true;
-          },
-          arrayCapacity,
-        );
-      });
+      // decoding and re-encoding the whole object. Inline writeLock to avoid
+      // a closure allocation on the hot path.
+      mem.beginWrite();
+      if (mem.isDefragmenting()) {
+        mem.endWrite();
+        return mem.withLock(() => writeArrayProp(arrProp, val));
+      }
+      try {
+        return writeArrayProp(arrProp, val);
+      } finally {
+        mem.endWrite();
+      }
     },
   });
 }
