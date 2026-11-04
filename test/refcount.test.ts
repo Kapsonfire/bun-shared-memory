@@ -92,7 +92,7 @@ describe("RefCountCoordinator", () => {
     const coord = new RefCountCoordinator(mem, undefined, {
       autoMaintenance: true,
       maintenanceInterval: 5,
-      defragThreshold: 0.01,
+      defragThreshold: 0.2,
       minFreeBlocks: 1,
       onDefragment: (buffers) => {
         defragResult = buffers;
@@ -100,8 +100,10 @@ describe("RefCountCoordinator", () => {
     });
 
     // Grow the ArrayTable across several chunks, then overwrite with larger
-    // arrays so the freed blocks cannot be reused and dead space accumulates
-    // on the free list, which triggers the automatic defragmentation pass.
+    // arrays. Writes are lock-free bump allocations, so each overwrite leaves
+    // the old block as dead space and the used length grows monotonically.
+    // Once the used length exceeds `defragThreshold` of the buffer's capacity,
+    // the automatic maintenance loop triggers a defragmentation pass.
     const keys: string[] = [];
     for (let i = 0; i < 100; i++) {
       const key = `gc-${i}`;

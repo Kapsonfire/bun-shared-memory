@@ -201,7 +201,7 @@ export class RefCountCoordinator {
             mem.attachRefCountBuffer(b.sab);
             return b;
           })());
-    this.defragThreshold = opts.defragThreshold ?? 0.1;
+    this.defragThreshold = opts.defragThreshold ?? 0.8;
     this.minFreeBlocks = opts.minFreeBlocks ?? 64;
     // Start periodic maintenance automatically so refcount events are drained
     // and dead space is reclaimed without an explicit call.
@@ -306,23 +306,20 @@ export class RefCountCoordinator {
    * Whether any table is highly fragmented enough to warrant a defragmentation
    * pass.
    *
-   * With the slab allocator, freed blocks are reused immediately, so low free
-   * space alone is not a problem. Defragmentation is only needed when the free
-   * space is fragmented into many blocks that together occupy a significant
-   * share of the buffer (dead space that cannot be reused efficiently).
+   * Writes are lock-free bump allocations: overwriting a value allocates a new
+   * block and leaves the old one as dead space (there is no free list to reuse
+   * it). The used length therefore grows monotonically even when the live data
+   * set stays the same size. When the used length occupies a significant share
+   * of the buffer's capacity, a defragmentation pass is warranted to compact
+   * the live data and reclaim the dead space.
    *
-   * A table triggers defrag when it has at least `minFreeBlocks` freed blocks
-   * AND those freed blocks occupy more than `defragThreshold` of the buffer's
-   * capacity (i.e. a large amount of dead space has accumulated).
+   * A table triggers defrag when its used length exceeds `defragThreshold` of
+   * the buffer's capacity.
    */
   needsDefrag(): boolean {
-    const frag = (b: {
-      capacity: number;
-      freeListStats: () => { count: number; bytes: number };
-    }) => {
-      const { count, bytes } = b.freeListStats();
-      if (count < this.minFreeBlocks) return false;
-      return bytes / b.capacity > this.defragThreshold;
+    const frag = (b: { capacity: number; byteLength: number }) => {
+      if (b.capacity === 0) return false;
+      return b.byteLength / b.capacity > this.defragThreshold;
     };
     return (
       frag(this.mem.dataTable) ||
@@ -348,7 +345,12 @@ export class RefCountCoordinator {
     this.maintenanceTimer = setInterval(() => {
       this.drainEvents();
       if (this.needsDefrag()) {
+        // Set the defrag flag so lock-free writes fall back to the mutex, then
+        // wait for any in-flight lock-free writes to finish before compacting.
+        this.mem.setDefragmenting();
+        this.mem.waitForWritesToFinish();
         const buffers = this.mem.withLock(() => this.mem.defragment());
+        this.mem.clearDefragmenting();
         this.onDefragment?.(buffers);
       }
     }, intervalMs);

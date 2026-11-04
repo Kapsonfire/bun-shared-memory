@@ -2,6 +2,7 @@ import {
   SharedMemory,
   TYPE_ARRAY_REF,
   TYPE_BIGINT_STR,
+  TYPE_INLINE_STRING,
   TYPE_STRING_REF,
   TYPE_STRING_VALUE_REF,
   arrayRefSlot,
@@ -35,6 +36,26 @@ const MUTATING_METHODS = new Set([
 
 type Primitive = number | string | boolean | bigint;
 
+/**
+ * Run a write operation. Writes are lock-free by default: they increment the
+ * in-flight write counter, and only fall back to the shared mutex if a
+ * defragmentation pass is running (rare). This keeps the hot write path free
+ * of the mutex's re-entrancy tracking while still preventing a write from
+ * racing with a defragmentation pass.
+ */
+function writeLock<T>(mem: SharedMemory, fn: () => T): T {
+  mem.beginWrite();
+  if (mem.isDefragmenting()) {
+    mem.endWrite();
+    return mem.withLock(fn);
+  }
+  try {
+    return fn();
+  } finally {
+    mem.endWrite();
+  }
+}
+
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
 const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = 2n ** 63n - 1n;
@@ -44,6 +65,7 @@ function encodeValue(
   mem: SharedMemory,
   value: unknown,
   arrayCapacity?: number,
+  oldSlot?: ValueSlot,
 ): ValueSlot {
   switch (typeof value) {
     case "number":
@@ -58,7 +80,12 @@ function encodeValue(
       }
       return bigintStrSlot(mem.storeString(value.toString()));
     case "string":
-      return stringValueRefSlot(mem.storeStringValue(value));
+      // Reuse the existing string block in place when the new string fits.
+      const oldRef =
+        oldSlot?.type === TYPE_STRING_VALUE_REF
+          ? { offset: oldSlot.a, length: oldSlot.b }
+          : undefined;
+      return stringValueRefSlot(mem.storeStringValue(value, oldRef));
     default:
       if (Array.isArray(value)) {
         for (const v of value) {
@@ -84,6 +111,8 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
       return mem.readString({ offset: slot.a, length: slot.b });
     case TYPE_STRING_VALUE_REF: // string value in the ArrayTable
       return mem.readStringValue({ offset: slot.a, length: slot.b });
+    case TYPE_INLINE_STRING: // short string stored inline in the slot
+      return mem.readInlineString(slot.a, slot.b, slot.c);
     case TYPE_BIGINT_STR: // bigint stored as decimal string
       return BigInt(mem.readString({ offset: slot.a, length: slot.b }));
     case 4: // array-ref
@@ -100,22 +129,11 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
  * so they can be reused by the slab allocator. Called before a slot is
  * overwritten with a new value. No-op for primitive slots.
  *
- * String values are refcounted (see `releaseStringValue`); they are only
- * freed when their refcount reaches zero.
+ * No-op: string-value/array/object blocks are no longer freed on the hot
+ * path (they are reclaimed by defragmentation instead).
  */
-function freeSlotRefs(mem: SharedMemory, slot: ValueSlot): void {
-  switch (slot.type) {
-    case TYPE_STRING_VALUE_REF:
-      // String values live in the ArrayTable and are refcounted; free them
-      // when the last reference is released.
-      mem.releaseStringValue({ offset: slot.a, length: slot.b });
-      break;
-    case TYPE_ARRAY_REF:
-      mem.freeArray({ offset: slot.a, count: slot.b, capacity: slot.c });
-      break;
-    // TYPE_STRING_REF and TYPE_BIGINT_STR reference interned strings in the
-    // append-only StringTable; they are never freed.
-  }
+function freeSlotRefs(_mem: SharedMemory, _slot: ValueSlot): void {
+  // Intentionally a no-op; dead blocks are reclaimed by defrag.
 }
 
 /**
@@ -165,6 +183,18 @@ const readCache = new Map<
  */
 const indexCache = new Map<string, number>();
 
+/**
+ * Per-worker cache of a key's current DataTable offset, valid only for the
+ * layout version it was resolved under. The offset changes on
+ * GC/defragmentation, so it is re-validated against the global layout version
+ * on each access (a single Atomics.load). This avoids the Index-Table read on
+ * every write, which is the dominant cost of the write hot path.
+ */
+const offsetCache = new Map<
+  string,
+  { offset: number; layoutVersion: number }
+>();
+
 /** Resolve a key's stable index, caching it after the first lookup. */
 function getIndex(mem: SharedMemory, key: string): number {
   const cached = indexCache.get(key);
@@ -192,6 +222,47 @@ function getOffset(mem: SharedMemory, key: string): number | null {
   if (index === null) return null;
   indexCache.set(key, index);
   return mem.lookupByIndex(index);
+}
+
+/**
+ * Resolve a key's current DataTable offset, caching it across writes. The
+ * cached offset is only reused when the global layout version is unchanged
+ * (i.e. no defragmentation has moved the data since it was cached); otherwise
+ * it is re-resolved from the Index Table.
+ */
+function getCachedOffset(
+  mem: SharedMemory,
+  key: string,
+  target?: { __offset?: number; __layoutVersion: number; __type?: number },
+): number | null {
+  if (target !== undefined && target.__offset !== undefined) {
+    if (target.__layoutVersion === mem.getLayoutVersion()) {
+      return target.__offset;
+    }
+    target.__offset = undefined;
+    target.__type = undefined;
+  }
+  const cached = offsetCache.get(key);
+  if (cached !== undefined) {
+    if (cached.layoutVersion === mem.getLayoutVersion()) {
+      if (target !== undefined) {
+        target.__offset = cached.offset;
+        target.__layoutVersion = cached.layoutVersion;
+      }
+      return cached.offset;
+    }
+    offsetCache.delete(key);
+  }
+  const offset = getOffset(mem, key);
+  if (offset !== null) {
+    offsetCache.set(key, { offset, layoutVersion: mem.getLayoutVersion() });
+    if (target !== undefined) {
+      target.__offset = offset;
+      target.__layoutVersion = mem.getLayoutVersion();
+      target.__type = undefined;
+    }
+  }
+  return offset;
 }
 
 /** Whether a decoded value is a reference-countable object/array. */
@@ -417,82 +488,140 @@ function writeProp(
   val: unknown,
   arrayCapacity?: number,
 ): void {
-  mem.withLock(() => {
-    // Object property: use the cached layout to write only that slot.
-    const layout = getObjectLayout(mem, key);
-    if (layout !== null) {
-      const slotOffset = layout.properties.get(prop as string);
-      if (slotOffset === undefined) {
-        throw new TypeError(
-          `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-        );
-      }
-      freeSlotRefs(mem, mem.readValueSlot(slotOffset));
-      mem.updateValueSlot(slotOffset, encodeValue(mem, val));
+  // Inline writeLock to avoid a closure allocation on the hot path.
+  mem.beginWrite();
+  if (mem.isDefragmenting()) {
+    mem.endWrite();
+    mem.withLock(() => writePropInner(mem, key, prop, val, arrayCapacity));
+    return;
+  }
+  try {
+    writePropInner(mem, key, prop, val, arrayCapacity);
+  } finally {
+    mem.endWrite();
+  }
+}
+
+function writePropInner(
+  mem: SharedMemory,
+  key: string,
+  prop: string | symbol,
+  val: unknown,
+  arrayCapacity?: number,
+): void {
+  // Object property: use the cached layout to write only that slot.
+  const layout = getObjectLayout(mem, key);
+  if (layout !== null) {
+    const slotOffset = layout.properties.get(prop as string);
+    if (slotOffset === undefined) {
+      throw new TypeError(
+        `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+      );
+    }
+    if (typeof val === "number") {
+      // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
+      // and no in-place string reuse; write the float64 directly.
+      mem.updateNumberSlot(slotOffset, val);
       bump(mem, key);
       return;
     }
-
-    // Top-level array index write: update only that array slot.
-    const offset = getOffset(mem, key);
-    if (offset === null) {
-      throw new Error(`No shared value found for key "${key}"`);
-    }
-    const slot = mem.readValueSlot(offset);
-    if (
-      slot.type === TYPE_ARRAY_REF &&
-      typeof prop === "string" &&
-      /^\d+$/.test(prop)
-    ) {
-      const index = Number(prop);
-      const ref = { offset: slot.a, count: slot.b, capacity: slot.c };
-      if (index >= ref.count) {
-        throw new RangeError(
-          `Index ${index} out of bounds for array of length ${ref.count}`,
-        );
-      }
-      freeSlotRefs(mem, mem.readArraySlot(ref, index));
-      mem.updateArraySlot(ref, index, encodeValue(mem, val));
-      bump(mem, key);
-      return;
-    }
-
-    // Top-level array length write: shrink/grow the array in place.
-    if (slot.type === TYPE_ARRAY_REF && prop === "length") {
-      const newLen = Number(val);
-      if (!Number.isInteger(newLen) || newLen < 0) {
-        throw new RangeError("Invalid array length");
-      }
-      const ref = { offset: slot.a, count: slot.b, capacity: slot.c };
-      if (newLen <= ref.capacity) {
-        mem.updateValueSlot(
-          offset,
-          arrayRefSlot({
-            offset: ref.offset,
-            count: newLen,
-            capacity: ref.capacity,
-          }),
-        );
+    if (typeof val === "string") {
+      // Fast path: short strings are written inline into the slot itself.
+      if (mem.updateInlineStringSlot(slotOffset, val)) {
         bump(mem, key);
         return;
       }
     }
-
-    // Fallback: full read-modify-write.
-    mutateValue<unknown, boolean>(
-      mem,
-      key,
-      (value) => {
-        if (Array.isArray(value)) {
-          (value as unknown as Record<string | symbol, unknown>)[prop] = val;
-        } else {
-          (value as Record<string | symbol, unknown>)[prop] = val;
-        }
-        return true;
-      },
-      arrayCapacity,
+    const oldSlot = mem.readValueSlot(slotOffset);
+    freeSlotRefs(mem, oldSlot);
+    mem.updateValueSlot(
+      slotOffset,
+      encodeValue(mem, val, arrayCapacity, oldSlot),
     );
-  });
+    bump(mem, key);
+    return;
+  }
+
+  // Top-level array index write: update only that array slot.
+  const offset = getCachedOffset(mem, key);
+  if (offset === null) {
+    throw new Error(`No shared value found for key "${key}"`);
+  }
+  const slotType = mem.dataTable.getInt32(offset);
+  if (
+    slotType === TYPE_ARRAY_REF &&
+    typeof prop === "string" &&
+    /^\d+$/.test(prop)
+  ) {
+    const index = Number(prop);
+    const ref = {
+      offset: mem.dataTable.getInt32(offset + 4),
+      count: mem.dataTable.getInt32(offset + 8),
+      capacity: mem.dataTable.getInt32(offset + 12),
+    };
+    if (index >= ref.count) {
+      throw new RangeError(
+        `Index ${index} out of bounds for array of length ${ref.count}`,
+      );
+    }
+    if (typeof val === "number") {
+      // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op).
+      mem.updateArrayNumberSlot(ref, index, val);
+      bump(mem, key);
+      return;
+    }
+    if (typeof val === "string") {
+      // Fast path: short strings are written inline into the array slot.
+      if (mem.updateArrayInlineStringSlot(ref, index, val)) {
+        bump(mem, key);
+        return;
+      }
+    }
+    freeSlotRefs(mem, mem.readArraySlot(ref, index));
+    mem.updateArraySlot(ref, index, encodeValue(mem, val));
+    bump(mem, key);
+    return;
+  }
+
+  // Top-level array length write: shrink/grow the array in place.
+  if (slotType === TYPE_ARRAY_REF && prop === "length") {
+    const newLen = Number(val);
+    if (!Number.isInteger(newLen) || newLen < 0) {
+      throw new RangeError("Invalid array length");
+    }
+    const ref = {
+      offset: mem.dataTable.getInt32(offset + 4),
+      count: mem.dataTable.getInt32(offset + 8),
+      capacity: mem.dataTable.getInt32(offset + 12),
+    };
+    if (newLen <= ref.capacity) {
+      mem.updateValueSlot(
+        offset,
+        arrayRefSlot({
+          offset: ref.offset,
+          count: newLen,
+          capacity: ref.capacity,
+        }),
+      );
+      bump(mem, key);
+      return;
+    }
+  }
+
+  // Fallback: full read-modify-write.
+  mutateValue<unknown, boolean>(
+    mem,
+    key,
+    (value) => {
+      if (Array.isArray(value)) {
+        (value as unknown as Record<string | symbol, unknown>)[prop] = val;
+      } else {
+        (value as Record<string | symbol, unknown>)[prop] = val;
+      }
+      return true;
+    },
+    arrayCapacity,
+  );
 }
 
 /** Create a SharedRef proxy backed by a SharedMemory instance. */
@@ -512,6 +641,15 @@ function createSharedRef<T>(
     // the version check in the get handler.
     __cache: undefined as
       { version: number; value: unknown; index: number } | undefined,
+    // Cached DataTable offset for this key, valid only while the global
+    // layout version is unchanged (i.e. no defragmentation has moved it).
+    // Mirrors the module-level offsetCache to avoid a Map lookup on the
+    // write hot path.
+    __offset: undefined as number | undefined,
+    __layoutVersion: -1,
+    // Cached slot type for this key, so the write hot path can skip the
+    // DataTable type read when the value's type is known to be stable.
+    __type: undefined as number | undefined,
     read: () => {
       const value = copyValue(readValue(mem, key, target)) as T;
       if (tracker && isTrackable(value)) {
@@ -522,7 +660,7 @@ function createSharedRef<T>(
     },
     write: (value: T) => {
       target.__cache = undefined;
-      writeValue(mem, key, value, arrayCapacity);
+      writeValue(mem, key, value, arrayCapacity, target);
     },
     update: (fn: (current: T) => T) => {
       target.__cache = undefined;
@@ -743,65 +881,150 @@ function writeValue(
   key: string,
   value: unknown,
   arrayCapacity?: number,
+  target?: { __offset?: number; __layoutVersion: number; __type?: number },
 ): void {
-  mem.withLock(() => {
-    const existing = getOffset(mem, key);
-    if (existing !== null) {
-      const type = mem.dataTable.getInt32(existing);
-      if (type === 5) {
-        // Update existing object's property slots in place.
-        const properties = mem.readObject(existing);
-        const valueObj = value as Record<string, unknown>;
-        for (let i = 0; i < properties.length; i++) {
-          const [name] = properties[i]!;
-          if (!(name in valueObj)) {
-            throw new TypeError(
-              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-            );
-          }
-          // Free the old referenced blocks (array/string) before overwriting.
-          freeSlotRefs(mem, properties[i]![1]);
-          mem.updateObjectSlot(
-            existing,
-            i,
-            encodeValue(mem, valueObj[name], arrayCapacity),
+  // Inline writeLock to avoid a closure allocation on the hot path.
+  mem.beginWrite();
+  if (mem.isDefragmenting()) {
+    mem.endWrite();
+    mem.withLock(() => writeValueInner(mem, key, value, arrayCapacity, target));
+    return;
+  }
+  try {
+    writeValueInner(mem, key, value, arrayCapacity, target);
+  } finally {
+    mem.endWrite();
+  }
+}
+
+function writeValueInner(
+  mem: SharedMemory,
+  key: string,
+  value: unknown,
+  arrayCapacity?: number,
+  target?: { __offset?: number; __layoutVersion: number; __type?: number },
+): void {
+  const existing = getCachedOffset(mem, key, target);
+  if (existing !== null) {
+    // Skip the DataTable type read when the slot type is known to be stable
+    // (cached on the target). Only re-read when the type is unknown.
+    let type = target?.__type;
+    if (type === undefined) {
+      type = mem.dataTable.getInt32(existing);
+      if (target !== undefined) target.__type = type;
+    }
+    if (type === 5) {
+      // Update existing object's property slots in place.
+      const properties = mem.readObject(existing);
+      const valueObj = value as Record<string, unknown>;
+      for (let i = 0; i < properties.length; i++) {
+        const [name] = properties[i]!;
+        if (!(name in valueObj)) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
           );
         }
-        // Check for extra properties.
-        const existingNames = new Set(properties.map(([n]) => n));
-        for (const name of Object.keys(valueObj)) {
-          if (!existingNames.has(name)) {
-            throw new TypeError(
-              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-            );
-          }
-        }
-        bump(mem, key);
-        return;
+        // Free the old referenced blocks (array/string) before overwriting.
+        const oldPropSlot = properties[i]![1];
+        freeSlotRefs(mem, oldPropSlot);
+        mem.updateObjectSlot(
+          existing,
+          i,
+          encodeValue(mem, valueObj[name], arrayCapacity, oldPropSlot),
+        );
       }
-      // Update a single value slot in place.
-      const oldSlot = mem.readValueSlot(existing);
-      freeSlotRefs(mem, oldSlot);
-      mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
+      // Check for extra properties.
+      const existingNames = new Set(properties.map(([n]) => n));
+      for (const name of Object.keys(valueObj)) {
+        if (!existingNames.has(name)) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+          );
+        }
+      }
       bump(mem, key);
       return;
     }
-
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-      // Create a new object.
-      const valueObj = value as Record<string, unknown>;
-      const props: Array<[string, ValueSlot]> = Object.entries(valueObj).map(
-        ([name, v]) => [name, encodeValue(mem, v, arrayCapacity)],
-      );
-      const offset = mem.createObject(props);
-      mem.insert(key, offset);
+    // Update a single value slot in place.
+    if (typeof value === "number") {
+      // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
+      // and no in-place string reuse; write the float64 directly.
+      mem.updateNumberSlot(existing, value);
+      bump(mem, key);
       return;
     }
+    const isPrimitive = typeof value === "boolean" || typeof value === "bigint";
+    if (isPrimitive) {
+      // Fast path: primitives need no old-slot read (freeSlotRefs is a
+      // no-op) and no in-place string reuse.
+      if (typeof value === "boolean") {
+        mem.updateBooleanSlot(existing, value);
+      } else {
+        mem.updateValueSlot(existing, encodeValue(mem, value, arrayCapacity));
+      }
+      bump(mem, key);
+      return;
+    }
+    if (typeof value === "string") {
+      // Fast path: short strings are written inline into the slot itself,
+      // avoiding a heap allocation and the string-table write. Longer strings
+      // read the old string ref directly (no ValueSlot object allocation) so
+      // storeStringValue can reuse the block in place.
+      if (mem.updateInlineStringSlot(existing, value)) {
+        bump(mem, key);
+        return;
+      }
+      const oldType = mem.dataTable.getInt32(existing);
+      const oldA = mem.dataTable.getInt32(existing + 4);
+      const oldB = mem.dataTable.getInt32(existing + 8);
+      const ref = mem.storeStringValue(
+        value,
+        oldType === TYPE_STRING_VALUE_REF
+          ? { offset: oldA, length: oldB }
+          : undefined,
+      );
+      mem.updateValueSlot(existing, stringValueRefSlot(ref));
+      bump(mem, key);
+      return;
+    }
+    const oldSlot = mem.readValueSlot(existing);
+    freeSlotRefs(mem, oldSlot);
+    mem.updateValueSlot(
+      existing,
+      encodeValue(mem, value, arrayCapacity, oldSlot),
+    );
+    bump(mem, key);
+    return;
+  }
 
-    // Create a single value slot (primitive or array).
-    const offset = mem.storeValueSlot(encodeValue(mem, value, arrayCapacity));
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    // Create a new object.
+    const valueObj = value as Record<string, unknown>;
+    const props: Array<[string, ValueSlot]> = Object.entries(valueObj).map(
+      ([name, v]) => [name, encodeValue(mem, v, arrayCapacity)],
+    );
+    const offset = mem.createObject(props);
     mem.insert(key, offset);
-  });
+    const lv = mem.getLayoutVersion();
+    offsetCache.set(key, { offset, layoutVersion: lv });
+    if (target !== undefined) {
+      target.__offset = offset;
+      target.__layoutVersion = lv;
+      target.__type = undefined;
+    }
+    return;
+  }
+
+  // Create a single value slot (primitive or array).
+  const offset = mem.storeValueSlot(encodeValue(mem, value, arrayCapacity));
+  mem.insert(key, offset);
+  const lv = mem.getLayoutVersion();
+  offsetCache.set(key, { offset, layoutVersion: lv });
+  if (target !== undefined) {
+    target.__offset = offset;
+    target.__layoutVersion = lv;
+    target.__type = undefined;
+  }
 }
 
 /** Bump the version cell for a key, invalidating read caches. */
@@ -816,7 +1039,7 @@ function updateValue<T>(
   fn: (current: T) => T,
   arrayCapacity?: number,
 ): T {
-  return mem.withLock(() => {
+  return writeLock(mem, () => {
     const current = readValue(mem, key) as T;
     const next = fn(current);
     writeValue(mem, key, next, arrayCapacity);
@@ -835,7 +1058,7 @@ function mutateValue<T, R>(
   fn: (current: T) => R,
   arrayCapacity?: number,
 ): R {
-  return mem.withLock(() => {
+  return writeLock(mem, () => {
     const current = readValue(mem, key) as T;
     const result = fn(current);
     writeValue(mem, key, current, arrayCapacity);
@@ -880,7 +1103,7 @@ function mutateArrayRef(
   method: "push" | "pop",
   args: unknown[],
 ): unknown {
-  return mem.withLock(() => {
+  return writeLock(mem, () => {
     const slotOffset = findArrayRefSlot(mem, key, prop);
     if (slotOffset === null) {
       throw new TypeError("Value is not an array");
@@ -1028,7 +1251,7 @@ function createArrayProxy(
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole object.
-      return mem.withLock(() => {
+      return writeLock(mem, () => {
         const layout = getObjectLayout(mem, key);
         if (layout !== null) {
           const slotOffset = layout.properties.get(prop);

@@ -426,6 +426,51 @@ export class GrowableBuffer {
   }
 
   /**
+   * Atomically reserve `size` bytes at the end of the buffer and return the
+   * start offset. This is the lock-free bump-allocation primitive: the shared
+   * cursor is incremented with a single `Atomics.add`, so concurrent workers
+   * each get a distinct, non-overlapping range without a mutex. The caller
+   * writes its data into `[offset, offset + size)`.
+   *
+   * Chunk growth is preserved: `ensureCapacity` activates any chunks needed to
+   * cover the reserved range. Because `SharedArrayBuffer.grow()` is visible
+   * across workers, activation needs no broadcast.
+   *
+   * Unlike `alloc`, this never consults the free list, so freed blocks are not
+   * reused on this path (dead space is reclaimed by defragmentation).
+   */
+  reserve(size: number): number {
+    // Lock-free bump allocation with chunk-boundary alignment. The shared
+    // cursor is advanced with a compare-exchange loop so concurrent workers
+    // each get a distinct, non-overlapping range without a mutex. If the
+    // block would cross a chunk boundary, the offset is aligned up to the next
+    // chunk so the caller's typed writes (setInt32 etc.) never straddle two
+    // chunks (those accessors only write within a single chunk).
+    while (true) {
+      const current = Number(Atomics.load(this.cursor, 0));
+      let offset = current;
+      if (!this.singleBuffer) {
+        const within = current & (this.chunkSize - 1);
+        if (within + size > this.chunkSize) {
+          offset = current + (this.chunkSize - within);
+        }
+      }
+      const next = offset + size;
+      if (
+        Atomics.compareExchange(
+          this.cursor,
+          0,
+          BigInt(current),
+          BigInt(next),
+        ) === BigInt(current)
+      ) {
+        this.ensureCapacity(next);
+        return offset;
+      }
+    }
+  }
+
+  /**
    * Allocate `size` bytes, reusing a freed block from the free list when one
    * of at least `size` bytes is available (first-fit), otherwise appending at
    * the end of the buffer.
