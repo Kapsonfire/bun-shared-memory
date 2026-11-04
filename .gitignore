@@ -13,3 +13,6 @@ bench/real-world/bench.db
 
 # Generated Unix sockets (mounted from Docker containers)
 bench/real-world/sockets/
+
+# cofusion triage: tests & benchmarks for the cofusion comparison library
+cofusion/

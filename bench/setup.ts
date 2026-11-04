@@ -19,7 +19,7 @@ import {
 // buffer, so 64 KiB is more than enough headroom.
 const mem = new SharedMemory({
   initialSize: 64 * 1024, // 64 KiB per buffer
-  maxByteLength: 512 * 1024 * 1024, // 512 MiB
+  maxByteLength: 4 * 1024 * 1024 * 1024, // 4 GiB
 });
 
 const refBuffer = new RefCountBuffer();

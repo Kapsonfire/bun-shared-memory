@@ -1,5 +1,6 @@
 import {
   GrowableBuffer,
+  MIN_BLOCK_SIZE,
   SharedBudget,
   nextPowerOfTwo,
 } from "./growable-buffer.ts";
@@ -48,6 +49,13 @@ export const TYPE_STRING_REF = 3;
 export const TYPE_ARRAY_REF = 4;
 export const TYPE_OBJECT = 5;
 export const TYPE_BIGINT_STR = 6;
+/** A string value stored in the ArrayTable (slab-allocated, refcounted). */
+export const TYPE_STRING_VALUE_REF = 7;
+/**
+ * A short string stored inline in the slot itself (up to 12 UTF-8 bytes in
+ * the a/b/c fields), avoiding a heap allocation and the string-table write.
+ */
+export const TYPE_INLINE_STRING = 8;
 
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
@@ -149,6 +157,11 @@ export function stringRefSlot(ref: StringRef): ValueSlot {
   return { type: TYPE_STRING_REF, a: ref.offset, b: ref.length, c: 0 };
 }
 
+/** Encode a string value (in the ArrayTable) into a ValueSlot. */
+export function stringValueRefSlot(ref: StringRef): ValueSlot {
+  return { type: TYPE_STRING_VALUE_REF, a: ref.offset, b: ref.length, c: 0 };
+}
+
 /** Encode a bigint stored as a decimal string into a ValueSlot. */
 export function bigintStrSlot(ref: StringRef): ValueSlot {
   return { type: TYPE_BIGINT_STR, a: ref.offset, b: ref.length, c: 0 };
@@ -175,6 +188,8 @@ export function decodeSlot(slot: ValueSlot): unknown {
       return slotView.getBigInt64(0, true);
     }
     case TYPE_STRING_REF:
+      return { offset: slot.a, length: slot.b };
+    case TYPE_STRING_VALUE_REF:
       return { offset: slot.a, length: slot.b };
     case TYPE_ARRAY_REF:
       return { offset: slot.a, count: slot.b, capacity: slot.c };
@@ -217,6 +232,11 @@ export interface SharedMemoryOptions {
       stringTable?: SharedArrayBuffer;
       arrayTable?: SharedArrayBuffer;
     };
+    freeLists?: {
+      dataTable?: SharedArrayBuffer;
+      stringTable?: SharedArrayBuffer;
+      arrayTable?: SharedArrayBuffer;
+    };
   };
 }
 
@@ -230,6 +250,7 @@ function makeBuffer(
   singleBuffer = false,
   chargeInitial = true,
   cursorBuffer?: SharedArrayBuffer,
+  freeListBuffer?: SharedArrayBuffer,
 ): GrowableBuffer {
   if (buf === undefined) {
     return new GrowableBuffer(
@@ -240,6 +261,7 @@ function makeBuffer(
       singleBuffer,
       chargeInitial,
       cursorBuffer,
+      freeListBuffer,
     );
   }
   return new GrowableBuffer(
@@ -250,6 +272,7 @@ function makeBuffer(
     singleBuffer,
     chargeInitial,
     cursorBuffer,
+    freeListBuffer,
   );
 }
 
@@ -274,7 +297,7 @@ export class SharedMemory {
    * on growth. The version is incremented on every write so workers can
    * invalidate their read caches cross-worker.
    */
-  private versionView: Int32Array;
+  versionView: Int32Array;
   /**
    * Global layout version cell. Bumped by the main thread after a
    * defragmentation pass so workers can invalidate cached offsets (indexCache,
@@ -380,6 +403,7 @@ export class SharedMemory {
       false,
       chargeInitial,
       buffers?.cursors?.dataTable,
+      buffers?.freeLists?.dataTable,
     );
     this.stringTable = makeBuffer(
       buffers?.stringTable,
@@ -390,6 +414,7 @@ export class SharedMemory {
       false,
       chargeInitial,
       buffers?.cursors?.stringTable,
+      buffers?.freeLists?.stringTable,
     );
     this.arrayTable = makeBuffer(
       buffers?.arrayTable,
@@ -400,11 +425,12 @@ export class SharedMemory {
       false,
       chargeInitial,
       buffers?.cursors?.arrayTable,
+      buffers?.freeLists?.arrayTable,
     );
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
     this.layoutVersion = new Int32Array(
       buffers?.layoutVersion ??
-        new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+        new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3),
     );
     this.lock = options?.lock ?? new Mutex();
     this.refCountBuffer = buffers?.refCount ?? null;
@@ -473,6 +499,11 @@ export class SharedMemory {
       stringTable: SharedArrayBuffer;
       arrayTable: SharedArrayBuffer;
     };
+    freeLists: {
+      dataTable: SharedArrayBuffer;
+      stringTable: SharedArrayBuffer;
+      arrayTable: SharedArrayBuffer;
+    };
   } {
     return {
       indexTable: this.indexTable.buffers,
@@ -491,6 +522,11 @@ export class SharedMemory {
         dataTable: this.dataTable.cursorBuffer,
         stringTable: this.stringTable.cursorBuffer,
         arrayTable: this.arrayTable.cursorBuffer,
+      },
+      freeLists: {
+        dataTable: this.dataTable.freeListBuffer,
+        stringTable: this.stringTable.freeListBuffer,
+        arrayTable: this.arrayTable.freeListBuffer,
       },
     };
   }
@@ -517,6 +553,11 @@ export class SharedMemory {
       stringTable?: SharedArrayBuffer;
       arrayTable?: SharedArrayBuffer;
     };
+    freeLists?: {
+      dataTable?: SharedArrayBuffer;
+      stringTable?: SharedArrayBuffer;
+      arrayTable?: SharedArrayBuffer;
+    };
   }): SharedMemory {
     const indexBuffer = Array.isArray(buffers.indexTable)
       ? buffers.indexTable[0]
@@ -538,6 +579,7 @@ export class SharedMemory {
         refCount: buffers.refCount ?? undefined,
         budget: buffers.budget ?? undefined,
         cursors: buffers.cursors,
+        freeLists: buffers.freeLists,
       },
       lock: new Mutex(buffers.lock),
     });
@@ -574,10 +616,8 @@ export class SharedMemory {
     }
 
     const bytes = this.encoder.encode(value);
-    const offset = this.stringTable.byteLength;
-    this.stringTable.ensureCapacity(offset + bytes.byteLength);
+    const offset = this.stringTable.reserve(bytes.byteLength);
     this.stringTable.writeBytes(offset, bytes);
-    this.stringTable.advance(bytes.byteLength);
     const ref: StringRef = { offset, length: bytes.byteLength };
 
     // Insert into the cache, growing capacity up to `internMax` before evicting.
@@ -615,6 +655,86 @@ export class SharedMemory {
     return this.decoder.decode(bytes);
   }
 
+  /**
+   * Store a string value in the ArrayTable as a slab-allocated block.
+   *
+   * Unlike `storeString` (which interns into the append-only StringTable for
+   * property names and keys), string values are stored in the ArrayTable so
+   * they can be freed and reused when their reference is overwritten. Each
+   * block starts with a 4-byte objectId header (for refcounting), followed by
+   * the UTF-8 bytes of the string.
+   *
+   * @returns a StringRef pointing into the ArrayTable.
+   */
+  storeStringValue(value: string, oldRef?: StringRef): StringRef {
+    const bytes = this.encoder.encode(value);
+    const size = ARRAY_HEADER + bytes.byteLength;
+    // In-place update: if the new string fits in the existing block (same
+    // length or shorter), overwrite it without allocating a new block. This
+    // keeps repeated writes to the same string property cheap and avoids
+    // unbounded ArrayTable growth. The block's objectId header is preserved.
+    if (oldRef !== undefined && size <= ARRAY_HEADER + oldRef.length) {
+      this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
+      return { offset: oldRef.offset, length: bytes.byteLength };
+    }
+    const offset = this.arrayTable.reserve(size);
+    const objectId = this.nextObjectId++;
+    this.arrayTable.setInt32(offset, objectId);
+    this.arrayTable.writeBytes(offset + ARRAY_HEADER, bytes);
+    return { offset, length: bytes.byteLength };
+  }
+
+  /** Read a string value from the ArrayTable by reference. */
+  readStringValue(ref: StringRef): string {
+    const bytes = this.arrayTable.readBytes(
+      ref.offset + ARRAY_HEADER,
+      ref.length,
+    );
+    return this.decoder.decode(bytes);
+  }
+
+  /** Read a short string stored inline in a DataTable slot. */
+  readInlineString(a: number, b: number, c: number): string {
+    const length = c >>> 28;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) {
+      const word = i < 4 ? a : i < 8 ? b : c;
+      bytes[i] = (word >>> ((i % 4) * 8)) & 0xff;
+    }
+    return this.decoder.decode(bytes);
+  }
+
+  /**
+   * Free a string value block in the ArrayTable, pushing it onto the free
+   * list so it can be reused. Detects double frees.
+   *
+   * No-op: string-value blocks are no longer freed on the hot path (they are
+   * reclaimed by defragmentation instead), so this is kept only for API
+   * compatibility.
+   */
+  freeStringValue(_ref: StringRef): void {
+    // Intentionally a no-op; dead string blocks are reclaimed by defrag.
+  }
+
+  /**
+   * Release a reference to a string value.
+   *
+   * No-op: string-value refcounting is disabled. Blocks are never freed on the
+   * hot path; dead space is reclaimed by defragmentation.
+   */
+  releaseStringValue(_ref: StringRef): void {
+    // Intentionally a no-op; see freeStringValue.
+  }
+
+  /**
+   * Acquire a reference to a string value.
+   *
+   * No-op: string-value refcounting is disabled.
+   */
+  acquireStringValue(_ref: StringRef): void {
+    // Intentionally a no-op; see freeStringValue.
+  }
+
   // ---------------------------------------------------------------------------
   // ArrayTable
   // ---------------------------------------------------------------------------
@@ -631,8 +751,8 @@ export class SharedMemory {
   storeArray(slots: ValueSlot[], capacity?: number): ArrayRef {
     const count = slots.length;
     const cap = Math.max(capacity ?? 0, count, 1);
-    const offset = this.arrayTable.byteLength;
-    this.arrayTable.ensureCapacity(offset + ARRAY_HEADER + cap * SLOT_SIZE);
+    const size = ARRAY_HEADER + cap * SLOT_SIZE;
+    const offset = this.arrayTable.reserve(size);
     const objectId = this.nextObjectId++;
     this.arrayTable.setInt32(offset, objectId);
     for (let i = 0; i < count; i++) {
@@ -642,7 +762,6 @@ export class SharedMemory {
         slots[i]!,
       );
     }
-    this.arrayTable.advance(ARRAY_HEADER + cap * SLOT_SIZE);
     return { offset, count, capacity: cap };
   }
 
@@ -666,6 +785,63 @@ export class SharedMemory {
     );
   }
 
+  /**
+   * Fast-path: write a float64 number into an array slot directly, avoiding
+   * the ValueSlot object allocation and the 4 separate Int32 writes.
+   */
+  updateArrayNumberSlot(ref: ArrayRef, index: number, value: number): void {
+    slotView.setFloat64(0, value, true);
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    buf.setInt32(off, TYPE_NUMBER);
+    buf.setInt32(off + 4, slotView.getInt32(0, true));
+    buf.setInt32(off + 8, slotView.getInt32(4, true));
+    buf.setInt32(off + 12, 0);
+  }
+
+  /**
+   * Fast-path: write a boolean into an array slot directly, avoiding the
+   * ValueSlot object allocation and the 4 separate Int32 writes.
+   */
+  updateArrayBooleanSlot(ref: ArrayRef, index: number, value: boolean): void {
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    buf.setInt32(off, TYPE_BOOLEAN);
+    buf.setInt32(off + 4, value ? 1 : 0);
+    buf.setInt32(off + 8, 0);
+    buf.setInt32(off + 12, 0);
+  }
+
+  /**
+   * Fast-path: write a short string inline into an array slot (up to 11
+   * UTF-8 bytes), avoiding a heap allocation and the string-table write.
+   * Returns true if the string fit inline; false if it must go to the heap.
+   */
+  updateArrayInlineStringSlot(
+    ref: ArrayRef,
+    index: number,
+    value: string,
+  ): boolean {
+    const bytes = this.encoder.encode(value);
+    if (bytes.byteLength > 11) return false;
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    buf.setInt32(off, TYPE_INLINE_STRING);
+    let a = 0;
+    let b = 0;
+    let c = bytes.byteLength << 28;
+    for (let i = 0; i < bytes.byteLength; i++) {
+      const byte = bytes[i]!;
+      if (i < 4) a |= byte << (i * 8);
+      else if (i < 8) b |= byte << ((i - 4) * 8);
+      else c |= byte << ((i - 8) * 8);
+    }
+    buf.setInt32(off + 4, a);
+    buf.setInt32(off + 8, b);
+    buf.setInt32(off + 12, c);
+    return true;
+  }
+
   /** Read a single value slot of an array from the ArrayTable. */
   readArraySlot(ref: ArrayRef, index: number): ValueSlot {
     return readSlot(
@@ -685,10 +861,8 @@ export class SharedMemory {
    * the DataTable to point at the new location.
    */
   moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
-    const newOffset = this.arrayTable.byteLength;
-    this.arrayTable.ensureCapacity(
-      newOffset + ARRAY_HEADER + newCapacity * SLOT_SIZE,
-    );
+    const size = ARRAY_HEADER + newCapacity * SLOT_SIZE;
+    const newOffset = this.arrayTable.reserve(size);
     const objectId = this.getArrayObjectId(ref.offset);
     this.arrayTable.setInt32(newOffset, objectId);
     for (let i = 0; i < ref.count; i++) {
@@ -698,7 +872,13 @@ export class SharedMemory {
         readSlot(this.arrayTable, ref.offset + ARRAY_HEADER + i * SLOT_SIZE),
       );
     }
-    this.arrayTable.advance(ARRAY_HEADER + newCapacity * SLOT_SIZE);
+    // The old block is no longer referenced; it is reclaimed by defrag.
+    this.freeArray(ref);
+    // The array moved to a new offset, so any cached ArrayRef (e.g. the
+    // per-target `__arrayRef` on the write hot path) is now stale. Bump the
+    // global layout version so those caches are invalidated, exactly as a
+    // defragmentation pass does.
+    this.bumpLayoutVersion();
     return { offset: newOffset, count: ref.count, capacity: newCapacity };
   }
 
@@ -734,16 +914,23 @@ export class SharedMemory {
     };
   }
 
+  /**
+   * Free an array block, pushing it onto the ArrayTable free list so it can
+   * be reused. Detects double frees. The block's data is overwritten with
+   * free-list metadata, so it must not be read after freeing.
+   */
+  freeArray(_ref: ArrayRef): void {
+    // No-op: array blocks are reclaimed by defrag, not the free list.
+  }
+
   // ---------------------------------------------------------------------------
   // DataTable
   // ---------------------------------------------------------------------------
 
   /** Store a single value slot in the DataTable and return its offset. */
   storeValueSlot(slot: ValueSlot): number {
-    const offset = this.dataTable.byteLength;
-    this.dataTable.ensureCapacity(offset + SLOT_SIZE);
+    const offset = this.dataTable.reserve(SLOT_SIZE);
     writeSlot(this.dataTable, offset, slot);
-    this.dataTable.advance(SLOT_SIZE);
     return offset;
   }
 
@@ -758,6 +945,62 @@ export class SharedMemory {
   }
 
   /**
+   * Fast-path: write a float64 number slot directly into the DataTable,
+   * avoiding the ValueSlot object allocation and the 4 separate Int32
+   * writes of the generic path.
+   */
+  updateNumberSlot(offset: number, value: number): void {
+    slotView.setFloat64(0, value, true);
+    const buf = this.dataTable;
+    buf.setInt32(offset, TYPE_NUMBER);
+    buf.setInt32(offset + 4, slotView.getInt32(0, true));
+    buf.setInt32(offset + 8, slotView.getInt32(4, true));
+    buf.setInt32(offset + 12, 0);
+  }
+
+  /**
+   * Fast-path: write a boolean slot directly into the DataTable, avoiding
+   * the ValueSlot object allocation of the generic path.
+   */
+  updateBooleanSlot(offset: number, value: boolean): void {
+    const buf = this.dataTable;
+    buf.setInt32(offset, TYPE_BOOLEAN);
+    buf.setInt32(offset + 4, value ? 1 : 0);
+    buf.setInt32(offset + 8, 0);
+    buf.setInt32(offset + 12, 0);
+  }
+
+  /**
+   * Fast-path: write a short string inline into the slot itself (up to 11
+   * UTF-8 bytes), avoiding a heap allocation and the string-table write.
+   * The bytes are packed into the slot's a/b/c fields (11 bytes) with the
+   * length in the top 4 bits of `c`, so they can be read back without
+   * touching the DataTable again.
+   * Returns true if the string fit inline; false if it must go to the heap.
+   */
+  updateInlineStringSlot(offset: number, value: string): boolean {
+    const bytes = this.encoder.encode(value);
+    if (bytes.byteLength > 11) return false;
+    const buf = this.dataTable;
+    buf.setInt32(offset, TYPE_INLINE_STRING);
+    // Pack length into the top 4 bits of `c`; bytes 0-3 in `a`, 4-7 in `b`,
+    // 8-10 in the low 28 bits of `c`.
+    let a = 0;
+    let b = 0;
+    let c = bytes.byteLength << 28;
+    for (let i = 0; i < bytes.byteLength; i++) {
+      const byte = bytes[i]!;
+      if (i < 4) a |= byte << (i * 8);
+      else if (i < 8) b |= byte << ((i - 4) * 8);
+      else c |= byte << ((i - 8) * 8);
+    }
+    buf.setInt32(offset + 4, a);
+    buf.setInt32(offset + 8, b);
+    buf.setInt32(offset + 12, c);
+    return true;
+  }
+
+  /**
    * Create an object in the DataTable.
    *
    * @param properties array of [name, valueSlot] pairs
@@ -766,8 +1009,7 @@ export class SharedMemory {
   createObject(properties: Array<[string, ValueSlot]>): number {
     const blockSize =
       OBJECT_HEADER + properties.length * (NAME_REF_SIZE + SLOT_SIZE);
-    const offset = this.dataTable.byteLength;
-    this.dataTable.ensureCapacity(offset + blockSize);
+    const offset = this.dataTable.reserve(blockSize);
 
     const objectId = this.nextObjectId++;
     this.dataTable.setInt32(offset, TYPE_OBJECT);
@@ -783,7 +1025,6 @@ export class SharedMemory {
       writeSlot(this.dataTable, cursor, slot);
       cursor += SLOT_SIZE;
     }
-    this.dataTable.advance(blockSize);
     return offset;
   }
 
@@ -807,6 +1048,32 @@ export class SharedMemory {
   /** Read the stable objectId of an object block in the DataTable. */
   getObjectId(offset: number): number {
     return this.dataTable.getInt32(offset + 8);
+  }
+
+  /**
+   * Free a single value slot in the DataTable, pushing it onto the free list
+   * so it can be reused. Detects double frees.
+   */
+  freeValueSlot(_offset: number): void {
+    // No-op: value slots are reclaimed by defrag, not the free list.
+  }
+
+  /**
+   * Free an object block in the DataTable, pushing it onto the free list so
+   * it can be reused. Detects double frees. The block's data is overwritten
+   * with free-list metadata, so it must not be read after freeing.
+   */
+  freeObject(_offset: number): void {
+    // No-op: object blocks are reclaimed by defrag, not the free list.
+  }
+
+  /**
+   * Free a string in the StringTable, pushing it onto the free list so it can
+   * be reused. Detects double frees. The string's bytes are overwritten with
+   * free-list metadata, so it must not be read after freeing.
+   */
+  freeString(_ref: StringRef): void {
+    // No-op: string blocks are reclaimed by defrag, not the free list.
   }
 
   /**
@@ -895,6 +1162,15 @@ export class SharedMemory {
     return null;
   }
 
+  /**
+   * Int32Array index of a key's version cell within the Index Table buffer.
+   * Stable for the lifetime of the key (the Index Table is never reordered or
+   * replaced), so callers may cache it and load the version directly.
+   */
+  getVersionCellIndex(index: number): number {
+    return versionCellIndex(index);
+  }
+
   /** Read the current version for a key index (lock-free). */
   getVersion(index: number): number {
     return Atomics.load(this.versionView, versionCellIndex(index));
@@ -908,7 +1184,13 @@ export class SharedMemory {
   /** Insert a key → dataOffset mapping into the Index Table. */
   insert(key: string, dataOffset: number): void {
     const keyRef = this.storeString(key);
-    const count = this.indexTable.getInt32(0);
+    // Atomically reserve the next entry index. The count cell (index 0) is
+    // incremented with a single Atomics.add, so concurrent workers each get a
+    // distinct entry slot without a mutex. The Index Table is a single
+    // growable SAB, so a fresh Int32Array view over its current buffer is
+    // correct (insert is rare — only on first write of a key).
+    const view = new Int32Array(this.indexTable.buffers[0]!);
+    const count = Atomics.add(view, 0, 1);
     const entryOffset = INDEX_HEADER + count * INDEX_ENTRY_SIZE;
     this.indexTable.ensureCapacity(entryOffset + INDEX_ENTRY_SIZE);
     this.indexTable.setInt32(entryOffset, keyRef.offset);
@@ -916,8 +1198,6 @@ export class SharedMemory {
     this.indexTable.setInt32(entryOffset + 8, dataOffset);
     // The 4th field is the key's version cell, initialized to 0.
     this.indexTable.setInt32(entryOffset + INDEX_VERSION_OFFSET, 0);
-    this.indexTable.setInt32(0, count + 1);
-    this.indexTable.advance(INDEX_ENTRY_SIZE);
 
     // Rebuild the version view over the first chunk (the Index Table is small
     // and stays within the first chunk for typical workloads; version cells
@@ -937,6 +1217,49 @@ export class SharedMemory {
   /** Bump the global layout version, invalidating all per-worker caches. */
   bumpLayoutVersion(): void {
     Atomics.add(this.layoutVersion, 0, 1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lock-free write coordination (write counter + defrag flag)
+  // ---------------------------------------------------------------------------
+  // Cell 0 of `layoutVersion` is the global layout version. Cells 1 and 2 are
+  // used to coordinate lock-free writes against the (rare) defragmentation
+  // pass: cell 1 is a count of in-flight lock-free writes, cell 2 is a flag
+  // set while a defragmentation pass is running. A write increments the
+  // counter, checks the flag, and if the flag is set it falls back to the
+  // mutex. The defrag sets the flag, waits for the counter to reach zero, then
+  // runs under the mutex.
+
+  /** Enter a lock-free write: increment the in-flight write counter. */
+  beginWrite(): void {
+    Atomics.add(this.layoutVersion, 1, 1);
+  }
+
+  /** Leave a lock-free write: decrement the in-flight write counter. */
+  endWrite(): void {
+    Atomics.sub(this.layoutVersion, 1, 1);
+  }
+
+  /** Whether a defragmentation pass is currently running. */
+  isDefragmenting(): boolean {
+    return Atomics.load(this.layoutVersion, 2) !== 0;
+  }
+
+  /** Set the defragmentation-in-progress flag. */
+  setDefragmenting(): void {
+    Atomics.store(this.layoutVersion, 2, 1);
+  }
+
+  /** Clear the defragmentation-in-progress flag. */
+  clearDefragmenting(): void {
+    Atomics.store(this.layoutVersion, 2, 0);
+  }
+
+  /** Wait until no lock-free writes are in flight. */
+  waitForWritesToFinish(): void {
+    while (Atomics.load(this.layoutVersion, 1) !== 0) {
+      Atomics.wait(this.layoutVersion, 1, Atomics.load(this.layoutVersion, 1));
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -971,6 +1294,10 @@ export class SharedMemory {
     const liveArrays = new Set<number>();
     const liveObjects = new Set<number>();
     const liveDataOffsets = new Set<number>();
+    /** Byte size of each live ArrayTable block (array or string value). */
+    const arrayBlockSizes = new Map<number, number>();
+    /** Offsets of live string-value blocks (no slots to remap). */
+    const stringValueBlocks = new Set<number>();
 
     const markString = (offset: number) => liveStrings.add(offset);
 
@@ -980,15 +1307,27 @@ export class SharedMemory {
         case TYPE_BIGINT_STR:
           liveStrings.add(slot.a);
           break;
+        case TYPE_STRING_VALUE_REF:
+          liveArrays.add(slot.a);
+          stringValueBlocks.add(slot.a);
+          arrayBlockSizes.set(
+            slot.a,
+            Math.max(ARRAY_HEADER + slot.b, MIN_BLOCK_SIZE),
+          );
+          break;
         case TYPE_ARRAY_REF:
-          markArray(slot.a, slot.b);
+          markArray(slot.a, slot.b, slot.c);
           break;
       }
     };
 
-    const markArray = (offset: number, count: number) => {
+    const markArray = (offset: number, count: number, capacity: number) => {
       if (liveArrays.has(offset)) return;
       liveArrays.add(offset);
+      arrayBlockSizes.set(
+        offset,
+        Math.max(ARRAY_HEADER + capacity * SLOT_SIZE, MIN_BLOCK_SIZE),
+      );
       for (let i = 0; i < count; i++) {
         markValueSlot(
           readSlot(this.arrayTable, offset + ARRAY_HEADER + i * SLOT_SIZE),
@@ -1055,19 +1394,10 @@ export class SharedMemory {
     const sortedArrays = [...liveArrays].sort((a, b) => a - b);
     let newArrayOffset = 0;
     for (const oldOffset of sortedArrays) {
-      // Determine the array's capacity by scanning forward to the next live
-      // array or the end of the used region.
-      const next = sortedArrays[sortedArrays.indexOf(oldOffset) + 1];
-      const end = next !== undefined ? next : this.arrayTable.byteLength;
-      const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
-      copyBytes(
-        this.arrayTable,
-        newArrayOffset,
-        oldOffset,
-        ARRAY_HEADER + capacity * SLOT_SIZE,
-      );
+      const size = arrayBlockSizes.get(oldOffset)!;
+      copyBytes(this.arrayTable, newArrayOffset, oldOffset, size);
       arrayRemap.set(oldOffset, newArrayOffset);
-      newArrayOffset += ARRAY_HEADER + capacity * SLOT_SIZE;
+      newArrayOffset += size;
     }
     this.arrayTable.reset(newArrayOffset);
 
@@ -1113,10 +1443,10 @@ export class SharedMemory {
       remapSlot(this.dataTable, newOff, stringRemap, arrayRemap);
     }
     for (const oldOffset of sortedArrays) {
+      if (stringValueBlocks.has(oldOffset)) continue;
       const newOff = arrayRemap.get(oldOffset)!;
-      const next = sortedArrays[sortedArrays.indexOf(oldOffset) + 1];
-      const end = next !== undefined ? next : this.arrayTable.byteLength;
-      const capacity = (end - oldOffset - ARRAY_HEADER) / SLOT_SIZE;
+      const capacity =
+        (arrayBlockSizes.get(oldOffset)! - ARRAY_HEADER) / SLOT_SIZE;
       for (let i = 0; i < capacity; i++) {
         remapSlot(
           this.arrayTable,
@@ -1172,7 +1502,7 @@ function copyBytes(
 /**
  * Rewrite a value slot's string/array references after compaction, in place.
  * String refs and bigint-str refs are remapped via `stringRemap`; array refs
- * via `arrayRemap`.
+ * and string-value refs (which live in the ArrayTable) via `arrayRemap`.
  */
 function remapSlot(
   buf: GrowableBuffer,
@@ -1183,7 +1513,7 @@ function remapSlot(
   const type = buf.getInt32(offset);
   if (type === TYPE_STRING_REF || type === TYPE_BIGINT_STR) {
     buf.setInt32(offset + 4, stringRemap.get(buf.getInt32(offset + 4))!);
-  } else if (type === TYPE_ARRAY_REF) {
+  } else if (type === TYPE_ARRAY_REF || type === TYPE_STRING_VALUE_REF) {
     buf.setInt32(offset + 4, arrayRemap.get(buf.getInt32(offset + 4))!);
   }
 }
