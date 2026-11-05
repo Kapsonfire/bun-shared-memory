@@ -90,7 +90,10 @@ See [SPEC.md](./SPEC.md) for the full specification.
 - **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
 - **BigInts** of any size are supported: values that fit in 64 bits are stored as a fast int64 slot; larger values are stored as their decimal string in the StringTable.
 - **Objects** have a **fixed shape**: once created, properties may not be added or removed — only their values can change.
-- **Not allowed**: nested objects, nested arrays, `null`, `undefined`.
+- **Nested objects and arrays** are supported: an object or array can contain other plain objects and arrays (read lazily, mutated in place).
+- **Nested `Shared` references**: a `Shared` object can be stored inside another object or array as a _live reference_ — both stay in sync (mutating either updates the same shared value). Self-references and mutual references are supported as long as the property exists in the object's initial fixed shape.
+- **`null` is allowed** as a value (top-level, object property, or array element).
+- **Not allowed**: `undefined`.
 
 ## Usage
 
@@ -122,6 +125,19 @@ user.tags.pop();
 const arr = Shared<number[]>("arr-1", [1, 2, 3]);
 arr.push(4);
 arr[0] = 99;
+
+// Nested objects are read lazily and mutated in place
+const doc = Shared("doc-1", {
+  profile: { name: "Alice", meta: { level: 3 } },
+});
+doc.profile.meta.level++;
+doc.profile.meta.level; // 4
+
+// Nested Shared values are live references that stay in sync
+const settings = Shared("settings-1", { theme: "dark" });
+const app = Shared("app-1", { settings });
+app.settings.theme = "light";
+settings.theme; // "light" (same shared value)
 
 // Primitives use read()/write()/update()
 const counter = Shared<number>("counter-1", 0);

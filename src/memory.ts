@@ -56,6 +56,21 @@ export const TYPE_STRING_VALUE_REF = 7;
  * the a/b/c fields), avoiding a heap allocation and the string-table write.
  */
 export const TYPE_INLINE_STRING = 8;
+/**
+ * A nested object block stored in the DataTable. `a` is the DataTable byte
+ * offset of the object block (same layout as a top-level object).
+ */
+export const TYPE_OBJECT_REF = 9;
+/**
+ * A live reference to another shared key (used for nested `Shared` objects so
+ * changes stay in sync). `a` is the referenced key's stable Index Table index.
+ */
+export const TYPE_KEY_REF = 10;
+/**
+ * The `null` value. No payload in a/b/c — the presence of the slot's type is
+ * the entire value. `undefined` is intentionally still not representable.
+ */
+export const TYPE_NULL = 11;
 
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
@@ -96,6 +111,12 @@ const slotView = new DataView(new ArrayBuffer(8));
 export interface StringRef {
   offset: number;
   length: number;
+  /**
+   * Reserved block size in the ArrayTable (>= ARRAY_HEADER + length). Only
+   * set for string values stored in the ArrayTable; used to grow a block in
+   * place when a string is overwritten with a longer one.
+   */
+  reserved?: number;
 }
 
 export interface ArrayRef {
@@ -159,7 +180,12 @@ export function stringRefSlot(ref: StringRef): ValueSlot {
 
 /** Encode a string value (in the ArrayTable) into a ValueSlot. */
 export function stringValueRefSlot(ref: StringRef): ValueSlot {
-  return { type: TYPE_STRING_VALUE_REF, a: ref.offset, b: ref.length, c: 0 };
+  return {
+    type: TYPE_STRING_VALUE_REF,
+    a: ref.offset,
+    b: ref.length,
+    c: ref.reserved ?? 0,
+  };
 }
 
 /** Encode a bigint stored as a decimal string into a ValueSlot. */
@@ -170,6 +196,21 @@ export function bigintStrSlot(ref: StringRef): ValueSlot {
 /** Encode an array reference into a ValueSlot. */
 export function arrayRefSlot(ref: ArrayRef): ValueSlot {
   return { type: TYPE_ARRAY_REF, a: ref.offset, b: ref.count, c: ref.capacity };
+}
+
+/** Encode a reference to a nested object block (DataTable offset). */
+export function objectRefSlot(offset: number): ValueSlot {
+  return { type: TYPE_OBJECT_REF, a: offset, b: 0, c: 0 };
+}
+
+/** Encode a live reference to another shared key (by stable Index Table index). */
+export function keyRefSlot(index: number): ValueSlot {
+  return { type: TYPE_KEY_REF, a: index, b: 0, c: 0 };
+}
+
+/** Encode the `null` value. */
+export function nullSlot(): ValueSlot {
+  return { type: TYPE_NULL, a: 0, b: 0, c: 0 };
 }
 
 /** Decode a ValueSlot into a JS value (primitives) or a ref object. */
@@ -191,8 +232,14 @@ export function decodeSlot(slot: ValueSlot): unknown {
       return { offset: slot.a, length: slot.b };
     case TYPE_STRING_VALUE_REF:
       return { offset: slot.a, length: slot.b };
+    case TYPE_NULL:
+      return null;
     case TYPE_ARRAY_REF:
       return { offset: slot.a, count: slot.b, capacity: slot.c };
+    case TYPE_OBJECT_REF:
+      return { offset: slot.a };
+    case TYPE_KEY_REF:
+      return { index: slot.a };
     default:
       throw new Error(`Unknown slot type ${slot.type}`);
   }
@@ -675,13 +722,34 @@ export class SharedMemory {
     // unbounded ArrayTable growth. The block's objectId header is preserved.
     if (oldRef !== undefined && size <= ARRAY_HEADER + oldRef.length) {
       this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
-      return { offset: oldRef.offset, length: bytes.byteLength };
+      return {
+        offset: oldRef.offset,
+        length: bytes.byteLength,
+        reserved: oldRef.reserved ?? size,
+      };
+    }
+    // The new string is longer than the old block. If the old block is the
+    // last allocated block (its reserved end is the current used length), grow
+    // it in place so repeated writes to the same property don't leak dead
+    // blocks. This also covers the shrink-then-grow case: a block that was
+    // reserved for a longer string but currently holds a shorter one can be
+    // grown back into its own reserved tail.
+    if (oldRef !== undefined && oldRef.reserved !== undefined) {
+      const reservedEnd = oldRef.offset + oldRef.reserved;
+      if (this.arrayTable.growInPlace(reservedEnd, size - oldRef.reserved)) {
+        this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
+        return {
+          offset: oldRef.offset,
+          length: bytes.byteLength,
+          reserved: Math.max(oldRef.reserved, size),
+        };
+      }
     }
     const offset = this.arrayTable.reserve(size);
     const objectId = this.nextObjectId++;
     this.arrayTable.setInt32(offset, objectId);
     this.arrayTable.writeBytes(offset + ARRAY_HEADER, bytes);
-    return { offset, length: bytes.byteLength };
+    return { offset, length: bytes.byteLength, reserved: size };
   }
 
   /** Read a string value from the ArrayTable by reference. */
@@ -1117,6 +1185,14 @@ export class SharedMemory {
   getObjectLayout(key: string): ObjectLayout | null {
     const offset = this.lookup(key);
     if (offset === null) return null;
+    return this.getObjectLayoutAtOffset(offset);
+  }
+
+  /**
+   * Get the stable layout of an object block at a DataTable offset (top-level
+   * or nested). Returns null if the offset is not an object block.
+   */
+  getObjectLayoutAtOffset(offset: number): ObjectLayout | null {
     if (this.dataTable.getInt32(offset) !== TYPE_OBJECT) return null;
     const count = this.dataTable.getInt32(offset + 4);
     const properties = new Map<string, number>();
@@ -1187,6 +1263,20 @@ export class SharedMemory {
       }
     }
     return null;
+  }
+
+  /**
+   * Read the key string for a known stable index. Used to resolve a live
+   * shared-key reference (TYPE_KEY_REF) back to its key so a wrapper can be
+   * reconstructed. Returns null if the index is out of range.
+   */
+  getKeyByIndex(index: number): string | null {
+    const count = this.indexTable.getInt32(0);
+    if (index >= count) return null;
+    const entryOffset = INDEX_HEADER + index * INDEX_ENTRY_SIZE;
+    const keyOffset = this.indexTable.getInt32(entryOffset);
+    const keyLength = this.indexTable.getInt32(entryOffset + 4);
+    return this.readString({ offset: keyOffset, length: keyLength });
   }
 
   /**
@@ -1339,11 +1429,20 @@ export class SharedMemory {
           stringValueBlocks.add(slot.a);
           arrayBlockSizes.set(
             slot.a,
-            Math.max(ARRAY_HEADER + slot.b, MIN_BLOCK_SIZE),
+            Math.max(slot.c || ARRAY_HEADER + slot.b, MIN_BLOCK_SIZE),
           );
           break;
         case TYPE_ARRAY_REF:
           markArray(slot.a, slot.b, slot.c);
+          break;
+        case TYPE_OBJECT_REF:
+          // Nested object block lives in the DataTable; mark it recursively.
+          markObject(slot.a);
+          break;
+        case TYPE_KEY_REF:
+          // A live reference to another shared key. The referenced key is
+          // marked separately when the Index Table is walked (Phase 1), so
+          // nothing to do here.
           break;
       }
     };
@@ -1460,14 +1559,14 @@ export class SharedMemory {
         const nameOffset = this.dataTable.getInt32(cursor);
         this.dataTable.setInt32(cursor, stringRemap.get(nameOffset)!);
         cursor += NAME_REF_SIZE;
-        remapSlot(this.dataTable, cursor, stringRemap, arrayRemap);
+        remapSlot(this.dataTable, cursor, stringRemap, arrayRemap, objectRemap);
         cursor += SLOT_SIZE;
       }
     }
     for (const oldOffset of sortedData) {
       if (this.dataTable.getInt32(oldOffset) === TYPE_OBJECT) continue;
       const newOff = objectRemap.get(oldOffset)!;
-      remapSlot(this.dataTable, newOff, stringRemap, arrayRemap);
+      remapSlot(this.dataTable, newOff, stringRemap, arrayRemap, objectRemap);
     }
     for (const oldOffset of sortedArrays) {
       if (stringValueBlocks.has(oldOffset)) continue;
@@ -1480,6 +1579,7 @@ export class SharedMemory {
           newOff + ARRAY_HEADER + i * SLOT_SIZE,
           stringRemap,
           arrayRemap,
+          objectRemap,
         );
       }
     }
@@ -1514,15 +1614,25 @@ function readSlot(buf: GrowableBuffer, offset: number): ValueSlot {
   };
 }
 
-/** Copy `len` bytes from `src` to `dst` in the same buffer (dst <= src). */
+/** Copy `len` bytes from `src` to `dst` in the same buffer, overlap-safe. */
 function copyBytes(
   buf: GrowableBuffer,
   dst: number,
   src: number,
   len: number,
 ): void {
-  for (let i = 0; i < len; i++) {
-    buf.setUint8(dst + i, buf.getUint8(src + i));
+  // `dst` may be greater than `src` when a small block compacts forward over
+  // the tail of a later block still holding its old data (e.g. string-value
+  // blocks interleaved with array blocks). Copy backwards in that case, like
+  // memmove, so overlapping source/destination ranges aren't corrupted.
+  if (dst > src) {
+    for (let i = len - 1; i >= 0; i--) {
+      buf.setUint8(dst + i, buf.getUint8(src + i));
+    }
+  } else {
+    for (let i = 0; i < len; i++) {
+      buf.setUint8(dst + i, buf.getUint8(src + i));
+    }
   }
 }
 
@@ -1536,11 +1646,16 @@ function remapSlot(
   offset: number,
   stringRemap: Map<number, number>,
   arrayRemap: Map<number, number>,
+  objectRemap?: Map<number, number>,
 ): void {
   const type = buf.getInt32(offset);
   if (type === TYPE_STRING_REF || type === TYPE_BIGINT_STR) {
     buf.setInt32(offset + 4, stringRemap.get(buf.getInt32(offset + 4))!);
   } else if (type === TYPE_ARRAY_REF || type === TYPE_STRING_VALUE_REF) {
     buf.setInt32(offset + 4, arrayRemap.get(buf.getInt32(offset + 4))!);
+  } else if (type === TYPE_OBJECT_REF && objectRemap !== undefined) {
+    buf.setInt32(offset + 4, objectRemap.get(buf.getInt32(offset + 4))!);
   }
+  // TYPE_KEY_REF (live shared-key reference) needs no remap: it stores the
+  // key's stable Index Table index, which never changes.
 }

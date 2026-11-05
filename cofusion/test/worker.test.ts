@@ -33,7 +33,7 @@ function spawnCofusionWorker(workerCode: string): Worker {
  * "read" message and resolves with the worker's reply.
  */
 function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
-  const pending: Array<(data: unknown) => void> = [];
+  const pending: Array<(data: { name: string; age: number }) => void> = [];
   let readyResolve: () => void;
   const ready = new Promise<void>((resolve) => {
     readyResolve = resolve;
@@ -41,9 +41,11 @@ function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
 
   worker.addEventListener("message", (e: MessageEvent) => {
     const data = e.data as
-      | { type?: string; ready?: boolean }
-      | { name: string; age: number };
-    if (data && (data as { type?: string }).type === "__HYPERSHM_INIT_REQUEST__") {
+      { type?: string; ready?: boolean } | { name: string; age: number };
+    if (
+      data &&
+      (data as { type?: string }).type === "__HYPERSHM_INIT_REQUEST__"
+    ) {
       worker.postMessage({
         type: "__HYPERSHM_INIT_RESPONSE__",
         buffer: arena.buffer,
@@ -57,7 +59,7 @@ function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
     }
     if (data && "name" in data) {
       const resolve = pending.shift();
-      if (resolve) resolve(data);
+      if (resolve) resolve(data as { name: string; age: number });
     }
   });
 

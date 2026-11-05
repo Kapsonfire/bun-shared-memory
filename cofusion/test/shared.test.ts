@@ -218,7 +218,7 @@ describe("cofusion Shared", () => {
 
   test("update applies a transform atomically", () => {
     const counter = arena.shared("counter-2", 0);
-    const result = counter.update((n) => n + 1);
+    const result = counter.update((n: number) => n + 1);
     expect(result).toBe(1);
     expect(counter.read()).toBe(1);
   });

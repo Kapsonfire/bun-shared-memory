@@ -70,7 +70,8 @@ Stores array data. **Append-only**, same principle as the StringTable.
 
 - Allowed: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
 - Objects have a **fixed shape**: properties may not be added or removed after creation.
-- Not allowed: nested objects, nested arrays, `null`, `undefined`.
+- Nested objects and arrays are supported, read lazily and mutated in place.
+- `null` is supported as a value; `undefined` is not.
 
 ## API (unchanged from current)
 

@@ -189,6 +189,52 @@ describe("Defragmentation", () => {
     expect(rc).toBe("gamma2");
   });
 
+  test("defragments nested objects (plain + live shared refs)", () => {
+    const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
+    const inner = Shared(
+      "inner",
+      { label: "deep", tags: ["a", "b"] },
+      { memory: mem },
+    );
+
+    type OuterShape = {
+      profile: { name: string; meta: { level: number } };
+      handler: { label: string; tags: string[] };
+    };
+    // `profile` is a plain nested object; `handler` is a live shared ref that
+    // is wired to `inner` after creation. Both must survive a defrag.
+    const outer = Shared<OuterShape>(
+      "outer",
+      {
+        profile: { name: "alpha", meta: { level: 1 } },
+        handler: { label: "deep", tags: ["a", "b"] },
+      },
+      { memory: mem },
+    );
+    const mutable = outer as unknown as OuterShape & {
+      handler: typeof inner;
+    };
+    mutable.handler = inner;
+
+    // Overwrite to create dead space and force object-block rewiring.
+    outer.write({
+      profile: { name: "alpha2", meta: { level: 2 } },
+      handler: inner,
+    });
+
+    mem.withLock(() => mem.defragment());
+
+    const ro = outer.read();
+    expect(ro.profile).toEqual({ name: "alpha2", meta: { level: 2 } });
+    // Plain nested object still linked, and mutating it in place stays in sync.
+    mutable.profile.meta.level = 9;
+    expect(outer.read().profile.meta.level).toBe(9);
+    // Live nested refs stay linked after defrag.
+    expect(mutable.handler).toBe(inner);
+    inner.write({ label: "deep3", tags: ["x"] });
+    expect(mutable.handler.label).toBe("deep3");
+  });
+
   test("releases unused chunks after defragmentation", () => {
     // Use the minimum chunk size so a few writes span multiple chunks.
     const mem = new SharedMemory({
