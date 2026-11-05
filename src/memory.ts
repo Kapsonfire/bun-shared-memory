@@ -96,6 +96,12 @@ const slotView = new DataView(new ArrayBuffer(8));
 export interface StringRef {
   offset: number;
   length: number;
+  /**
+   * Reserved block size in the ArrayTable (>= ARRAY_HEADER + length). Only
+   * set for string values stored in the ArrayTable; used to grow a block in
+   * place when a string is overwritten with a longer one.
+   */
+  reserved?: number;
 }
 
 export interface ArrayRef {
@@ -159,7 +165,12 @@ export function stringRefSlot(ref: StringRef): ValueSlot {
 
 /** Encode a string value (in the ArrayTable) into a ValueSlot. */
 export function stringValueRefSlot(ref: StringRef): ValueSlot {
-  return { type: TYPE_STRING_VALUE_REF, a: ref.offset, b: ref.length, c: 0 };
+  return {
+    type: TYPE_STRING_VALUE_REF,
+    a: ref.offset,
+    b: ref.length,
+    c: ref.reserved ?? 0,
+  };
 }
 
 /** Encode a bigint stored as a decimal string into a ValueSlot. */
@@ -675,13 +686,34 @@ export class SharedMemory {
     // unbounded ArrayTable growth. The block's objectId header is preserved.
     if (oldRef !== undefined && size <= ARRAY_HEADER + oldRef.length) {
       this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
-      return { offset: oldRef.offset, length: bytes.byteLength };
+      return {
+        offset: oldRef.offset,
+        length: bytes.byteLength,
+        reserved: oldRef.reserved ?? size,
+      };
+    }
+    // The new string is longer than the old block. If the old block is the
+    // last allocated block (its reserved end is the current used length), grow
+    // it in place so repeated writes to the same property don't leak dead
+    // blocks. This also covers the shrink-then-grow case: a block that was
+    // reserved for a longer string but currently holds a shorter one can be
+    // grown back into its own reserved tail.
+    if (oldRef !== undefined && oldRef.reserved !== undefined) {
+      const reservedEnd = oldRef.offset + oldRef.reserved;
+      if (this.arrayTable.growInPlace(reservedEnd, size - oldRef.reserved)) {
+        this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
+        return {
+          offset: oldRef.offset,
+          length: bytes.byteLength,
+          reserved: Math.max(oldRef.reserved, size),
+        };
+      }
     }
     const offset = this.arrayTable.reserve(size);
     const objectId = this.nextObjectId++;
     this.arrayTable.setInt32(offset, objectId);
     this.arrayTable.writeBytes(offset + ARRAY_HEADER, bytes);
-    return { offset, length: bytes.byteLength };
+    return { offset, length: bytes.byteLength, reserved: size };
   }
 
   /** Read a string value from the ArrayTable by reference. */
@@ -1339,7 +1371,7 @@ export class SharedMemory {
           stringValueBlocks.add(slot.a);
           arrayBlockSizes.set(
             slot.a,
-            Math.max(ARRAY_HEADER + slot.b, MIN_BLOCK_SIZE),
+            Math.max(slot.c || ARRAY_HEADER + slot.b, MIN_BLOCK_SIZE),
           );
           break;
         case TYPE_ARRAY_REF:

@@ -83,7 +83,11 @@ function encodeValue(
       // Reuse the existing string block in place when the new string fits.
       const oldRef =
         oldSlot?.type === TYPE_STRING_VALUE_REF
-          ? { offset: oldSlot.a, length: oldSlot.b }
+          ? {
+              offset: oldSlot.a,
+              length: oldSlot.b,
+              reserved: oldSlot.c || undefined,
+            }
           : undefined;
       return stringValueRefSlot(mem.storeStringValue(value, oldRef));
     default:
@@ -1133,10 +1137,11 @@ function writeValueInner(
       const oldType = mem.dataTable.getInt32(existing);
       const oldA = mem.dataTable.getInt32(existing + 4);
       const oldB = mem.dataTable.getInt32(existing + 8);
+      const oldC = mem.dataTable.getInt32(existing + 12);
       const ref = mem.storeStringValue(
         value,
         oldType === TYPE_STRING_VALUE_REF
-          ? { offset: oldA, length: oldB }
+          ? { offset: oldA, length: oldB, reserved: oldC || undefined }
           : undefined,
       );
       mem.updateValueSlot(existing, stringValueRefSlot(ref));

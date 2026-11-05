@@ -267,6 +267,46 @@ describe("SharedMemory string interning", () => {
   });
 });
 
+describe("SharedMemory string value in-place growth", () => {
+  test("overwriting a string with a longer one reuses the block in place", () => {
+    const mem = new SharedMemory();
+    const obj = Shared(
+      "grow-1",
+      { url: "https://internal.service.cluster.local/v1/telemetry" },
+      { memory: mem },
+    );
+    const before = mem.arrayTable.byteLength;
+
+    // Grow the string repeatedly. Each write must reuse the existing block
+    // (the space after it is free), so the ArrayTable must not grow.
+    obj.url = "https://internal.service.cluster.local/v1/metrics";
+    obj.url = "https://internal.service.cluster.local/v1/heartbeat";
+    obj.url = "https://internal.service.cluster.local/v1/telemetry";
+
+    expect(mem.arrayTable.byteLength).toBe(before);
+    expect(obj.url).toBe("https://internal.service.cluster.local/v1/telemetry");
+  });
+
+  test("rotating string lengths does not exhaust the ArrayTable", () => {
+    const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
+    const urls = [
+      "https://internal.service.cluster.local/v1/telemetry",
+      "https://internal.service.cluster.local/v1/metrics",
+      "https://internal.service.cluster.local/v1/heartbeat",
+    ];
+    const obj = Shared("grow-2", { url: urls[0] }, { memory: mem });
+
+    for (let i = 0; i < 100_000; i++) {
+      obj.url = urls[i % 3];
+    }
+
+    // The block is reused in place, so the ArrayTable stays tiny instead of
+    // growing by ~18 bytes per write.
+    expect(mem.arrayTable.byteLength).toBeLessThan(1024);
+    expect(obj.url).toBe(urls[99_999 % 3]);
+  });
+});
+
 describe("SharedMemory total memory budget", () => {
   test("keeps the Index Table in one growable SharedArrayBuffer", () => {
     const mem = new SharedMemory({

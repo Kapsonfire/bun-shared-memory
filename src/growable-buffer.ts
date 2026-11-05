@@ -426,6 +426,41 @@ export class GrowableBuffer {
   }
 
   /**
+   * Grow a block in place by `extra` bytes when the space immediately after it
+   * is free (i.e. the block is the last allocated one, so its end equals the
+   * current used length). This lets a caller extend a block without leaving
+   * the old prefix as dead space.
+   *
+   * The cursor is advanced with a compare-exchange loop, so concurrent workers
+   * cannot allocate into the space being claimed: if another worker has
+   * reserved bytes after `endOffset`, the cursor no longer equals `endOffset`
+   * and this returns false, letting the caller fall back to a fresh
+   * allocation.
+   *
+   * @returns true if the block was grown in place, false if the space after it
+   *          is not free (caller must allocate a new block).
+   */
+  growInPlace(endOffset: number, extra: number): boolean {
+    if (extra <= 0) return true;
+    while (true) {
+      const current = Number(Atomics.load(this.cursor, 0));
+      if (current !== endOffset) return false;
+      const next = current + extra;
+      if (
+        Atomics.compareExchange(
+          this.cursor,
+          0,
+          BigInt(current),
+          BigInt(next),
+        ) === BigInt(current)
+      ) {
+        this.ensureCapacity(next);
+        return true;
+      }
+    }
+  }
+
+  /**
    * Atomically reserve `size` bytes at the end of the buffer and return the
    * start offset. This is the lock-free bump-allocation primitive: the shared
    * cursor is incremented with a single `Atomics.add`, so concurrent workers
