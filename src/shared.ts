@@ -998,10 +998,7 @@ function writePropInner(
     // i.e. no defragmentation or array growth has moved it). Otherwise
     // re-read the 3 header Int32s and refresh the cache.
     let ref = target?.__arrayRef;
-    if (
-      ref === undefined ||
-      target!.__arrayRefLayoutVersion !== cachedLv
-    ) {
+    if (ref === undefined || target!.__arrayRefLayoutVersion !== cachedLv) {
       ref = {
         offset: mem.dataTable.getInt32(offset + 4),
         count: mem.dataTable.getInt32(offset + 8),

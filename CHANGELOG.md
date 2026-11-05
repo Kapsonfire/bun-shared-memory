@@ -49,8 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Atomics.load(view, cached.cell)`.
 - Hoist **`getLayoutVersion`** inside lock-free writes: within a write (counter
   > 0) the layout version cannot change, so read it once and reuse it for all
-  cached-offset and ArrayRef checks, saving 2–3 `Atomics.load` ops per write.
-  Array writes improved from ~37× to ~33× slower than native.
+  > cached-offset and ArrayRef checks, saving 2–3 `Atomics.load` ops per write.
+  > Array writes improved from ~37× to ~33× slower than native.
 
 ### Fixed
 
