@@ -58,6 +58,8 @@ async function seedMysql(): Promise<void> {
       VALUES (${u.id}, ${u.name}, ${u.email}, ${u.role}, ${u.active ? 1 : 0}, ${u.score})
     `;
   }
+  // Prime the connection.
+  await mysql`SELECT id FROM users LIMIT 1`;
   mysql.close();
   console.log(`MySQL seeded: ${SEED_ROWS} rows`);
 }
@@ -65,6 +67,8 @@ async function seedMysql(): Promise<void> {
 async function seedRedis(): Promise<void> {
   const redis = new RedisClient("redis://127.0.0.1:6379");
   await redis.connect();
+  // Prime the connection.
+  await redis.ping();
   const keys = await redis.keys(`${REDIS_KEY_PREFIX}*`);
   if (keys.length > 0) await redis.del(...keys);
   // Bulk-insert via MSET (Bun's native client has no pipeline; MSET sets all

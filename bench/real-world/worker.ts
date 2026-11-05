@@ -58,8 +58,8 @@ workerScope.onmessage = async (e: MessageEvent) => {
 
     const app = await buildApi({ methodology, transport });
 
-    // Warm up the handler (JIT) before measuring.
-    for (let i = 0; i < 1000; i++) {
+    // Warm up the handler (JIT) and DB caches before measuring.
+    for (let i = 0; i < 5000; i++) {
       await app.fetch(new Request(`http://localhost/user/${userId}`));
     }
 

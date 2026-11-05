@@ -108,9 +108,13 @@ export async function buildApi(opts: ApiOptions) {
     // with tagged-template queries; Unix sockets are selected via ?socket=.
     mysql = new SQL(
       transport === "socket"
-        ? `mysql://bench:bench@127.0.0.1/bench?socket=${MYSQL_SOCKET}`
-        : "mysql://bench:bench@127.0.0.1:3306/bench",
+        ? `mysql://bench:bench@127.0.0.1/bench?socket=${MYSQL_SOCKET}&pool=8`
+        : "mysql://bench:bench@127.0.0.1:3306/bench?pool=8",
     );
+    // Prime the connection so the first queries are fast.
+    await mysql`
+      SELECT id FROM users LIMIT 1
+    `;
   } else if (methodology === "redis") {
     // Establish the connection up front so the handshake is not part of the
     // measured per-request cost. Bun's native Redis client (Bun.redis) is
@@ -121,6 +125,8 @@ export async function buildApi(opts: ApiOptions) {
         : "redis://127.0.0.1:6379",
     );
     await redis.connect();
+    // Prime the connection.
+    await redis.ping();
   }
 
   const app = new Elysia().get("/user/:id", async ({ params }) => {

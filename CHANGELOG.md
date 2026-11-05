@@ -24,10 +24,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache the key's version-cell index in the array proxy so writes bump the
   version without a per-write Map lookup. Object array-prop index writes
   dropped from ~33.9× to ~29× slower than native.
-- Real-world benchmark: the shared-memory "get user" endpoint improved from
-  ~4.18M to ~5.79M req/s (+39%), widening the gap over the comparison
-  backends (sqlite 6.2×→8.5×, redis 218×→302×, mysql 233×→322× slower than
+- Real-world benchmark: the shared-memory "get user" endpoint improved to
+  ~5.15M req/s, widening the gap over the comparison
+  backends (sqlite 9.9×, redis 76.5×, mysql 82.0× slower than
   shared memory).
+
+### Benchmark
+
+- Increase `SAMPLES_PER_WORKER` from 5 to 15 for more stable per-run statistics.
+- Increase `RUNS_PER_METHOD` from 3 to 5 for better CPU-contention filtering.
+- Increase warmup from 1,000 to 5,000 iterations so the JIT and DB caches
+  are fully warmed before measurement.
+- Add `?pool=8` to MySQL connection strings to avoid per-request connect overhead.
+- Add priming queries (`SELECT LIMIT 1` for MySQL, `PING` for Redis) so the
+  first measured request does not hit cold-connect latency.
 
 ## [0.2.0] - 2026-11-04
 
