@@ -6,7 +6,7 @@
       "name": "shared-memory",
       "devDependencies": {
         "@types/bun": "latest",
-        "cofusion": "^0.0.2",
+        "cofusion": "^0.0.3",
         "elysia": "^1.4.30",
       },
     },
@@ -26,7 +26,7 @@
 
     "bun-types": ["bun-types@1.4.4", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-yjrJh5oGX7mMPKGd19YXyIjmEuj4G4zNC30bs7PM9Az7NQ3ndF3j6hbeRdvJTRQEhJ/FYQwW0a2moweEi2hMxQ=="],
 
-    "cofusion": ["cofusion@0.0.2", "", {}, "sha512-NhIztfcE6DkcUZxKl5aeYBVxCKVCKayg6FyFGH7Aj90rtrVvcyvyRoHFSwHkQ6+5VCvRqYK0yM9yynJNWsdQHA=="],
+    "cofusion": ["cofusion@0.0.3", "", {}, "sha512-p8Rku5w6ZaR4EVFSEHYfwxGLRnX76DAmhPEcOy1R+O0drU5oTX7Xu8gueThv4AC0AMLlFww6zCBq/u47+q83Gw=="],
 
     "cookie": ["cookie@1.1.1", "", {}, "sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ=="],
 
