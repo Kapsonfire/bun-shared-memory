@@ -4,6 +4,7 @@ import {
   TYPE_BIGINT_STR,
   TYPE_INLINE_STRING,
   TYPE_KEY_REF,
+  TYPE_NULL,
   TYPE_OBJECT_REF,
   TYPE_STRING_REF,
   TYPE_STRING_VALUE_REF,
@@ -13,6 +14,7 @@ import {
   booleanSlot,
   decodeSlot,
   keyRefSlot,
+  nullSlot,
   numberSlot,
   objectRefSlot,
   stringRefSlot,
@@ -124,6 +126,11 @@ function encodeValue(
           : undefined;
       return stringValueRefSlot(mem.storeStringValue(value, oldRef));
     default:
+      if (value === null) {
+        // `null` is a supported value (stored as TYPE_NULL). `undefined` is
+        // intentionally still rejected below.
+        return nullSlot();
+      }
       if (Array.isArray(value)) {
         // Nested arrays are stored as array-refs in the parent array's slots
         // (recursively). Elements may be any encodable value (primitives,

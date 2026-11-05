@@ -66,6 +66,11 @@ export const TYPE_OBJECT_REF = 9;
  * changes stay in sync). `a` is the referenced key's stable Index Table index.
  */
 export const TYPE_KEY_REF = 10;
+/**
+ * The `null` value. No payload in a/b/c — the presence of the slot's type is
+ * the entire value. `undefined` is intentionally still not representable.
+ */
+export const TYPE_NULL = 11;
 
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
@@ -203,6 +208,11 @@ export function keyRefSlot(index: number): ValueSlot {
   return { type: TYPE_KEY_REF, a: index, b: 0, c: 0 };
 }
 
+/** Encode the `null` value. */
+export function nullSlot(): ValueSlot {
+  return { type: TYPE_NULL, a: 0, b: 0, c: 0 };
+}
+
 /** Decode a ValueSlot into a JS value (primitives) or a ref object. */
 export function decodeSlot(slot: ValueSlot): unknown {
   switch (slot.type) {
@@ -222,6 +232,8 @@ export function decodeSlot(slot: ValueSlot): unknown {
       return { offset: slot.a, length: slot.b };
     case TYPE_STRING_VALUE_REF:
       return { offset: slot.a, length: slot.b };
+    case TYPE_NULL:
+      return null;
     case TYPE_ARRAY_REF:
       return { offset: slot.a, count: slot.b, capacity: slot.c };
     case TYPE_OBJECT_REF:

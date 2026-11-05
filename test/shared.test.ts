@@ -498,9 +498,72 @@ describe("Shared", () => {
     }).toThrow(TypeError);
   });
 
-  test("rejects null and undefined values", () => {
-    expect(() => Shared("bad-2", null as never)).toThrow(TypeError);
-    expect(() => Shared("bad-3", undefined as never)).toThrow(TypeError);
+  test("rejects undefined values", () => {
+    expect(() => Shared("bad-2", undefined as never)).toThrow(TypeError);
+  });
+
+  test("supports null as a top-level value", () => {
+    const v = Shared<null>("null-1", null);
+    expect(v.read()).toBeNull();
+  });
+
+  test("reads null from a shared object property", () => {
+    const obj = Shared("null-2", { a: 1, m: null as number | null, z: "x" });
+    expect(obj.m).toBeNull();
+    obj.m = 2;
+    expect(obj.m).toBe(2);
+    obj.m = null;
+    expect(obj.m).toBeNull();
+    expect(obj.read().m).toBeNull();
+  });
+
+  test("reads null from a shared array element", () => {
+    const arr = Shared<Array<number | null>>("null-3", [1, null, 3]);
+    expect(arr[1]).toBeNull();
+    expect(arr.length).toBe(3);
+    arr[1] = 7;
+    expect(arr[1]).toBe(7);
+    arr[1] = null;
+    expect(arr[1]).toBeNull();
+    expect(arr.read()[1]).toBeNull();
+  });
+
+  test("stores null inside a nested object", () => {
+    const obj = Shared("null-4", {
+      nested: { flag: true, nothing: null as string | null },
+    });
+    expect(obj.nested.nothing).toBeNull();
+    obj.nested.nothing = "filled";
+    expect(obj.nested.nothing).toBe("filled");
+  });
+
+  test("stores null inside a nested array", () => {
+    const arr = Shared<Array<Array<number | null>>>("null-5", [
+      [null, 0],
+      [1],
+    ]);
+    expect(arr[0]![0]).toBeNull();
+    arr[0]!.push(null);
+    expect(arr[0]![2]).toBeNull();
+  });
+
+  test("supports null via update", () => {
+    const obj = Shared<{ v: string | number | null }>("null-6", { v: "set" });
+    expect(obj.v).toBe("set");
+    const updated = obj.update((current) => {
+      return { ...current, v: null };
+    });
+    expect(updated.v).toBeNull();
+    expect(obj.v).toBeNull();
+    obj.update((current) => ({ ...current, v: 42 }));
+    expect(obj.v).toBe(42);
+  });
+
+  test("supports null via write", () => {
+    const v = Shared<number | null>("null-7", 1);
+    expect(v.read()).toBe(1);
+    v.write(null);
+    expect(v.read()).toBeNull();
   });
 
   test("creates a shared value from a sync loader", async () => {

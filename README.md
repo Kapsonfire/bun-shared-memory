@@ -92,7 +92,8 @@ See [SPEC.md](./SPEC.md) for the full specification.
 - **Objects** have a **fixed shape**: once created, properties may not be added or removed — only their values can change.
 - **Nested objects and arrays** are supported: an object or array can contain other plain objects and arrays (read lazily, mutated in place).
 - **Nested `Shared` references**: a `Shared` object can be stored inside another object or array as a _live reference_ — both stay in sync (mutating either updates the same shared value). Self-references and mutual references are supported as long as the property exists in the object's initial fixed shape.
-- **Not allowed**: `null`, `undefined`.
+- **`null` is allowed** as a value (top-level, object property, or array element).
+- **Not allowed**: `undefined`.
 
 ## Usage
 
