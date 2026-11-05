@@ -41,9 +41,11 @@ function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
 
   worker.addEventListener("message", (e: MessageEvent) => {
     const data = e.data as
-      | { type?: string; ready?: boolean }
-      | { name: string; age: number };
-    if (data && (data as { type?: string }).type === "__HYPERSHM_INIT_REQUEST__") {
+      { type?: string; ready?: boolean } | { name: string; age: number };
+    if (
+      data &&
+      (data as { type?: string }).type === "__HYPERSHM_INIT_REQUEST__"
+    ) {
       worker.postMessage({
         type: "__HYPERSHM_INIT_RESPONSE__",
         buffer: arena.buffer,

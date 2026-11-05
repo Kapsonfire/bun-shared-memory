@@ -65,13 +65,19 @@ function merge(bsm: MeasuredOp[], cofusion: MeasuredOp[]): void {
       console.error(`No cofusion result for "${b.name}"`);
       continue;
     }
-    results.push({ name: b.name, bsmOps: b.ops, cofusionOps: cofOps, ratio: b.ops / cofOps });
+    results.push({
+      name: b.name,
+      bsmOps: b.ops,
+      cofusionOps: cofOps,
+      ratio: b.ops / cofOps,
+    });
   }
 }
 
 /** Print the comparison as a compact table. */
 function printSummary(): void {
-  const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  const fmt = (n: number) =>
+    n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 
   const header = `│ ${"operation".padEnd(26)} │ ${"bsm ops/s".padStart(12)} │ ${"cofusion ops/s".padStart(14)} │ ${"ratio".padStart(6)} │ winner        │`;
   const sep = `├${"─".repeat(28)}┼${"─".repeat(14)}┼${"─".repeat(16)}┼${"─".repeat(8)}┼${"─".repeat(14)}┤`;

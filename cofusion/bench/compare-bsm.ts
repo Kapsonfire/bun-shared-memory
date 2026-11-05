@@ -81,7 +81,10 @@ const ops: Array<{ name: string; fn: () => unknown }> = [];
   ops.push({ name: "object · read string prop", fn: () => obj.name });
   ops.push({ name: "object · read boolean prop", fn: () => obj.active });
   ops.push({ name: "object · write number prop", fn: () => (obj.id = 2) });
-  ops.push({ name: "object · write string prop", fn: () => (obj.name = "Bob") });
+  ops.push({
+    name: "object · write string prop",
+    fn: () => (obj.name = "Bob"),
+  });
 }
 
 // When a single operation name is passed as a CLI argument, measure only that

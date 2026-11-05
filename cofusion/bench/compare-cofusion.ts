@@ -39,17 +39,33 @@ const ops: Array<{ name: string; fn: () => unknown }> = [];
   ops.push({ name: "number[] · read index", fn: () => numArr[3] });
   ops.push({ name: "number[] · write index", fn: () => (numArr[3] = 99) });
 
-  const strArr = arena.shared<string[]>(
-    nextKey("strarr"),
-    ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
-  );
+  const strArr = arena.shared<string[]>(nextKey("strarr"), [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+  ]);
   ops.push({ name: "string[] · read index", fn: () => strArr[3] });
   ops.push({ name: "string[] · write index", fn: () => (strArr[3] = "z") });
 
-  const boolArr = arena.shared<boolean[]>(
-    nextKey("boolarr"),
-    [true, false, true, false, true, false, true, false, true, false],
-  );
+  const boolArr = arena.shared<boolean[]>(nextKey("boolarr"), [
+    true,
+    false,
+    true,
+    false,
+    true,
+    false,
+    true,
+    false,
+    true,
+    false,
+  ]);
   ops.push({ name: "boolean[] · read index", fn: () => boolArr[3] });
   ops.push({ name: "boolean[] · write index", fn: () => (boolArr[3] = true) });
 }
@@ -64,7 +80,10 @@ const ops: Array<{ name: string; fn: () => unknown }> = [];
   ops.push({ name: "object · read string prop", fn: () => obj.name });
   ops.push({ name: "object · read boolean prop", fn: () => obj.active });
   ops.push({ name: "object · write number prop", fn: () => (obj.id = 2) });
-  ops.push({ name: "object · write string prop", fn: () => (obj.name = "Bob") });
+  ops.push({
+    name: "object · write string prop",
+    fn: () => (obj.name = "Bob"),
+  });
 }
 
 // When a single operation name is passed as a CLI argument, measure only that
