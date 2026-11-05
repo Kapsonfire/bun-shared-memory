@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-05
+
+### Fixed
+
+- **Concurrent key registration no longer splits a key across two index
+  entries**. When several workers created the same key at the same time
+  (e.g. two workers both calling `Shared("counter", 0)`), the existence check
+  was not atomic: both workers could observe the key as absent and both insert
+  it, producing two index-table entries with separate data offsets and version
+  cells. Reads and writes then resolved to different entries, so updates became
+  invisible across workers (a writer's value appeared stuck at the initial
+  value). Key registration now runs under the shared mutex, so only the first
+  worker inserts the key and every other worker reuses it.
+
 ## [0.2.2] - 2026-11-05
 
 ### Added
@@ -321,6 +335,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[0.2.3]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.1.6...v0.1.7

@@ -732,18 +732,42 @@ export function Shared<T>(
 
   if (typeof initialOrLoader === "function") {
     return Promise.resolve((initialOrLoader as Loader<T>)()).then((value) => {
-      ref.write(value);
+      registerInitial(mem, key, ref, value);
       return ref;
     });
   }
 
-  // If the key already exists in shared memory (e.g. it was created by the
-  // main thread and this is a worker sharing the same buffers), don't
-  // overwrite it with the initial value.
-  if (getOffset(mem, key) === null) {
-    ref.write(initialOrLoader as T);
-  }
+  registerInitial(mem, key, ref, initialOrLoader as T);
   return ref;
+}
+
+/**
+ * Register a key's initial value exactly once, serialized across workers.
+ *
+ * When several workers call `Shared` for the same key concurrently, the
+ * raw existence check is not atomic: two workers can both see the key as
+ * absent and both insert it, producing two index-table entries for the same
+ * key (each with its own data offset and version cell). Reads and writes then
+ * resolve to different entries and updates become invisible across workers.
+ *
+ * Holding the shared lock while checking existence and writing the initial
+ * value makes registration atomic: only the first worker inserts, and every
+ * other worker observes the already-created key and preserves its value.
+ */
+function registerInitial(
+  mem: SharedMemory,
+  key: string,
+  ref: { write(value: unknown): void },
+  value: unknown,
+): void {
+  mem.withLock(() => {
+    // If the key already exists in shared memory (e.g. it was created by the
+    // main thread or a racing worker), don't overwrite it with the initial
+    // value.
+    if (getOffset(mem, key) === null) {
+      ref.write(value);
+    }
+  });
 }
 
 /**
