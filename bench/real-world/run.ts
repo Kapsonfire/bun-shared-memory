@@ -31,9 +31,9 @@ import type { Methodology, Transport } from "./api.ts";
 const WORKERS_PER_METHOD = 4;
 const DEFAULT_REQUESTS = 100_000;
 /** Measured samples per worker; the worker reports the minimum. */
-const SAMPLES_PER_WORKER = 5;
+const SAMPLES_PER_WORKER = 15;
 /** Full runs per methodology (each spawns the workers again); min is kept. */
-const RUNS_PER_METHOD = 3;
+const RUNS_PER_METHOD = 5;
 
 const totalRequests = Number(process.argv[2] ?? DEFAULT_REQUESTS);
 
