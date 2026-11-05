@@ -33,7 +33,7 @@ function spawnCofusionWorker(workerCode: string): Worker {
  * "read" message and resolves with the worker's reply.
  */
 function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
-  const pending: Array<(data: unknown) => void> = [];
+  const pending: Array<(data: { name: string; age: number }) => void> = [];
   let readyResolve: () => void;
   const ready = new Promise<void>((resolve) => {
     readyResolve = resolve;
@@ -57,7 +57,7 @@ function connectWorker(worker: Worker, arena: { buffer: SharedArrayBuffer }) {
     }
     if (data && "name" in data) {
       const resolve = pending.shift();
-      if (resolve) resolve(data);
+      if (resolve) resolve(data as { name: string; age: number });
     }
   });
 
