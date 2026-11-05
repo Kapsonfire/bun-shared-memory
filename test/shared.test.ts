@@ -157,6 +157,171 @@ describe("Shared", () => {
     expect(data.tags[1]).toBe("z");
   });
 
+  test("supports nested arrays via read()", () => {
+    const grid = Shared("nested-1", [
+      [1, 2],
+      [3, 4],
+    ]);
+    expect(grid.read()).toEqual([
+      [1, 2],
+      [3, 4],
+    ]);
+  });
+
+  test("supports reading nested array elements through the proxy", () => {
+    const grid = Shared("nested-2", [
+      [1, 2],
+      [3, 4],
+    ]);
+    expect(grid[0]![0]).toBe(1);
+    expect(grid[0]![1]).toBe(2);
+    expect(grid[1]![0]).toBe(3);
+    expect(grid[1]![1]).toBe(4);
+    expect(grid[0]!.length).toBe(2);
+  });
+
+  test("supports writing nested array elements through the proxy", () => {
+    const grid = Shared("nested-3", [
+      [1, 2],
+      [3, 4],
+    ]);
+    grid[0]![1] = 99;
+    expect(grid[0]![1]).toBe(99);
+    expect(grid.read()).toEqual([
+      [1, 99],
+      [3, 4],
+    ]);
+  });
+
+  test("supports push on a nested array", () => {
+    const grid = Shared("nested-4", [
+      [1, 2],
+      [3, 4],
+    ]);
+    grid[0]!.push(5);
+    expect(grid[0]!.length).toBe(3);
+    expect(grid[0]![2]).toBe(5);
+    expect(grid.read()).toEqual([
+      [1, 2, 5],
+      [3, 4],
+    ]);
+  });
+
+  test("supports pop on a nested array", () => {
+    const grid = Shared("nested-5", [
+      [1, 2],
+      [3, 4],
+    ]);
+    const popped = grid[1]!.pop();
+    expect(popped).toBe(4);
+    expect(grid[1]!.length).toBe(1);
+    expect(grid.read()).toEqual([[1, 2], [3]]);
+  });
+
+  test("supports deeply nested arrays", () => {
+    const cube = Shared("nested-6", [
+      [
+        [1, 2],
+        [3, 4],
+      ],
+      [
+        [5, 6],
+        [7, 8],
+      ],
+    ]);
+    expect(cube[0]![1]![0]).toBe(3);
+    cube[1]![0]![1] = 99;
+    expect(cube[1]![0]![1]).toBe(99);
+    expect(cube.read()).toEqual([
+      [
+        [1, 2],
+        [3, 4],
+      ],
+      [
+        [5, 99],
+        [7, 8],
+      ],
+    ]);
+  });
+
+  test("supports nested arrays as object properties", () => {
+    const data = Shared("nested-7", {
+      matrix: [
+        [1, 2],
+        [3, 4],
+      ],
+      name: "m",
+    });
+    expect(data.matrix[0]![1]).toBe(2);
+    data.matrix[1]![0] = 99;
+    expect(data.matrix[1]![0]).toBe(99);
+    data.matrix[0]!.push(5);
+    expect(data.matrix[0]!.length).toBe(3);
+    expect(data.name).toBe("m");
+  });
+
+  test("cached array proxy reflects in-place push growth", () => {
+    const data = Shared("nested-10", {
+      matrix: [
+        [1, 2],
+        [3, 4],
+      ],
+    });
+    const row = data.matrix[0]!;
+    row.push(5);
+    // The same cached proxy must see the new length and allow writing the
+    // newly appended element.
+    expect(row.length).toBe(3);
+    row[2] = 9;
+    expect(row[2]).toBe(9);
+    expect(data.read()).toEqual({
+      matrix: [
+        [1, 2, 9],
+        [3, 4],
+      ],
+    });
+  });
+
+  test("supports splice on a nested array", () => {
+    const grid = Shared("nested-11", [
+      [1, 2, 3],
+      [4, 5, 6],
+    ]);
+    grid[0]!.splice(1, 1);
+    expect(grid[0]!.length).toBe(2);
+    expect(grid[0]![0]).toBe(1);
+    expect(grid[0]![1]).toBe(3);
+    expect(grid.read()).toEqual([
+      [1, 3],
+      [4, 5, 6],
+    ]);
+  });
+
+  test("supports mixed nested arrays with primitives", () => {
+    const data = Shared("nested-8", [
+      [1, "a"],
+      [true, 2n],
+    ]);
+    expect(data[0]![1]).toBe("a");
+    expect(data[1]![0]).toBe(true);
+    expect(data[1]![1]).toBe(2n);
+  });
+
+  test("read() returns a deep copy that cannot corrupt the cache", () => {
+    const grid = Shared("nested-9", [
+      [1, 2],
+      [3, 4],
+    ]);
+    const copy = grid.read() as number[][];
+    copy[0]![0] = 999;
+    // The shared value must be unaffected by mutating the returned copy.
+    expect(grid[0]![0]).toBe(1);
+    expect(grid.read()).toEqual([
+      [1, 2],
+      [3, 4],
+    ]);
+  });
+
   test("allows changing values of existing object properties", () => {
     const user = Shared("user-4", { name: "Alice", age: 30 });
     user.age = 31;
@@ -186,8 +351,8 @@ describe("Shared", () => {
     expect(() => Shared("bad-3", undefined as never)).toThrow(TypeError);
   });
 
-  test("rejects nested arrays", () => {
-    expect(() => Shared("bad-4", [[1, 2]])).toThrow(TypeError);
+  test("rejects objects nested inside arrays", () => {
+    expect(() => Shared("bad-4", [{ a: 1 }])).toThrow(TypeError);
   });
 
   test("creates a shared value from a sync loader", async () => {

@@ -37,6 +37,25 @@ const MUTATING_METHODS = new Set([
 type Primitive = number | string | boolean | bigint;
 
 /**
+ * A single step in the path to a nested array. The first step may be a
+ * property name (an array property of a shared object); all subsequent steps
+ * are array indices.
+ */
+type ArrayStep =
+  { kind: "prop"; name: string } | { kind: "index"; index: number };
+
+/**
+ * Locates an array within shared memory. `path` is empty for a top-level
+ * array value, `[{kind:"prop",name}]` for an array property of a shared
+ * object, and longer for nested arrays (e.g. `[{kind:"index",index:0}]` for
+ * `arr[0]`).
+ */
+interface ArrayLocator {
+  key: string;
+  path: ArrayStep[];
+}
+
+/**
  * Run a write operation. Writes are lock-free by default: they increment the
  * in-flight write counter, and only fall back to the shared mutex if a
  * defragmentation pass is running (rare). This keeps the hot write path free
@@ -92,10 +111,14 @@ function encodeValue(
       return stringValueRefSlot(mem.storeStringValue(value, oldRef));
     default:
       if (Array.isArray(value)) {
+        // Nested arrays are stored as array-refs in the parent array's slots
+        // (recursively). Nested objects are still rejected: objects have a
+        // fixed shape and are only supported at the top level or as object
+        // properties, not inside arrays.
         for (const v of value) {
-          if (Array.isArray(v) || (v !== null && typeof v === "object")) {
+          if (v !== null && typeof v === "object" && !Array.isArray(v)) {
             throw new TypeError(
-              "Arrays may only contain primitives and bigints (no nested arrays or objects)",
+              "Arrays may only contain primitives, bigints, and nested arrays (no objects)",
             );
           }
         }
@@ -333,17 +356,17 @@ function getObjectLayout(mem: SharedMemory, key: string): ObjectLayout | null {
  * Deep-ish copy of a decoded value, so callers can't corrupt the cache.
  *
  * Uses `Object.assign` for the fast shallow copy, then a `for...in` pass to
- * copy any nested arrays (so mutating a returned array property cannot corrupt
- * the cache). This is ~4.5× faster than the previous `Object.entries` + spread
- * loop, which allocated an entries array and re-checked `Array.isArray` on
- * every property.
+ * recursively copy any nested arrays (so mutating a returned array property
+ * cannot corrupt the cache). This is ~4.5× faster than the previous
+ * `Object.entries` + spread loop, which allocated an entries array and
+ * re-checked `Array.isArray` on every property.
  */
 function copyValue(value: unknown): unknown {
-  if (Array.isArray(value)) return [...value];
+  if (Array.isArray(value)) return value.map(copyValue);
   if (value !== null && typeof value === "object") {
     const copy = Object.assign({} as Record<string, unknown>, value);
     for (const k in copy) {
-      if (Array.isArray(copy[k])) copy[k] = [...(copy[k] as unknown[])];
+      copy[k] = copyValue(copy[k]);
     }
     return copy;
   }
@@ -460,7 +483,11 @@ function readProp(
   }
   const propValue = (value as Record<string | symbol, unknown>)[prop];
   if (Array.isArray(propValue)) {
-    return createArrayProxy(mem, key, prop as string, arrayCapacity);
+    return createArrayProxy(
+      mem,
+      { key, path: [{ kind: "prop", name: prop as string }] },
+      arrayCapacity,
+    );
   }
   return propValue;
 }
@@ -496,7 +523,11 @@ function readObjectProp(
   const slot = mem.readValueSlot(slotOffset);
   let value = decodeValue(mem, slot);
   if (Array.isArray(value)) {
-    value = createArrayProxy(mem, key, prop, arrayCapacity);
+    value = createArrayProxy(
+      mem,
+      { key, path: [{ kind: "prop", name: prop }] },
+      arrayCapacity,
+    );
   }
   fieldCache.version = version;
   fieldCache.value = value;
@@ -959,10 +990,10 @@ function createSharedRef<T>(
       // push/pop on a top-level array: operate directly on the array ref
       // without decoding the whole array (O(1) amortized).
       if (prop === "push" || prop === "pop") {
-        const slotOffset = findArrayRefSlot(mem, key, null);
-        if (slotOffset !== null) {
+        const resolved = resolveArrayRef(mem, { key, path: [] });
+        if (resolved !== null) {
           return (...args: unknown[]) =>
-            mutateArrayRef(mem, key, null, prop, args);
+            mutateArrayRef(mem, { key, path: [] }, prop, args);
         }
       }
 
@@ -1254,55 +1285,110 @@ function mutateValue<T, R>(
  * `prop` is null for a top-level array value, or the property name for an
  * array property of an object. Returns null if the value is not an array.
  */
-function findArrayRefSlot(
+/**
+ * Resolve the array-ref slot for a locator, returning the current array-ref
+ * ValueSlot and a `write` function that persists a new array-ref slot back to
+ * its location (DataTable offset for a top-level array or object property,
+ * ArrayTable slot for a nested array). Returns null if the value at the
+ * locator is not an array.
+ */
+function resolveArrayRef(
   mem: SharedMemory,
-  key: string,
-  prop: string | null,
-): number | null {
-  if (prop === null) {
+  locator: ArrayLocator,
+): { slot: ValueSlot; write: (s: ValueSlot) => void } | null {
+  const { key, path } = locator;
+  if (path.length === 0) {
     const offset = getOffset(mem, key);
     if (offset === null) return null;
     const slot = mem.readValueSlot(offset);
-    return slot.type === TYPE_ARRAY_REF ? offset : null;
+    if (slot.type !== TYPE_ARRAY_REF) return null;
+    return { slot, write: (s) => mem.updateValueSlot(offset, s) };
   }
-  const layout = getObjectLayout(mem, key);
-  if (layout === null) return null;
-  const slotOffset = layout.properties.get(prop);
-  if (slotOffset === undefined) return null;
-  const slot = mem.readValueSlot(slotOffset);
-  return slot.type === TYPE_ARRAY_REF ? slotOffset : null;
+  const first = path[0]!;
+  if (first.kind === "prop") {
+    const layout = getObjectLayout(mem, key);
+    if (layout === null) return null;
+    const slotOffset = layout.properties.get(first.name);
+    if (slotOffset === undefined) return null;
+    const slot = mem.readValueSlot(slotOffset);
+    if (slot.type !== TYPE_ARRAY_REF) return null;
+    if (path.length === 1) {
+      return { slot, write: (s) => mem.updateValueSlot(slotOffset, s) };
+    }
+    return resolveNestedArrayRef(mem, slot, path.slice(1));
+  }
+  // First step is an index: the root must be a top-level array.
+  const rootOffset = getOffset(mem, key);
+  if (rootOffset === null) return null;
+  const rootSlot = mem.readValueSlot(rootOffset);
+  if (rootSlot.type !== TYPE_ARRAY_REF) return null;
+  return resolveNestedArrayRef(mem, rootSlot, path);
+}
+
+/**
+ * Navigate into a nested array starting from a parent array-ref slot. `steps`
+ * are all index steps. Returns the resolved array-ref slot and a writer, or
+ * null if any step is not an array or is out of bounds.
+ */
+function resolveNestedArrayRef(
+  mem: SharedMemory,
+  parentSlot: ValueSlot,
+  steps: ArrayStep[],
+): { slot: ValueSlot; write: (s: ValueSlot) => void } | null {
+  let ref: ArrayRef = {
+    offset: parentSlot.a,
+    count: parentSlot.b,
+    capacity: parentSlot.c,
+  };
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]!;
+    if (step.kind !== "index") return null;
+    if (step.index >= ref.count) return null;
+    const slot = mem.readArraySlot(ref, step.index);
+    if (slot.type !== TYPE_ARRAY_REF) return null;
+    if (i === steps.length - 1) {
+      const slotRef = ref;
+      const index = step.index;
+      return { slot, write: (s) => mem.updateArraySlot(slotRef, index, s) };
+    }
+    ref = { offset: slot.a, count: slot.b, capacity: slot.c };
+  }
+  return null;
 }
 
 /**
  * O(1) in-place push/pop on a shared array ref, without decoding or
- * re-encoding the whole array. `prop` is null for a top-level array, or the
- * property name for an array property of an object.
+ * re-encoding the whole array. `locator` identifies the array (top-level,
+ * object property, or nested).
  */
 function mutateArrayRef(
   mem: SharedMemory,
-  key: string,
-  prop: string | null,
+  locator: ArrayLocator,
   method: "push" | "pop",
   args: unknown[],
 ): unknown {
   return writeLock(mem, () => {
-    const slotOffset = findArrayRefSlot(mem, key, prop);
-    if (slotOffset === null) {
+    const resolved = resolveArrayRef(mem, locator);
+    if (resolved === null) {
       throw new TypeError("Value is not an array");
     }
-    const slot = mem.readValueSlot(slotOffset);
-    const ref: ArrayRef = { offset: slot.a, count: slot.b, capacity: slot.c };
+    const slot = resolved.slot;
+    const ref: ArrayRef = {
+      offset: slot.a,
+      count: slot.b,
+      capacity: slot.c,
+    };
 
     if (method === "push") {
       for (const arg of args) {
         const next = mem.appendArraySlot(ref, encodeValue(mem, arg));
         // Always persist the new count (and offset/capacity if moved).
-        mem.updateValueSlot(slotOffset, arrayRefSlot(next));
+        resolved.write(arrayRefSlot(next));
         ref.offset = next.offset;
         ref.count = next.count;
         ref.capacity = next.capacity;
       }
-      bump(mem, key);
+      bump(mem, locator.key);
       return ref.count;
     }
 
@@ -1320,10 +1406,46 @@ function mutateArrayRef(
       count: ref.count - 1,
       capacity: ref.capacity,
     };
-    mem.updateValueSlot(slotOffset, arrayRefSlot(next));
-    bump(mem, key);
+    resolved.write(arrayRefSlot(next));
+    bump(mem, locator.key);
     return result;
   });
+}
+
+/**
+ * Read the decoded value of the array at a locator, using the read cache for
+ * the root value and navigating the path. This is the fast read path (the
+ * root read hits the version-checked cache), matching the pre-nested-array
+ * performance for array-property reads.
+ */
+function readArrayValue(mem: SharedMemory, locator: ArrayLocator): unknown[] {
+  const root = readValue(mem, locator.key);
+  const arr = readPathValue(mem, locator, root);
+  if (!Array.isArray(arr)) {
+    throw new TypeError("Value is not an array");
+  }
+  return arr;
+}
+
+/**
+ * Navigate a decoded root value (the whole top-level value) along a locator
+ * path, returning the value at the end of the path. Used by the fallback
+ * read-modify-write paths.
+ */
+function readPathValue(
+  mem: SharedMemory,
+  locator: ArrayLocator,
+  rootValue: unknown,
+): unknown {
+  let current = rootValue;
+  for (const step of locator.path) {
+    if (step.kind === "prop") {
+      current = (current as Record<string, unknown>)[step.name];
+    } else {
+      current = (current as unknown[])[step.index];
+    }
+  }
+  return current;
 }
 
 /** Get a member of a top-level array value, with read-modify-write for mutating methods. */
@@ -1336,7 +1458,16 @@ function getTopLevelArrayMember(
 ): unknown {
   if (prop === "length") return value.length;
   if (typeof prop === "string" && /^\d+$/.test(prop)) {
-    return value[Number(prop)];
+    const index = Number(prop);
+    const element = value[index];
+    if (Array.isArray(element)) {
+      return createArrayProxy(
+        mem,
+        { key, path: [{ kind: "index", index }] },
+        arrayCapacity,
+      );
+    }
+    return element;
   }
   if (typeof prop === "symbol") {
     if (prop === Symbol.iterator) return value[Symbol.iterator].bind(value);
@@ -1347,7 +1478,7 @@ function getTopLevelArrayMember(
     // push/pop are O(1) in-place operations on the array ref.
     if (methodName === "push" || methodName === "pop") {
       return (...args: unknown[]) => {
-        return mutateArrayRef(mem, key, null, methodName, args);
+        return mutateArrayRef(mem, { key, path: [] }, methodName, args);
       };
     }
     return (...args: unknown[]) => {
@@ -1369,18 +1500,21 @@ function getTopLevelArrayMember(
   return method;
 }
 
-/** Create a proxy for an array property of a shared object. */
+/**
+ * Create a proxy for an array at a locator (a top-level array, an array
+ * property of a shared object, or a nested array). Index access and mutating
+ * methods work directly; nested array elements are returned as their own
+ * proxy so they can be mutated in place.
+ */
 function createArrayProxy(
   mem: SharedMemory,
-  key: string,
-  prop: string,
+  locator: ArrayLocator,
   arrayCapacity?: number,
 ): unknown[] {
-  // Cache the object's property slot offset and the array ref so index writes
-  // skip the per-write getObjectLayout Map lookup, properties.get, and the
-  // DataTable header reads. Invalidated when the layout version changes
-  // (defragmentation or array growth via moveArray).
-  let cachedSlotOffset: number | undefined;
+  const { key } = locator;
+  // Cache the resolved array ref and the version-cell index so index writes
+  // skip the per-write path navigation and Map lookups. Invalidated when the
+  // layout version changes (defragmentation or array growth via moveArray).
   let cachedRef:
     { offset: number; count: number; capacity: number } | undefined;
   let cachedLayoutVersion = -1;
@@ -1397,63 +1531,42 @@ function createArrayProxy(
   }
 
   /**
-   * Write a single array-property slot in place. Defined once (not per call)
-   * so the set handler can inline the writeLock without allocating a closure
-   * on every write. Mutates the cached slot offset/ref/layout version.
+   * Resolve the array ref, refreshing the cache when the layout changed or
+   * when the cached count is too small for a requested index (the array may
+   * have grown in place via `push` without a layout-version bump).
    */
-  function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
-    // Refresh the cached slot offset when the layout version changed
-    // (defragmentation may have moved the object block).
+  function getRef(minCount = 0): {
+    offset: number;
+    count: number;
+    capacity: number;
+  } {
     if (cachedLayoutVersion !== mem.getLayoutVersion()) {
-      cachedSlotOffset = undefined;
       cachedRef = undefined;
       cachedLayoutVersion = mem.getLayoutVersion();
     }
-    if (cachedSlotOffset === undefined) {
-      const layout = getObjectLayout(mem, key);
-      if (layout === null) {
-        // Fallback: full read-modify-write.
-        return mutateValue<Record<string, unknown>, boolean>(
-          mem,
-          key,
-          (fresh) => {
-            const arr = fresh[prop] as unknown[];
-            (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
-            return true;
-          },
-          arrayCapacity,
-        );
-      }
-      const so = layout.properties.get(prop);
-      if (so === undefined) {
-        throw new TypeError(
-          `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-        );
-      }
-      cachedSlotOffset = so;
+    if (cachedRef !== undefined && cachedRef.count >= minCount)
+      return cachedRef;
+    const resolved = resolveArrayRef(mem, locator);
+    if (resolved === null) {
+      throw new TypeError("Value is not an array");
     }
-    const propSlot = mem.readValueSlot(cachedSlotOffset);
-    if (
-      propSlot.type === TYPE_ARRAY_REF &&
-      typeof arrProp === "string" &&
-      /^\d+$/.test(arrProp)
-    ) {
+    cachedRef = {
+      offset: resolved.slot.a,
+      count: resolved.slot.b,
+      capacity: resolved.slot.c,
+    };
+    return cachedRef;
+  }
+
+  /**
+   * Write a single array slot in place. Defined once (not per call) so the
+   * set handler can inline the writeLock without allocating a closure on
+   * every write.
+   */
+  function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
+    if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
       const index = Number(arrProp);
-      // Use the cached ref when valid; re-read when the array may have
-      // grown past the cached count (push) or the layout changed.
-      let ref = cachedRef;
-      if (
-        ref === undefined ||
-        index >= ref.count ||
-        cachedLayoutVersion !== mem.getLayoutVersion()
-      ) {
-        ref = {
-          offset: propSlot.a,
-          count: propSlot.b,
-          capacity: propSlot.c,
-        };
-        cachedRef = ref;
-      }
+      const ref = getRef(index + 1);
       if (index >= ref.count) {
         throw new RangeError(
           `Index ${index} out of bounds for array of length ${ref.count}`,
@@ -1486,42 +1599,46 @@ function createArrayProxy(
         }
       }
       freeSlotRefs(mem, mem.readArraySlot(ref, index));
-      mem.updateArraySlot(ref, index, encodeValue(mem, val));
+      mem.updateArraySlot(ref, index, encodeValue(mem, val, arrayCapacity));
       bumpCached();
       return true;
     }
-    // Array property length write: shrink/grow in place without re-encoding
-    // the whole object (which would leave a dead slot).
-    if (propSlot.type === TYPE_ARRAY_REF && arrProp === "length") {
+    // Array length write: shrink/grow in place without re-encoding the whole
+    // value (which would leave a dead slot).
+    if (arrProp === "length") {
       const newLen = Number(val);
       if (!Number.isInteger(newLen) || newLen < 0) {
         throw new RangeError("Invalid array length");
       }
-      const ref = {
-        offset: propSlot.a,
-        count: propSlot.b,
-        capacity: propSlot.c,
-      };
+      const ref = getRef();
       if (newLen <= ref.capacity) {
-        mem.updateValueSlot(
-          cachedSlotOffset,
+        const resolved = resolveArrayRef(mem, locator);
+        if (resolved === null) {
+          throw new TypeError("Value is not an array");
+        }
+        resolved.write(
           arrayRefSlot({
             offset: ref.offset,
             count: newLen,
             capacity: ref.capacity,
           }),
         );
+        cachedRef = {
+          offset: ref.offset,
+          count: newLen,
+          capacity: ref.capacity,
+        };
         bumpCached();
         return true;
       }
       // Growing beyond capacity falls through to the full read-modify-write.
     }
     // Fallback: full read-modify-write.
-    return mutateValue<Record<string, unknown>, boolean>(
+    return mutateValue<unknown[], boolean>(
       mem,
       key,
       (fresh) => {
-        const arr = fresh[prop] as unknown[];
+        const arr = readPathValue(mem, locator, fresh) as unknown[];
         (arr as unknown as Record<string | symbol, unknown>)[arrProp] = val;
         return true;
       },
@@ -1531,25 +1648,34 @@ function createArrayProxy(
 
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
-      // push/pop on an array property: operate directly on the array ref
-      // without decoding the whole object (O(1) amortized).
+      // push/pop on the array: operate directly on the array ref without
+      // decoding the whole value (O(1) amortized).
       if (arrProp === "push" || arrProp === "pop") {
-        const slotOffset = findArrayRefSlot(mem, key, prop);
-        if (slotOffset !== null) {
+        const resolved = resolveArrayRef(mem, locator);
+        if (resolved !== null) {
           return (...args: unknown[]) =>
-            mutateArrayRef(mem, key, prop, arrProp, args);
+            mutateArrayRef(mem, locator, arrProp, args);
         }
       }
-      const current = readValue(mem, key) as Record<string, unknown>;
-      const arr = current[prop] as unknown[];
-      if (!Array.isArray(arr)) {
-        throw new TypeError(`Property "${prop}" is not an array`);
+      if (arrProp === "length") {
+        // Use the read cache (version-checked), so an in-place `push` that
+        // grew the array is reflected (the version bump invalidates the cache).
+        return readArrayValue(mem, locator).length;
       }
-      if (arrProp === "length") return arr.length;
       if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-        return arr[Number(arrProp)];
+        const index = Number(arrProp);
+        const element = readArrayValue(mem, locator)[index];
+        if (Array.isArray(element)) {
+          return createArrayProxy(
+            mem,
+            { key, path: [...locator.path, { kind: "index", index }] },
+            arrayCapacity,
+          );
+        }
+        return element;
       }
       if (typeof arrProp === "symbol") {
+        const arr = readArrayValue(mem, locator);
         if (arrProp === Symbol.iterator) return arr[Symbol.iterator].bind(arr);
         return (arr as unknown as Record<symbol, unknown>)[arrProp];
       }
@@ -1558,15 +1684,15 @@ function createArrayProxy(
         // push/pop are O(1) in-place operations on the array ref.
         if (methodName === "push" || methodName === "pop") {
           return (...args: unknown[]) => {
-            return mutateArrayRef(mem, key, prop, methodName, args);
+            return mutateArrayRef(mem, locator, methodName, args);
           };
         }
         return (...args: unknown[]) => {
-          return mutateValue<Record<string, unknown>, unknown>(
+          return mutateValue<unknown[], unknown>(
             mem,
             key,
             (fresh) => {
-              const freshArr = fresh[prop] as unknown[];
+              const freshArr = readPathValue(mem, locator, fresh) as unknown[];
               const method = (
                 freshArr as unknown as Record<
                   string,
@@ -1579,13 +1705,14 @@ function createArrayProxy(
           );
         };
       }
+      const arr = readArrayValue(mem, locator);
       const method = (arr as unknown as Record<string, unknown>)[arrProp];
       if (typeof method === "function") return method.bind(arr);
       return method;
     },
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
-      // decoding and re-encoding the whole object. Inline writeLock to avoid
+      // decoding and re-encoding the whole value. Inline writeLock to avoid
       // a closure allocation on the hot path.
       mem.beginWrite();
       if (mem.isDefragmenting()) {
