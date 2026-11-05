@@ -322,6 +322,162 @@ describe("Shared", () => {
     ]);
   });
 
+  test("supports nested plain objects via read()", () => {
+    const data = Shared("obj-nested-1", {
+      profile: { name: "A", age: 30 },
+      tags: "x",
+    });
+    expect(data.read()).toEqual({
+      profile: { name: "A", age: 30 },
+      tags: "x",
+    });
+    // Direct property access returns a live proxy; read it via property access.
+    expect(data.profile!.name).toBe("A");
+    expect(data.profile!.age).toBe(30);
+  });
+
+  test("supports reading nested object properties through the proxy", () => {
+    const data = Shared("obj-nested-2", {
+      profile: { name: "A", age: 30 },
+    });
+    expect(data.profile!.name).toBe("A");
+    expect(data.profile!.age).toBe(30);
+  });
+
+  test("supports writing nested object properties in place (stays in sync)", () => {
+    const data = Shared("obj-nested-3", {
+      profile: { name: "A", age: 30 },
+    });
+    data.profile!.name = "B";
+    expect(data.profile!.name).toBe("B");
+    expect(data.read()).toEqual({ profile: { name: "B", age: 30 } });
+  });
+
+  test("supports deeply nested plain objects", () => {
+    const data = Shared("obj-nested-4", {
+      a: { b: { c: 42, list: [{ d: 1 }] } },
+    });
+    expect(data.a!.b!.c).toBe(42);
+    data.a!.b!.c = 99;
+    data.a!.b!.list![0]!.d = 7;
+    expect(data.read()).toEqual({
+      a: { b: { c: 99, list: [{ d: 7 }] } },
+    });
+  });
+
+  test("supports objects nested inside arrays", () => {
+    const data = Shared("obj-nested-5", [{ x: 1, y: 2 }, { x: 3 }]);
+    expect(data[0]!.x).toBe(1);
+    data[1]!.x = 30;
+    expect(data.read()).toEqual([{ x: 1, y: 2 }, { x: 30 }]);
+  });
+
+  test("supports array property nested inside an object", () => {
+    const data = Shared("obj-nested-6", {
+      grid: [{ a: 1 }, { a: 2 }],
+    });
+    expect(data.grid![0]!.a).toBe(1);
+    data.grid![1]!.a = 20;
+    expect(data.read()).toEqual({ grid: [{ a: 1 }, { a: 20 }] });
+  });
+
+  test("nested plain object rejects adding a property (fixed shape)", () => {
+    const data = Shared("obj-nested-7", { profile: { name: "A" } });
+    expect(() => {
+      (data.profile as Record<string, unknown>).email = "x@y.z";
+    }).toThrow(TypeError);
+  });
+
+  test("read() returns a deep copy of nested objects", () => {
+    const data = Shared("obj-nested-8", {
+      profile: { name: "A", addr: { city: "X" } },
+    });
+    const copy = data.read() as {
+      profile: { name: string; addr: { city: string } };
+    };
+    copy.profile.addr.city = "Mutated";
+    expect(data.profile!.addr!.city).toBe("X");
+    expect(data.read()).toEqual({
+      profile: { name: "A", addr: { city: "X" } },
+    });
+  });
+
+  test("supports a shared object nested as a live reference (stays in sync)", () => {
+    const profile = Shared("obj-nested-shared-1", { name: "A", age: 30 });
+    const user = Shared("obj-nested-shared-1b", {
+      profile: profile as unknown as { name: string; age: number },
+    });
+    expect(user.profile!.name).toBe("A");
+
+    // Write through the nested reference: both see the change.
+    user.profile!.name = "B";
+    expect(profile.name).toBe("B");
+    expect(user.read()).toEqual({ profile: { name: "B", age: 30 } });
+
+    // Write through the original wrapper: the nested reference sees it too.
+    profile.age = 31;
+    expect(user.profile!.age).toBe(31);
+  });
+
+  test("supports a shared object nested in an array (live reference)", () => {
+    const a = Shared("obj-nested-shared-2", { v: 1 });
+    const b = Shared("obj-nested-shared-2b", { v: 2 });
+    const arr = Shared("obj-nested-shared-2c", [
+      a as unknown as { v: number },
+      b as unknown as { v: number },
+    ]);
+    arr[0]!.v = 10;
+    expect(a.v).toBe(10);
+    expect(arr[1]!.v).toBe(2);
+  });
+
+  test("handles self-referencing shared objects (recursion loop)", () => {
+    // The `self` property must exist in the initial shape (fixed shape), then
+    // it is reassigned to point back at the same shared object.
+    const node = Shared(
+      "obj-self-1" as string,
+      {
+        self: { placeholder: true },
+      } as Record<string, unknown>,
+    );
+    (node as unknown as Record<string, unknown>).self = node;
+    expect((node as unknown as Record<string, unknown>).self).toBe(node);
+    // read() must not recurse infinitely on the self reference.
+    expect(() => node.read()).not.toThrow();
+    const read = node.read() as Record<string, unknown>;
+    expect(read.self).toBeTruthy();
+  });
+
+  test("handles mutual shared references (recursion loop)", () => {
+    const a = Shared(
+      "obj-mut-1" as string,
+      {
+        b: { placeholder: true },
+      } as Record<string, unknown>,
+    );
+    const b = Shared(
+      "obj-mut-2" as string,
+      {
+        a: { placeholder: true },
+      } as Record<string, unknown>,
+    );
+    (a as unknown as Record<string, unknown>).b = b;
+    (b as unknown as Record<string, unknown>).a = a;
+    expect((a as unknown as Record<string, unknown>).b).toBe(b);
+    expect((b as unknown as Record<string, unknown>).a).toBe(a);
+    // read() must not recurse infinitely on the mutual reference.
+    expect(() => a.read()).not.toThrow();
+    expect(() => b.read()).not.toThrow();
+    const readA = a.read() as Record<string, unknown>;
+    expect(readA.b).toBeTruthy();
+  });
+
+  test("rejects cyclic plain objects (no representation)", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => Shared("bad-cyclic-1", { cyclic })).toThrow(TypeError);
+  });
+
   test("allows changing values of existing object properties", () => {
     const user = Shared("user-4", { name: "Alice", age: 30 });
     user.age = 31;
@@ -342,17 +498,9 @@ describe("Shared", () => {
     }).toThrow(TypeError);
   });
 
-  test("rejects nested objects", () => {
-    expect(() => Shared("bad-1", { nested: { a: 1 } })).toThrow(TypeError);
-  });
-
   test("rejects null and undefined values", () => {
     expect(() => Shared("bad-2", null as never)).toThrow(TypeError);
     expect(() => Shared("bad-3", undefined as never)).toThrow(TypeError);
-  });
-
-  test("rejects objects nested inside arrays", () => {
-    expect(() => Shared("bad-4", [{ a: 1 }])).toThrow(TypeError);
   });
 
   test("creates a shared value from a sync loader", async () => {

@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Support **nested objects**: an object property (or an array element) may now
+  be another plain object, read lazily and mutated in place (e.g.
+  `doc.profile.meta.level++` writes through to shared memory directly).
+  Two new slot types back this: `TYPE_OBJECT_REF` (a nested object block
+  in the DataTable) and `TYPE_KEY_REF` (a live reference to another shared
+  key). `read()` deep-copies nested objects; the proxy path reads lazily.
+- Support **nested `Shared` values**: storing a `Shared` object inside another
+  object or array keeps a live reference, so both wrappers stay in sync
+  (no copying). Self-references and mutual references are supported as long
+  as the referencing property exists in the object's fixed initial shape.
+- Defragmentation now remaps nested object references and rewrites their
+  property slots; the per-worker object-layout cache is re-validated against
+  the global layout version so it stays correct across a defrag.
+
+### Fixed
+
+- Fix `copyBytes` in the defrag compactor so overlapping source/destination
+  ranges (a small string-value block compacting forward over the source region
+  of a later array block) are copied overlap-safely. This previously could
+  corrupt array contents after a defragmentation that involved interleaved
+  string-value and array blocks.
+
 ## [0.2.1] - 2026-11-04
 
 ### Performance

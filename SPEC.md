@@ -27,7 +27,9 @@ Bun supports worker threads, but passing data between them typically requires st
 - **Allowed value types**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these.
 - **Mixed arrays** are allowed (e.g. `[1, "a", true, 2n]`).
 - **Objects** have a **fixed shape**: once an object is created in shared memory, its properties may not be added or removed. Only the values of existing properties may change.
-- Nested objects, `null`, and `undefined` are **not** supported as values.
+- **Nested objects and arrays** are supported (including arrays of objects and objects containing arrays), read lazily and mutated in place.
+- **Nested `Shared` values** are stored as live references that stay in sync with the referenced key (no copying). Self/mutual references are allowed as long as the referencing property exists in the object's initial fixed shape.
+- `null` and `undefined` are **not** supported as values.
 
 ## Non-Goals (Initial Scope)
 
