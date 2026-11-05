@@ -255,7 +255,7 @@ export type SharedRef<T> = [T] extends [object]
  */
 const readCache = new Map<
   string,
-  { version: number; value: unknown; index: number }
+  { version: number; value: unknown; index: number; cell: number }
 >();
 
 /**
@@ -762,7 +762,8 @@ function readProp(
   // cache hit). Keeping this monomorphic lets the JIT optimize the hot read.
   const cached = readCache.get(key);
   const value =
-    cached !== undefined && cached.version === mem.getVersion(cached.index)
+    cached !== undefined &&
+    cached.version === Atomics.load(mem.versionView, cached.cell)
       ? cached.value
       : readValue(mem, key);
   if (Array.isArray(value)) {
@@ -1076,7 +1077,8 @@ function createSharedRef<T>(
     // on every local write/update; cross-worker invalidation is detected by
     // the version check in the get handler.
     __cache: undefined as
-      { version: number; value: unknown; index: number } | undefined,
+      | { version: number; value: unknown; index: number; cell: number }
+      | undefined,
     // Cached DataTable offset for this key, valid only while the global
     // layout version is unchanged (i.e. no defragmentation has moved it).
     // Mirrors the module-level offsetCache to avoid a Map lookup on the
@@ -1348,17 +1350,22 @@ function readValue(
   mem: SharedMemory,
   key: string,
   cacheTarget?: {
-    __cache?: { version: number; value: unknown; index: number };
+    __cache?: { version: number; value: unknown; index: number; cell: number };
   },
 ): unknown {
   // Inline the read-cache fast path (see readProp) to avoid the polymorphic
   // {hit,value} union returned by readCachedValue.
   const cached = readCache.get(key);
-  if (cached !== undefined && cached.version === mem.getVersion(cached.index)) {
+  if (
+    cached !== undefined &&
+    cached.version === Atomics.load(mem.versionView, cached.cell)
+  ) {
     return cached.value;
   }
 
   const index = cached !== undefined ? cached.index : getIndex(mem, key);
+  const cell =
+    cached !== undefined ? cached.cell : mem.getVersionCellIndex(index);
   const version = mem.getVersion(index);
 
   // Cache miss: decode under the lock and cache with the observed version.
@@ -1381,7 +1388,7 @@ function readValue(
     return decodeValue(mem, mem.readValueSlot(offset));
   });
 
-  const entry = { version, value, index };
+  const entry = { version, value, index, cell };
   readCache.set(key, entry);
   if (cacheTarget) cacheTarget.__cache = entry;
   return value;
