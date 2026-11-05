@@ -334,9 +334,10 @@ function getCachedOffset(
   mem: SharedMemory,
   key: string,
   target?: WriteTarget,
+  lv?: number,
 ): number | null {
   if (target !== undefined && target.__offset !== undefined) {
-    if (target.__layoutVersion === mem.getLayoutVersion()) {
+    if (target.__layoutVersion === (lv ?? mem.getLayoutVersion())) {
       return target.__offset;
     }
     target.__offset = undefined;
@@ -345,7 +346,7 @@ function getCachedOffset(
   }
   const cached = offsetCache.get(key);
   if (cached !== undefined) {
-    if (cached.layoutVersion === mem.getLayoutVersion()) {
+    if (cached.layoutVersion === (lv ?? mem.getLayoutVersion())) {
       if (target !== undefined) {
         target.__offset = cached.offset;
         target.__layoutVersion = cached.layoutVersion;
@@ -356,10 +357,11 @@ function getCachedOffset(
   }
   const offset = getOffset(mem, key);
   if (offset !== null) {
-    offsetCache.set(key, { offset, layoutVersion: mem.getLayoutVersion() });
+    const currentLv = lv ?? mem.getLayoutVersion();
+    offsetCache.set(key, { offset, layoutVersion: currentLv });
     if (target !== undefined) {
       target.__offset = offset;
-      target.__layoutVersion = mem.getLayoutVersion();
+      target.__layoutVersion = currentLv;
       target.__type = undefined;
       target.__arrayRef = undefined;
     }
@@ -948,7 +950,10 @@ function writePropInner(
   }
 
   // Top-level array index write: update only that array slot.
-  const offset = getCachedOffset(mem, key, target);
+  // Within a lock-free write the layout version is stable, so we read it
+  // once and reuse it for all checks below, saving 2 Atomics.load ops.
+  const cachedLv = mem.getLayoutVersion();
+  const offset = getCachedOffset(mem, key, target, cachedLv);
   if (offset === null) {
     throw new Error(`No shared value found for key "${key}"`);
   }
@@ -971,7 +976,7 @@ function writePropInner(
     let ref = target?.__arrayRef;
     if (
       ref === undefined ||
-      target!.__arrayRefLayoutVersion !== mem.getLayoutVersion()
+      target!.__arrayRefLayoutVersion !== cachedLv
     ) {
       ref = {
         offset: mem.dataTable.getInt32(offset + 4),
@@ -980,7 +985,7 @@ function writePropInner(
       };
       if (target !== undefined) {
         target.__arrayRef = ref;
-        target.__arrayRefLayoutVersion = mem.getLayoutVersion();
+        target.__arrayRefLayoutVersion = cachedLv;
       }
     }
     if (index >= ref.count) {
@@ -1423,7 +1428,11 @@ function writeValueInner(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  const existing = getCachedOffset(mem, key, target);
+  // Within a lock-free write the layout version is stable (defragmentation
+  // can only start when the write counter reaches 0), so we read it once
+  // and reuse it for all checks below.
+  const cachedLv = mem.getLayoutVersion();
+  const existing = getCachedOffset(mem, key, target, cachedLv);
   if (existing !== null) {
     // Skip the DataTable type read when the slot type is known to be stable
     // (cached on the target). Only re-read when the type is unknown.
