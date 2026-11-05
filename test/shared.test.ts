@@ -538,10 +538,7 @@ describe("Shared", () => {
   });
 
   test("stores null inside a nested array", () => {
-    const arr = Shared<Array<Array<number | null>>>("null-5", [
-      [null, 0],
-      [1],
-    ]);
+    const arr = Shared<Array<Array<number | null>>>("null-5", [[null, 0], [1]]);
     expect(arr[0]![0]).toBeNull();
     arr[0]!.push(null);
     expect(arr[0]![2]).toBeNull();
