@@ -7,21 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-05
+
 ### Added
 
-- Support **nested objects**: an object property (or an array element) may now
-  be another plain object, read lazily and mutated in place (e.g.
-  `doc.profile.meta.level++` writes through to shared memory directly).
-  Two new slot types back this: `TYPE_OBJECT_REF` (a nested object block
-  in the DataTable) and `TYPE_KEY_REF` (a live reference to another shared
-  key). `read()` deep-copies nested objects; the proxy path reads lazily.
-- Support **nested `Shared` values**: storing a `Shared` object inside another
-  object or array keeps a live reference, so both wrappers stay in sync
-  (no copying). Self-references and mutual references are supported as long
-  as the referencing property exists in the object's fixed initial shape.
-- Defragmentation now remaps nested object references and rewrites their
+- **`null` is now a supported shared value**. A new `TYPE_NULL` slot type
+  allows `null` to be stored and read anywhere — top-level, object property,
+  array element, nested object/array. `undefined` remains intentionally
+  unsupported.
+- **Nested objects and live `Shared` references**: an object property (or array
+  element) may now be another plain object, read lazily and mutated in place
+  (e.g. `doc.profile.meta.level++` writes directly to shared memory). Two new
+  slot types back this: `TYPE_OBJECT_REF` (a nested object block in the
+  DataTable) and `TYPE_KEY_REF` (a live reference to another shared key).
+- **Nested `Shared` values**: storing a `Shared` object inside another object
+  or array keeps a live reference, so both wrappers stay in sync (no copying).
+- **Nested arrays**: arrays may contain other arrays (stored recursively as
+  array-refs in the ArrayTable). `arr[0][1] = x`, `arr[0].push(...)`, etc.
+- **Defragmentation** remaps nested object references and rewrites their
   property slots; the per-worker object-layout cache is re-validated against
   the global layout version so it stays correct across a defrag.
+
+### Performance
+
+- Cache the key's **version-cell index in the read cache**, so cache-hit reads
+  skip the `versionCellIndex` arithmetic and go straight to
+  `Atomics.load(view, cached.cell)`.
+- Hoist **`getLayoutVersion`** inside lock-free writes: within a write (counter
+  > 0) the layout version cannot change, so read it once and reuse it for all
+  cached-offset and ArrayRef checks, saving 2–3 `Atomics.load` ops per write.
+  Array writes improved from ~37× to ~33× slower than native.
 
 ### Fixed
 
