@@ -1,0 +1,8 @@
+---
+exclude_paths:
+  - "test/**"
+  - "cofusion/**"
+  - "benchlogs/**"
+  - "bench/**"
+  - "examples/**"
+  - "dist/**"

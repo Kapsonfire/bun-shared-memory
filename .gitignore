@@ -13,3 +13,19 @@ bench/real-world/bench.db
 
 # Generated Unix sockets (mounted from Docker containers)
 bench/real-world/sockets/
+# Build output
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Dependencies
+node_modules/
+
+# Test coverage
+coverage/
+
+# Environment
+.env
+.env.local

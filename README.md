@@ -320,6 +320,69 @@ process alive — the process exits naturally once no other work is pending
 
 A complete runnable example is in [`examples/worker/`](examples/worker/).
 
+### Browser & Web Workers
+
+The core (`SharedArrayBuffer`/`Atomics`) runs identically in modern browsers,
+so `Shared`/`SharedMemory`/`Mutex`/`Notifier` work there out of the box. Only
+the worker handshake differs: Bun auto-discovers workers via
+`process.on("worker", ...)`, but browsers have no equivalent — each Web Worker
+must be registered explicitly.
+
+Two differences to keep in mind:
+
+1. **No auto-registration.** In the browser, call `init()` on the main thread
+   and then register each worker you create with `acceptWorker(worker)` (or
+   use `spawnWorker()`, which does it for you).
+2. **`SharedArrayBuffer` needs cross-origin isolation.** Serve your app with
+   `COOP: same-origin` and `COEP: require-corp` response headers, otherwise
+   `SharedArrayBuffer` is unavailable in the browser.
+
+```ts
+// main.ts
+import { Shared, init, spawnWorker } from "bun-shared-memory";
+
+await init({ initialSize: 64 * 1024, maxByteLength: 4 * 1024 * 1024 * 1024 });
+const user = Shared("user-1", { name: "Alice", age: 30 });
+
+// spawnWorker() creates the worker and registers it with the handshake.
+const worker = spawnWorker(new URL("./worker.ts", import.meta.url), {
+  type: "module",
+});
+worker.postMessage("read");
+```
+
+```ts
+// worker.ts — identical to the Bun version
+import { Shared, init, onMessage } from "bun-shared-memory";
+
+await init(); // request the shared buffers from the main thread
+onMessage(async (e) => {
+  const user = Shared("user-1", { name: "x" });
+  self.postMessage(user.read());
+});
+```
+
+`spawnWorker()` is a thin cross-platform wrapper over `new Worker()` that
+automatically calls `acceptWorker()` on the browser main thread (and is a no-op
+overhead in Bun, where workers are auto-registered). If you prefer to build the
+`Worker` yourself, call `acceptWorker(worker)` after constructing it.
+
+> **Note on worker lifecycle & reference counting.** In Bun, the coordinator
+> learns about new workers via `process.on("worker", ...)` and detects a dead
+> worker via its `close` event. Browsers expose neither, so:
+>
+> - `acceptWorker(worker)`/`spawnWorker()` register each Web Worker with the
+>   coordinator explicitly.
+> - The worker's `init()` starts a periodic **heartbeat** (`setInterval`), and
+>   the coordinator's automatic maintenance reaps a worker whose heartbeat
+>   stalls (releases its references), so dead/terminated workers are detected
+>   without a `close` event.
+> - `coordinator.unregisterWorker(worker)` is the explicit backstop if you
+>   terminate a worker and want its references freed immediately.
+>
+> This means reference counting and automatic defragmentation work in the
+> browser exactly as they do in Bun.
+
 ## Memory budget
 
 The Index Table (including each key's version counter) uses one growable
