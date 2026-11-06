@@ -262,7 +262,7 @@ export class RefCountCoordinator {
   private readonly buffer: RefCountBuffer;
   private readonly mem: SharedMemory;
   /** workerId -> Set of objectIds that worker holds. */
-  private readonly workerRefs = new Map<number, Set<number>>();
+  private readonly workerRefs = new Map<number, Map<number, number>>();
   /** objectId -> Set of workerIds holding it. */
   private readonly objectWorkers = new Map<number, Set<number>>();
   /** workerId -> the worker object it belongs to (for reverse/explicit reaping). */
@@ -355,7 +355,7 @@ export class RefCountCoordinator {
   ): number {
     const id = workerId ?? this.buffer.allocateWorkerId();
     if (!this.workerRefs.has(id)) {
-      this.workerRefs.set(id, new Set());
+      this.workerRefs.set(id, new Map());
       // heartbeatSeen is left unset until the first heartbeat is observed, so
       // a worker that has not started heartbeating yet is not reaped.
     }
@@ -401,36 +401,60 @@ export class RefCountCoordinator {
   releaseWorker(workerId: number): void {
     const refs = this.workerRefs.get(workerId);
     if (!refs) return;
-    for (const objectId of refs) {
-      this.releaseGlobal(objectId, workerId);
+    // A worker may hold several references to the same objectId (e.g. several
+    // read() copies); every one must be released, otherwise the object leaks.
+    for (const [objectId, count] of refs) {
+      for (let i = 0; i < count; i++) {
+        this.buffer.releaseGlobal(objectId);
+      }
+      const ws = this.objectWorkers.get(objectId);
+      ws?.delete(workerId);
+      if (ws && ws.size === 0) {
+        this.objectWorkers.delete(objectId);
+      }
     }
     refs.clear();
+    this.workerRefs.delete(workerId);
   }
 
   /** Record that a worker acquired a reference to an objectId. */
   acquire(objectId: number, workerId: number): void {
     this.buffer.acquireGlobal(objectId);
-    this.workerRefs.get(workerId)?.add(objectId);
-    let ws = this.objectWorkers.get(objectId);
-    if (!ws) {
-      ws = new Set();
-      this.objectWorkers.set(objectId, ws);
+    let refs = this.workerRefs.get(workerId);
+    if (!refs) {
+      refs = new Map();
+      this.workerRefs.set(workerId, refs);
     }
-    ws.add(workerId);
+    const count = (refs.get(objectId) ?? 0) + 1;
+    refs.set(objectId, count);
+    if (count === 1) {
+      let ws = this.objectWorkers.get(objectId);
+      if (!ws) {
+        ws = new Set();
+        this.objectWorkers.set(objectId, ws);
+      }
+      ws.add(workerId);
+    }
   }
 
   /** Record that a worker released a reference to an objectId. */
   release(objectId: number, workerId: number): void {
-    this.releaseGlobal(objectId, workerId);
-  }
-
-  private releaseGlobal(objectId: number, workerId: number): void {
     this.buffer.releaseGlobal(objectId);
-    this.workerRefs.get(workerId)?.delete(objectId);
-    const ws = this.objectWorkers.get(objectId);
-    ws?.delete(workerId);
-    if (ws && ws.size === 0) {
-      this.objectWorkers.delete(objectId);
+    const refs = this.workerRefs.get(workerId);
+    if (!refs) return;
+    const count = (refs.get(objectId) ?? 1) - 1;
+    if (count <= 0) {
+      refs.delete(objectId);
+      if (refs.size === 0) {
+        this.workerRefs.delete(workerId);
+      }
+      const ws = this.objectWorkers.get(objectId);
+      ws?.delete(workerId);
+      if (ws && ws.size === 0) {
+        this.objectWorkers.delete(objectId);
+      }
+    } else {
+      refs.set(objectId, count);
     }
   }
 
