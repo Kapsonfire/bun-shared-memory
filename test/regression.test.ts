@@ -154,8 +154,8 @@ describe("P1.3 — Worker id boundaries are enforced", () => {
       maxObjects: MAX_OBJECTS,
     });
 
-    // Recompute the layout exactly as the class does.
-    const hbOffset = 3 + RING_SIZE * 3;
+    // Recompute the layout exactly as the class does (4 Int32 per event slot).
+    const hbOffset = 3 + RING_SIZE * 4;
     const refOffset = hbOffset + MAX_WORKERS;
     const view = new Int32Array(buffer.buffer);
 

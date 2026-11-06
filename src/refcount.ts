@@ -45,12 +45,25 @@ export interface RefEvent {
  * events, a heartbeat table, and a global refcount table.
  *
  * Layout (all Int32):
- *   [0]        write index (producer, workers)
+ *   [0]        write index (producer, workers, reserved atomically)
  *   [1]        read index (consumer, main thread)
  *   [2]        next worker id (allocated by workers)
- *   [3..]      ring buffer of events (workerId, op, objectId triples)
+ *   [3..]      ring buffer of events (workerId, op, objectId, seq per slot)
  *   [ringEnd..] heartbeat table (one cell per worker)
  *   [hbEnd..]   global refcount table (one cell per objectId)
+ *
+ * The ring is a bounded MPSC queue (multiple producers, single consumer).
+ * Each 4-Int32 slot carries a `seq` cell used for two things:
+ *   - Slot reservation is done atomically by `Atomics.add`ing the write
+ *     pointer, so every producer gets a globally unique slot position —
+ *     two producers can never claim the same slot (fixes lost/collided
+ *     events).
+ *   - The producer publishes the slot by advancing `seq` to `pos + 1` (a
+ *     release), and the consumer only reads a slot whose `seq` is exactly
+ *     `pos + 1`, so a slot is never observed half-written (no torn events).
+ *   - After consuming, the consumer re-arms the slot for the next
+ *     revolution by setting `seq` to `pos + ringSize`, so the slot is not
+ *     overwritten by a producer before the consumer has drained it.
  */
 export class RefCountBuffer {
   readonly buffer: SharedArrayBuffer;
@@ -67,12 +80,22 @@ export class RefCountBuffer {
     const maxWorkers = opts.maxWorkers ?? 64;
     const maxObjects = opts.maxObjects ?? 1 << 16;
     this.ringSize = ringSize;
-    this.hbOffset = 3 + ringSize * 3;
+    this.hbOffset = 3 + ringSize * 4;
     this.refOffset = this.hbOffset + maxWorkers;
     const total = this.refOffset + maxObjects;
     this.buffer =
       buffer ?? new SharedArrayBuffer(total * Int32Array.BYTES_PER_ELEMENT);
     this.view = new Int32Array(this.buffer);
+    // The sequence cells are only initialized when this instance owns a
+    // freshly-created SharedArrayBuffer. Instances that wrap an existing
+    // buffer (workers, or a coordinator reusing the memory's buffer) must not
+    // reset the ring — the buffer's original creator already initialized it.
+    if (buffer === undefined) {
+      for (let i = 0; i < ringSize; i++) {
+        // Slot i is initially ready for the producer at global position i.
+        Atomics.store(this.view, 3 + i * 4 + 3, i);
+      }
+    }
   }
 
   /** The underlying SharedArrayBuffer, for sharing with other threads. */
@@ -88,31 +111,66 @@ export class RefCountBuffer {
     return Atomics.add(this.view, 2, 1);
   }
 
-  /** Append an acquire/release event to the ring buffer (worker side). */
+  /**
+   * Append an acquire/release event to the ring buffer (worker side).
+   *
+   * Safe for multiple concurrent producers: the output slot is reserved with
+   * an atomic `add` on the write pointer, so each producer gets a unique
+   * position and two producers can never write the same slot. When the ring
+   * is full, the producer blocks until the consumer re-arms a slot, rather
+   * than silently dropping the event — a lost acquire/release would corrupt
+   * the refcount and leak or prematurely free an object.
+   */
   pushEvent(workerId: number, op: 0 | 1, objectId: number): void {
-    const write = Atomics.load(this.view, 0);
-    const read = Atomics.load(this.view, 1);
-    if (write - read >= this.ringSize) {
-      // Ring full; drop the event (main thread will reconcile via heartbeat).
-      return;
+    // Atomically reserve the next output position (old value = our position).
+    const pos = Atomics.add(this.view, 0, 1);
+    const slot = pos % this.ringSize;
+    const seqIdx = 3 + slot * 4 + 3;
+    // Wait until the consumer has re-armed this slot. The slot is free for
+    // the producer at global position `pos` when its seq equals `pos`. If the
+    // ring is full, the consumer has not re-armed it yet and we block until
+    // it does (the user signals it via Atomics.notify after re-arming).
+    let seq = Atomics.load(this.view, seqIdx);
+    while (seq !== pos) {
+      Atomics.wait(this.view, seqIdx, seq);
+      seq = Atomics.load(this.view, seqIdx);
     }
-    const base = 3 + (write % this.ringSize) * 3;
+    const base = 3 + slot * 4;
+    // Fill the slot, then publish it. The closing seq store is a release:
+    // the consumer re-checks seq === pos + 1 before reading the slot, so it
+    // can never observe a partially-written event.
     Atomics.store(this.view, base, workerId);
     Atomics.store(this.view, base + 1, op);
     Atomics.store(this.view, base + 2, objectId);
-    Atomics.store(this.view, 0, write + 1);
+    Atomics.store(this.view, seqIdx, pos + 1);
   }
 
-  /** Pop the next event, or null if the queue is empty (main thread side). */
+  /**
+   * Pop the next event, or null if the queue is empty (main thread side).
+   *
+   * Only the main thread consumes. It reads the slot at the current read
+   * position only once that slot's seq has advanced to `pos + 1` (i.e. the
+   * producer has finished writing), then re-arms the slot for the next
+   * revolution and wakes any producer blocked on a full ring.
+   */
   popEvent(): RefEvent | null {
     const read = Atomics.load(this.view, 1);
-    const write = Atomics.load(this.view, 0);
-    if (read >= write) return null;
-    const base = 3 + (read % this.ringSize) * 3;
+    const slot = read % this.ringSize;
+    const seqIdx = 3 + slot * 4 + 3;
+    // The event at this position is only ready once its seq is exactly
+    // `read + 1`. A value of `read` (or less) means the producer has not
+    // published it yet.
+    if (Atomics.load(this.view, seqIdx) !== read + 1) return null;
+    const base = 3 + slot * 4;
     const workerId = Atomics.load(this.view, base);
     const op = Atomics.load(this.view, base + 1) as 0 | 1;
     const objectId = Atomics.load(this.view, base + 2);
+    // Re-arm the slot for the producer at global position `read + ringSize`
+    // (which maps to this same ring slot), then advance the read pointer and
+    // wake any producer waiting for space.
+    Atomics.store(this.view, seqIdx, read + this.ringSize);
     Atomics.store(this.view, 1, read + 1);
+    Atomics.notify(this.view, seqIdx, Infinity);
     return { workerId, op, objectId };
   }
 
