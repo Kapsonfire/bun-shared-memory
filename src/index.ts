@@ -18,4 +18,8 @@ export {
   init,
   stopInit,
   onMessage,
+  acceptWorker,
+  spawnWorker,
 } from "./worker.ts";
+export type { SpawnWorkerOptions } from "./worker.ts";
+export { isBun, isMainThread, isWorkerContext } from "./env.ts";

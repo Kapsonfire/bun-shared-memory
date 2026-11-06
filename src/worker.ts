@@ -1,3 +1,4 @@
+import { isBun, isMainThread, supportsWorkerEvents } from "./env.ts";
 import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
 import {
   RefCountBuffer,
@@ -42,7 +43,7 @@ export function getDefaultMemory(): SharedMemory {
           "Await init() before using Shared().",
       );
     }
-    if (!Bun.isMainThread) {
+    if (!isMainThread) {
       // A worker must call `await init()` to receive the shared buffers from
       // the main thread. Without it, creating a fresh memory here would
       // silently give the worker its own, unshared buffers — a hard-to-debug
@@ -83,12 +84,19 @@ export function hasDefaultMemory(): boolean {
  * the main thread, after the buffers arrive in a worker).
  */
 export async function init(options?: SharedMemoryOptions): Promise<void> {
-  if (Bun.isMainThread) {
+  if (isMainThread) {
     if (!hasDefaultMemory()) {
       setDefaultMemory(new SharedMemory(options));
     }
-    initMain();
-    startCoordinator();
+    if (isBun) {
+      // In Bun, the main thread can auto-discover workers via
+      // `process.on("worker", ...)`.
+      initMain();
+      startCoordinator();
+    }
+    // On the browser main thread there is no way to discover new workers
+    // automatically. Instead, hand the buffers to each worker explicitly via
+    // `acceptWorker(worker)` after creating it.
     return;
   }
   await initWorker();
@@ -99,7 +107,7 @@ export async function init(options?: SharedMemoryOptions): Promise<void> {
  * worker. Useful for tests and teardown.
  */
 export function stopInit(): void {
-  if (Bun.isMainThread) {
+  if (isMainThread && isBun) {
     stopMain();
     stopCoordinator();
   }
@@ -107,8 +115,9 @@ export function stopInit(): void {
 
 /** The main-thread RefCountCoordinator, started by `init()`. */
 let coordinator: RefCountCoordinator | null = null;
-/** Cleanup function returned by `coordinator.autoRegister()`. */
-let unregisterWorkers: (() => void) | null = null;
+
+/** workerId assigned to each live worker, for the handshake reply. */
+const workerIdByWorker = new Map<unknown, number>();
 
 /** The worker-side RefCountTracker, created from the shared refcount buffer. */
 let workerTracker: RefCountTracker | null = null;
@@ -124,24 +133,26 @@ export function getDefaultTracker(): RefCountTracker | null {
  * Creates a `RefCountCoordinator` over the default memory (attaching the 5th
  * refcount buffer so it is shared with workers) and starts automatic
  * maintenance: refcount events are drained and dead space is defragmented
- * when free space is low. Also auto-registers workers so their references are
- * released on close/crash.
+ * when free space is low. Heartbeat reaping is enabled so workers that stop
+ * heartbeating (terminated/crashed without a `close` event, as can happen in
+ * the browser) are detected and their references released.
+ *
+ * Workers are registered per-handshake in `initMain()` (Bun) and
+ * `acceptWorker()` (browser).
  */
 function startCoordinator(): void {
   if (coordinator !== null) return;
   const mem = getDefaultMemory();
   coordinator = new RefCountCoordinator(mem, undefined, {
     onDefragment: (buffers) => broadcastChunkUpdate(buffers),
+    heartbeatTicks: 3,
   });
-  unregisterWorkers = coordinator.autoRegister();
 }
 
-/** Stop the coordinator's maintenance timer and worker listener. */
+/** Stop the coordinator's maintenance timer. */
 function stopCoordinator(): void {
   if (coordinator !== null) {
     coordinator.stopAutoMaintenance();
-    unregisterWorkers?.();
-    unregisterWorkers = null;
     coordinator = null;
   }
 }
@@ -161,7 +172,8 @@ let mainListener:
 /** Live workers on the main thread, for broadcasting chunk updates. */
 const liveWorkers = new Set<{
   postMessage: (msg: unknown) => void;
-  addEventListener: (type: string, fn: (e: { data: unknown }) => void) => void;
+  addEventListener?: (type: string, fn: (e: { data: unknown }) => void) => void;
+  onmessage?: unknown;
 }>();
 
 /** Main thread: answer each worker's buffer request. */
@@ -174,6 +186,10 @@ function initMain(): void {
     ) => void;
   }) => {
     liveWorkers.add(worker);
+    // Register with the refcount coordinator and remember the assigned id so
+    // the handshake reply can pass it back to the worker.
+    const workerId = coordinator?.registerWorker(worker);
+    if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
     worker.addEventListener("message", (e) => {
       const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
       if (
@@ -185,6 +201,7 @@ function initMain(): void {
         worker.postMessage({
           __sharedMemoryInit: true,
           buffers: mem.exportBuffers(),
+          workerId,
         });
         return;
       }
@@ -216,6 +233,121 @@ function broadcastChunkUpdate(buffers: {
   for (const worker of liveWorkers) {
     worker.postMessage({ __chunkUpdate: true, buffers });
   }
+}
+
+/**
+ * Register a worker on the main thread so its shared-buffer request is
+ * answered.
+ *
+ * In Bun this is automatic (`process.on("worker", ...)`, see `init()`), so
+ * this is a no-op there. On the browser main thread there is no way to
+ * discover new workers, so each one must be registered explicitly — either by
+ * calling this directly, or by using `spawnWorker()` which does it for you.
+ *
+ * The worker calls `await init()` itself to request the shared buffers.
+ *
+ * Returns the same worker for chaining.
+ */
+export function acceptWorker<
+  T extends {
+    postMessage: (msg: unknown) => void;
+    addEventListener?: (
+      type: string,
+      fn: (e: { data: unknown }) => void,
+    ) => void;
+    onmessage?: unknown;
+  },
+>(worker: T): T {
+  if (!isMainThread || isBun) {
+    // Bun main thread already auto-registers workers via `init()`. In a
+    // worker context there is nothing to register.
+    return worker;
+  }
+  liveWorkers.add(worker);
+  // Register with the refcount coordinator and remember the assigned id so the
+  // handshake reply can pass it back to the worker.
+  const workerId = coordinator?.registerWorker(worker);
+  if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
+  const listener = (e: { data: unknown }) => {
+    const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
+    if (
+      msg !== null &&
+      typeof msg === "object" &&
+      "__sharedMemoryRequest" in msg
+    ) {
+      const mem = getDefaultMemory();
+      worker.postMessage({
+        __sharedMemoryInit: true,
+        buffers: mem.exportBuffers(),
+        workerId,
+      });
+    }
+  };
+  // Preserve any user handler already assigned, and forward to it.
+  const prior = worker.onmessage;
+  const wrapped = (e: { data: unknown }) => {
+    listener(e);
+    if (prior) (prior as (e: { data: unknown }) => void).call(worker, e);
+  };
+  if (typeof worker.addEventListener === "function") {
+    worker.addEventListener("message", wrapped);
+  } else {
+    worker.onmessage = wrapped;
+  }
+  return worker;
+}
+
+/**
+ * Cross-environment worker options.
+ *
+ * `type` is standard in the Web Worker API. The remaining options are
+ * Bun-only extensions; they are typed here so that `spawnWorker` compiles for
+ * both browsers and Bun, but are ignored (and harmless) in the browser.
+ */
+export interface SpawnWorkerOptions {
+  type?: "module" | "classic";
+  env?: Record<string, string | undefined>;
+  reusePort?: boolean;
+  smol?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+}
+
+/**
+ * Spawn a worker and wire it up for shared memory automatically.
+ *
+ * The worker must call `await init()` at startup to receive the shared
+ * buffers. On the main thread:
+ *
+ * - **Bun**: `init()` already auto-registers new workers, so this is just a
+ *   thin wrapper around `new Worker(...)`.
+ * - **Browser / Bundler (Node)**: there is no `process.on("worker")`, so the
+ *   worker is automatically registered via `acceptWorker()`, which answers its
+ *   buffer request.
+ *
+ * Requires cross-origin isolation (`COOP`/`COEP`) in the browser for
+ * `SharedArrayBuffer` to be available.
+ *
+ * ```ts
+ * // worker.ts (the spawned module):
+ * await init();
+ * Shared("counter", { value: 0 });
+ *
+ * // main.ts:
+ * await init();
+ * const worker = spawnWorker(new URL("./worker.ts", import.meta.url), {
+ *   type: "module",
+ * });
+ * ```
+ */
+export function spawnWorker(
+  url: string | URL,
+  options?: SpawnWorkerOptions,
+): Worker {
+  // `Worker` only constructs in a worker-capable global scope; a bundler will
+  // map it to the platform Worker constructor.
+  const worker = new Worker(url, options as WorkerOptions);
+  return acceptWorker(worker) as Worker;
 }
 
 /** Worker: request the buffers from the main thread and await the reply. */
@@ -263,6 +395,7 @@ function installMessageWrapper(): void {
       | {
           __sharedMemoryInit?: boolean;
           buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
+          workerId?: number;
         }
       | {
           __chunkUpdate?: boolean;
@@ -284,13 +417,19 @@ function installMessageWrapper(): void {
       setDefaultMemory(mem);
       // Create the worker-side refcount tracker from the shared refcount
       // buffer, so read() acquires references that the main thread's
-      // coordinator can reclaim.
+      // coordinator can reclaim. The workerId is assigned by the coordinator
+      // (same shared counter the main thread tracks) so the two sides agree
+      // on which worker holds which refs. Fall back to allocating one only if
+      // a coordinator did not supply it.
       if (msg.buffers.refCount) {
         const rcBuffer = new RefCountBuffer(msg.buffers.refCount);
         workerTracker = new RefCountTracker(
           rcBuffer,
-          rcBuffer.allocateWorkerId(),
+          msg.workerId ?? rcBuffer.allocateWorkerId(),
         );
+        // Keep the main-thread coordinator aware this worker is alive even
+        // without a close event (needed in the browser).
+        workerTracker.startHeartbeat();
       }
       pendingInitResolve?.();
       pendingInitResolve = null;

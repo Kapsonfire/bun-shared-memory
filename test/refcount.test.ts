@@ -411,10 +411,11 @@ describe("RefCount across workers", () => {
         new URL("../src/index.ts", import.meta.url).href,
       )};
       self.onmessage = (e) => {
-        const { buffers, lockBuf, refBuf, key } = e.data;
+        const { buffers, lockBuf, refBuf, key, workerId } = e.data;
         const mem = new SharedMemory({ lock: new Mutex(lockBuf), buffers });
         const refBuf2 = new RefCountBuffer(refBuf);
-        const workerId = refBuf2.allocateWorkerId();
+        // Use the workerId assigned by the coordinator (from the shared
+        // count) so both sides agree on which worker holds which refs.
         const tracker = new RefCountTracker(refBuf2, workerId);
         const user = Shared(key, { name: "Alice", age: 30 }, { memory: mem, refCount: tracker });
         const copy = user.read(); // acquires a ref
@@ -430,8 +431,9 @@ describe("RefCount across workers", () => {
       ),
       { type: "module" },
     );
-    // Auto-register the worker; its close handler releases its refs.
-    const stop = coord.autoRegister();
+    // Register the worker with the coordinator. It returns the shared
+    // workerId we pass to the worker so both sides agree on ref ownership.
+    const workerId = coord.registerWorker(worker);
 
     const read = await new Promise<{ name: string; age: number }>((resolve) => {
       worker.onmessage = (e) =>
@@ -440,6 +442,7 @@ describe("RefCount across workers", () => {
         key: "rc-worker-1",
         lockBuf: mem.lock.buffer,
         refBuf: coord.sab,
+        workerId,
         buffers: {
           indexTable: mem.indexTable.buffers[0],
           dataTable: mem.dataTable.buffers[0],
@@ -464,7 +467,6 @@ describe("RefCount across workers", () => {
       worker.addEventListener("close", () => resolve());
     });
     expect(coord.refCount(objectId)).toBe(0);
-    stop();
   });
 
   test("auto maintenance drains events and defragments on demand", async () => {
@@ -486,6 +488,61 @@ describe("RefCount across workers", () => {
     // Push a release event; it should be drained too.
     buf.pushEvent(workerId, 0, objectId);
     await new Promise((r) => setTimeout(r, 30));
+    expect(coord.refCount(objectId)).toBe(0);
+
+    coord.stopAutoMaintenance();
+  });
+
+  test("explicit unregisterWorker releases a worker's refs (backstop)", () => {
+    const mem = new SharedMemory();
+    const coord = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: false,
+    });
+    const worker = { onclose: null as (() => void) | null };
+    const workerId = coord.registerWorker(worker);
+    coord.acquire(1, workerId);
+    coord.acquire(2, workerId);
+    expect(coord.refCount(1)).toBe(1);
+    expect(coord.refCount(2)).toBe(1);
+
+    // Forget the worker by object and by id — both release its refs.
+    coord.unregisterWorker(worker);
+    expect(coord.refCount(1)).toBe(0);
+    expect(coord.refCount(2)).toBe(0);
+  });
+
+  test("heartbeat reaping releases a worker that stopped heartbeating", async () => {
+    const mem = new SharedMemory();
+    const buf = new RefCountBuffer();
+    // Enable heartbeat reaping after 3 stalled maintenance ticks.
+    const coord = new RefCountCoordinator(mem, buf, {
+      maintenanceInterval: 5,
+      heartbeatTicks: 3,
+    });
+
+    // A worker that has never heartbeated is NOT reaped automatically (the
+    // explicit unregisterWorker backstop handles those).
+    const idleId = coord.registerWorker({});
+    const idleObject = 99;
+    buf.pushEvent(idleId, 1, idleObject);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(coord.refCount(idleObject)).toBe(1);
+
+    // A live worker keeps heartbeating (as the tracker's startHeartbeat does)
+    // and acquires a ref.
+    const workerId = coord.registerWorker({});
+    const objectId = 1;
+    for (let i = 0; i < 10; i++) {
+      buf.heartbeat(workerId);
+      await new Promise((r) => setTimeout(r, 3));
+    }
+    buf.pushEvent(workerId, 1, objectId);
+    coord.drainEvents(); // process the acquire deterministically (synchronous)
+    expect(coord.refCount(objectId)).toBe(1);
+
+    // It stops heartbeating: after enough stalled maintenance ticks its refs
+    // are released automatically.
+    await new Promise((r) => setTimeout(r, 100));
     expect(coord.refCount(objectId)).toBe(0);
 
     coord.stopAutoMaintenance();

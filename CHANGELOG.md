@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Browser support.** The library now runs in modern browsers and Web
+  Workers. Bun-specific APIs (`Bun.isMainThread`, `process.on("worker")`) are
+  feature-detected (`src/env.ts`) so the module evaluates safely without Bun.
+  New exported helpers:
+
+  - `acceptWorker(worker)` — register a Web Worker on the browser main thread
+    so its shared-buffer request is answered (a no-op in Bun, which
+    auto-discovers workers).
+  - `spawnWorker(url, options)` — cross-platform worker spawner that creates a
+    `Worker` and wires it into the handshake automatically.
+  - `isBun`, `isMainThread`, `isWorkerContext` — environment introspection.
+
+  Requires cross-origin isolation (`COOP: same-origin`, `COEP:
+require-corp`) for `SharedArrayBuffer` in the browser. See the README.
+
+- **Browser-capable reference counting.** Reference counting and automatic
+  defragmentation now work in the browser too, not just Bun:
+
+  - The `RefCountCoordinator` now uses the shared refcount buffer's
+    `workerId` (`allocateWorkerId()`) as the single source of truth and maps
+    each worker object to it (previously it used a separate internal counter
+    that could diverge from the ids in the event stream — a real bug that only
+    appeared to work with a single worker).
+  - Workers periodically **heartbeat** (`RefCountTracker.startHeartbeat()`),
+    and the coordinator's automatic maintenance reaps a worker whose heartbeat
+    stalls — detecting a dead/terminated worker without relying on a `close`
+    event (which browsers don't provide).
+  - `RefCountCoordinator.unregisterWorker(worker)` is the explicit backstop to
+    free a worker's references immediately.
+
 ## [0.2.3] - 2026-11-05
 
 ### Fixed

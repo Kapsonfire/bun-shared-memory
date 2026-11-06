@@ -1,3 +1,4 @@
+import { supportsWorkerEvents } from "./env.ts";
 import { SharedMemory } from "./memory.ts";
 
 /**
@@ -157,7 +158,18 @@ export class RefCountCoordinator {
   private readonly workerRefs = new Map<number, Set<number>>();
   /** objectId -> Set of workerIds holding it. */
   private readonly objectWorkers = new Map<number, Set<number>>();
-  private nextWorkerId = 0;
+  /** workerId -> the worker object it belongs to (for reverse/explicit reaping). */
+  private readonly workerById = new Map<number, unknown>();
+  /** workerId -> heartbeat counter last observed by the coordinator. */
+  private readonly heartbeatSeen = new Map<number, number>();
+  /** workerId -> number of consecutive maintenance ticks without a heartbeat. */
+  private readonly heartbeatMisses = new Map<number, number>();
+  /**
+   * After this many consecutive maintenance ticks with no heartbeat advance a
+   * worker is considered dead and its refs are released. `0`/undefined
+   * disables automatic heartbeat reaping.
+   */
+  private readonly heartbeatTicks: number;
   /** Free-space threshold (fraction of maxByteLength) that triggers defrag. */
   private readonly defragThreshold: number;
   /** Minimum number of freed blocks before a table is considered fragmented. */
@@ -179,6 +191,8 @@ export class RefCountCoordinator {
       minFreeBlocks?: number;
       autoMaintenance?: boolean;
       maintenanceInterval?: number;
+      /** Consecutive ticks without a heartbeat before a worker is reaped. */
+      heartbeatTicks?: number;
       onDefragment?: (buffers: {
         indexTable: SharedArrayBuffer[];
         dataTable: SharedArrayBuffer[];
@@ -189,6 +203,7 @@ export class RefCountCoordinator {
   ) {
     this.mem = mem;
     this.onDefragment = opts.onDefragment;
+    this.heartbeatTicks = opts.heartbeatTicks ?? 0;
     // Reuse the memory's shared refCount buffer if present, so the same SAB is
     // exported to workers; otherwise create a fresh one and attach it to the
     // memory so it can be shared.
@@ -214,20 +229,37 @@ export class RefCountCoordinator {
     return this.buffer.sab;
   }
 
-  /** Register a worker and attach a close listener that frees its refs. */
-  registerWorker(worker: {
-    onclose?: (() => void) | null;
-    addEventListener?: (type: string, fn: () => void) => void;
-  }): number {
-    const workerId = this.nextWorkerId++;
-    this.workerRefs.set(workerId, new Set());
-    const release = () => this.releaseWorker(workerId);
+  /**
+   * Register a worker and attach a close listener that frees its refs.
+   *
+   * The workerId is assigned by the shared refcount buffer itself
+   * (`allocateWorkerId()`), so it is the same id the worker uses for its own
+   * events and heartbeats. Pass an explicit `workerId` when the worker already
+   * allocated one (e.g. reconstructed from a handshake).
+   *
+   * Returns the workerId assigned to the worker.
+   */
+  registerWorker(
+    worker: {
+      onclose?: (() => void) | null;
+      addEventListener?: (type: string, fn: () => void) => void;
+    },
+    workerId?: number,
+  ): number {
+    const id = workerId ?? this.buffer.allocateWorkerId();
+    if (!this.workerRefs.has(id)) {
+      this.workerRefs.set(id, new Set());
+      // heartbeatSeen is left unset until the first heartbeat is observed, so
+      // a worker that has not started heartbeating yet is not reaped.
+    }
+    this.workerById.set(id, worker);
+    const release = () => this.releaseWorker(id);
     if (typeof worker.addEventListener === "function") {
       worker.addEventListener("close", release);
     } else if (worker.onclose !== undefined) {
       worker.onclose = release;
     }
-    return workerId;
+    return id;
   }
 
   /**
@@ -239,9 +271,16 @@ export class RefCountCoordinator {
    * worker's `onclose` handler is set to release all of its references on
    * close/crash.
    *
+   * On the browser main thread there is no `process.on("worker", ...)`, so
+   * this returns a no-op; instead, workers created via `acceptWorker()` /
+   * `spawnWorker()` are registered there.
+   *
    * Returns a function that removes the listener.
    */
   autoRegister(): () => void {
+    if (!supportsWorkerEvents) {
+      return () => {};
+    }
     const listener = (worker: { onclose?: (() => void) | null }) => {
       this.registerWorker(worker);
     };
@@ -303,6 +342,71 @@ export class RefCountCoordinator {
   }
 
   /**
+   * Release the references of any registered worker that was observed
+   * heartbeating and then stopped for `heartbeatTicks` consecutive maintenance
+   * cycles.
+   *
+   * Called automatically by the maintenance timer when heartbeat reaping is
+   * enabled (`heartbeatTicks > 0`). This detects a dead/terminated worker
+   * without a `close` event — relevant in the browser, which has neither
+   * `process.on("worker")` nor a reliable per-worker `close` event.
+   *
+   * A worker that never heartbeated is treated as alive and is NOT reaped here;
+   * use `unregisterWorker()` as the explicit backstop for those.
+   */
+  reapDeadWorkers(): void {
+    for (const workerId of [...this.workerRefs.keys()]) {
+      const seen = this.heartbeatSeen.get(workerId);
+      const now = this.buffer.lastHeartbeat(workerId);
+      if (seen === undefined) {
+        // Not observed alive yet. If it has actually heartbeated, record that
+        // so later stalls can be reaped; otherwise skip (may still be
+        // starting up / never heartbeats -> left to explicit unregister).
+        if (now > 0) {
+          this.heartbeatSeen.set(workerId, now);
+        }
+        continue;
+      }
+      if (now === seen) {
+        const misses = (this.heartbeatMisses.get(workerId) ?? 0) + 1;
+        this.heartbeatMisses.set(workerId, misses);
+        if (this.heartbeatTicks > 0 && misses >= this.heartbeatTicks) {
+          this.releaseWorker(workerId);
+          this.unregisterWorker(workerId);
+        }
+      } else {
+        this.heartbeatSeen.set(workerId, now);
+        this.heartbeatMisses.delete(workerId);
+      }
+    }
+  }
+
+  /**
+   * Forcibly unregister a worker (by workerId or by the worker object passed to
+   * `registerWorker`), releasing any refs it still holds.
+   *
+   * This is the explicit backstop to heartbeat reaping — call it when you know
+   * a worker has terminated and want its refs freed immediately.
+   */
+  unregisterWorker(worker: unknown | number): void {
+    const id = typeof worker === "number" ? worker : this.idForWorker(worker);
+    if (id === undefined) return;
+    this.releaseWorker(id);
+    this.workerRefs.delete(id);
+    this.workerById.delete(id);
+    this.heartbeatSeen.delete(id);
+    this.heartbeatMisses.delete(id);
+  }
+
+  /** Map a worker object back to its workerId, if registered. */
+  private idForWorker(worker: unknown): number | undefined {
+    for (const [id, w] of this.workerById) {
+      if (w === worker) return id;
+    }
+    return undefined;
+  }
+
+  /**
    * Whether any table is highly fragmented enough to warrant a defragmentation
    * pass.
    *
@@ -344,6 +448,7 @@ export class RefCountCoordinator {
     if (this.maintenanceTimer !== null) return () => {};
     this.maintenanceTimer = setInterval(() => {
       this.drainEvents();
+      if (this.heartbeatTicks > 0) this.reapDeadWorkers();
       if (this.needsDefrag()) {
         // Set the defrag flag so lock-free writes fall back to the mutex, then
         // wait for any in-flight lock-free writes to finish before compacting.
@@ -396,5 +501,30 @@ export class RefCountTracker {
   /** Periodically called by the worker to signal it is alive. */
   heartbeat(): void {
     this.buffer.heartbeat(this.workerId);
+  }
+
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Start sending periodic heartbeats so the main-thread coordinator can
+   * detect this worker is still alive.
+   *
+   * Needed when the worker may terminate without a `close` event reaching the
+   * coordinator — most importantly in the browser (Web Workers have no
+   * `process.on("worker")` and no reliable per-worker `close` event). Returns a
+   * stop function.
+   */
+  startHeartbeat(intervalMs = 1000): () => void {
+    if (this.heartbeatTimer !== null) return () => {};
+    this.heartbeatTimer = setInterval(() => this.heartbeat(), intervalMs);
+    return () => this.stopHeartbeat();
+  }
+
+  /** Stop the periodic heartbeat, if running. */
+  stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 }
