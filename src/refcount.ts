@@ -123,7 +123,7 @@ export class RefCountBuffer {
    */
   heartbeat(workerId: number): void {
     const prev = Atomics.load(this.view, this.hbOffset + workerId);
-    Atomics.store(this.view, this.hbOffset + workerId, (prev + 1) | 0);
+    Atomics.store(this.view, this.hbOffset + workerId, prev + 1);
   }
 
   /** Read a worker's last heartbeat timestamp. */
