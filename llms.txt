@@ -1,0 +1,233 @@
+bun-shared-memory — LLM Reference
+
+PACKAGE: bun-shared-memory v1.0.0
+REPO: Kapsonfire/bun-shared-memory
+LICENSE: MIT
+RUNTIME: Bun >= 1.4.0 (also works in Node.js and browser Web Workers)
+
+QUICK SUMMARY
+=============
+A TypeScript library for the Bun runtime that shares data between workers/threads
+using SharedArrayBuffer. Zero-copy, high-performance, with a Proxy-based API and
+Atomics-based synchronization. Supports objects (fixed shape), arrays, primitives,
+bigints, and nested structures.
+
+CORE API
+========
+
+1. Shared<T>(key, value, options?) -> SharedRef<T>
+   Get or create a typed wrapper for a value in shared memory.
+
+   Examples:
+     const user = Shared("user-1", { name: "Alice", age: 30 });
+     user.name = "Bob";                    // writes to shared memory
+     console.log(user.age);                // reads from shared memory
+     const scores = Shared("scores", [1, 2, 3]);
+     scores.push(4);                       // O(1) amortized
+     scores[0] = 100;                      // direct index write
+
+     // Async loader (runs once, first caller wins)
+     const config = await Shared("config", async () => loadConfig());
+
+     // Options
+     const mem = new SharedMemory({ maxTotalBytes: 64 * 1024 * 1024 });
+     const obj = Shared("obj", { x: 1 }, { memory: mem, arrayCapacity: 16 });
+
+2. SharedRef<T> — Returned Wrapper
+   For objects: properties are directly accessible (hard-baked accessors)
+   For arrays: Proxy with index access and mutating methods
+   For primitives: Proxy
+
+   Methods:
+     read(): T                    - Read full value (with deep copy)
+     write(value: T): void        - Write full value to shared memory
+     update(fn: (current: T) => T): T  - Atomic read-modify-write
+     key: string                  - The shared key name (readonly)
+     buffer: SharedArrayBuffer    - Underlying SAB (readonly)
+
+3. SharedMemory — Core Memory Manager
+   const mem = new SharedMemory({
+     initialSize?: number,            // default: 1024
+     maxByteLength?: number,          // default: 64 MiB, min 32 MiB
+     maxTotalBytes?: number,          // combined budget for Data/Str/Arr tables
+     chunkSize?: number,              // default: 32 MiB, min 4 MiB
+     lock?: Mutex,                    // shared mutex for cross-worker use
+     internCapacity?: number,         // string interning cache, default: 256
+     internMax?: number,              // intern cache max entries, default: 65536
+   });
+
+   Methods:
+     exportBuffers() -> {...}        // export all SABs for worker handoff
+     static fromBuffers(buffers)     // reconstruct from exported buffers
+     storeString(value) -> StringRef // intern string (append-only, deduped)
+     readString(ref: StringRef)
+     storeArray(slots, capacity?) -> ArrayRef
+     readArray(ref: ArrayRef)
+     appendArraySlot(ref, slot) -> ArrayRef  // O(1) amortized push
+     createObject(properties: [name, ValueSlot][]) -> offset
+     readObject(offset) -> [name, ValueSlot][]
+     getObjectLayout(key) -> ObjectLayout|null
+     lookup(key) -> offset|null
+     lookupIndex(key) -> index|null
+     insert(key, dataOffset)
+     getKeyByIndex(index) -> string|null
+     bumpVersion(index)              // invalidate read caches cross-worker
+     getLayoutVersion() -> number
+     bumpLayoutVersion()
+     beginWrite(), endWrite()        // lock-free write coordination
+     isDefragmenting() -> boolean
+     waitForWritesToFinish()
+     defragment() -> {...buffers}    // compact, reclaim dead space
+
+4. Mutex — Atomics-Based Re-entrant Lock
+   const mutex = new Mutex(buffer?: SharedArrayBuffer);
+   mutex.lock()                      // acquire (blocks with Atomics.wait)
+   mutex.unlock()                    // release (wakes waiters)
+   mutex.withLock(fn)                // run fn under lock
+   mutex.buffer                      // underlying SAB
+
+5. Notifier — Atomics-Based Signaling
+   const notifier = new Notifier(buffer?: SharedArrayBuffer);
+   notifier.wait(timeoutMs?)         // -> "ok" | "not-equal" | "timed-out"
+   notifier.notify(count = 1)        // wake up to N waiting workers
+
+6. Worker Integration
+   Main thread:
+     import { init, spawnWorker, acceptWorker, stopInit } from "bun-shared-memory";
+     await init({ maxTotalBytes: 64 * 1024 * 1024 });  // sets up refcount coordinator
+     const worker = spawnWorker(new URL("./worker.ts", import.meta.url), { type: "module" });
+     // or acceptWorker(worker) for browser environments
+     stopInit();                     // cleanup
+
+   Worker:
+     import { init, onMessage } from "bun-shared-memory";
+     await init();                    // receives shared buffers from main thread
+     Shared("myKey", { data: 42 });  // now shares with main thread
+     onMessage((e) => { /* handle messages */ });
+
+7. Environment Detection
+   import { isBun, isMainThread, isWorkerContext, isNode } from "bun-shared-memory";
+
+MEMORY ARCHITECTURE (4 + 1 BUFFERS)
+====================================
+1) Index Table    - maps object keys -> DataTable offsets
+   Single growable SAB, max 4 GiB, O(n) linear key scan
+
+2) DataTable      - stores objects + value slots
+   Chunked, variable-length blocks (OBJECT type, primitive value slots)
+
+3) StringTable    - append-only storage for strings
+   Chunked, deduped via per-worker LRU interning cache
+
+4) ArrayTable     - append-only storage for arrays
+   Chunked, capacity padding for O(1) push, relocate on overflow (doubled capacity)
+
+5) RefCountBuffer - ring buffer + heartbeat + global refcount table
+   Auto-started by init() for auto-GC
+
+Value Slot Layout (16 bytes each):
+  [0..3]   type (Int32):
+           0=number, 1=boolean, 2=bigint, 3=string-ref, 4=array-ref,
+           5=object, 6=bigint-str, 7=string-value-ref, 8=inline-string,
+           9=object-ref, 10=key-ref, 11=null
+  [4..7]   payload A (offset / int32)
+  [8..11]  payload B (length / count / int32)
+  [12..15] payload C (capacity / int32)
+
+Object Block Layout in DataTable:
+  [0..3]   type = 5 (OBJECT)
+  [4..7]   property count
+  [8..11]  objectId (monotonic, stable across defragmentation)
+  [12..15] reserved
+  then for each property:
+    [name_offset(4) + name_length(4)] -> into StringTable
+    [value_type(4) + payload_A(4) + payload_B(4) + payload_C(4)]
+
+Index Table Entry (16 bytes):
+  [0..3]   key string offset (into StringTable)
+  [4..7]   key string length
+  [8..11]  data offset (into DataTable)
+  [12..15] key version (Int32, bumped on every write)
+
+SUPPORTED TYPES
+===============
+  JS Type     | Storage                  | Notes
+  ------------|--------------------------|------------------------------------------
+  number      | Inline in slot (float64) |
+  boolean     | Inline in slot           |
+  bigint      | Inline if fits int64     | Large bigints stored as StringTable
+  string      | StringTable or inline    | Inline for <=11 bytes; deduped via interning
+  null        | TYPE_NULL slot           | undefined is NOT supported
+  Array       | ArrayTable (append-only) | Mixed types allowed; nested arrays supported
+  object      | DataTable block          | FIXED SHAPE: properties may NOT be added/removed
+  Shared obj  | Live key reference       | Stays in sync with referenced key
+
+SYNCHRONIZATION MODEL
+=====================
+1. Shared Mutex: All read/write operations acquire the shared Mutex (re-entrant).
+2. Read Cache: Each worker caches decoded values with a version number. Writes bump
+   the version cell (in the Index Table), so caches auto-invalidate cross-worker.
+3. Offset Cache: Per-worker cache of key -> DataTable offsets, invalidated on
+   defragmentation (via layoutVersion).
+4. Layout Version: Global cell bumped on GC/defragmentation, invalidating offset
+   and layout caches across all workers.
+5. Lock-free Writes: Hot writes use a write counter; if defragmentation is running,
+   falls back to mutex.
+6. Atomic Registration: Initial value writes hold the lock, so racing workers from
+   different threads don't overwrite each other's values.
+
+PERFORMANCE OPTIMIZATIONS
+=========================
+- String interning: Repeated strings share the same StringTable ref (per-worker LRU cache)
+- Inline short strings: <=11 UTF-8 bytes stored directly in the slot (no heap alloc)
+- In-place updates: Numbers/booleans/biggints written directly without ValueSlot allocation
+- String value reuse: Overwriting with a shorter string reuses existing ArrayTable block
+- Array capacity padding: push writes into reserved slots (O(1) amortized); reallocates on overflow
+- Hard-baked accessors: Objects get plain JS objects with getters/setters (no Proxy overhead)
+- Field cache: Each property getter has its own cache (avoids Map lookup per read)
+- Target cache: __cache, __offset, __arrayRef on proxy targets skip Map lookups on writes
+- Defragmentation: Auto-runs when free space < 20%, compacts all tables in-place
+- Background maintenance: Timer drains refcount events and runs defrag every 100ms (unref'd)
+
+MEMORY BUDGET
+=============
+- Index Table: Max 4 GiB (single growable SAB), excluded from maxTotalBytes
+- DataTable/StringTable/ArrayTable: Chunked buffers, each max maxByteLength (default 64 MiB, min 32 MiB)
+- maxTotalBytes: Caps combined physical size of the three chunked tables. Atomic counter shared
+  across workers; throws RangeError on overflow.
+- chunkSize: Minimum growth step (default 32 MiB, min 4 MiB). Raised as needed so no table
+  exceeds 1024 chunks.
+
+REFERENCE COUNTING (AUTO-GC)
+=============================
+When init() is called on the main thread, a RefCountCoordinator starts automatically:
+- Workers have RefCountTracker instances with FinalizationRegistry
+- Ring buffer message queue: workers send acquire/release events to main thread
+- Heartbeat table: main thread detects dead workers via heartbeat stalls (3 ticks)
+- Defragmentation reclaims dead space when free space is low (80% threshold)
+- Crash recovery: main thread releases all refs on worker close event (Bun) or
+  heartbeat stall (browser)
+
+FILE STRUCTURE
+==============
+  src/
+    index.ts           - Public exports
+    memory.ts          - Core 4-buffer SharedMemory (1661 lines)
+    shared.ts          - Proxy-based Shared/SharedRef API (2105 lines)
+    growable-buffer.ts - Growable SAB helper + SharedBudget (chunked)
+    mutex.ts           - Re-entrant Atomics mutex
+    notifier.ts        - Atomics wait/notify signaling
+    refcount.ts        - RefCountBuffer, RefCountCoordinator, RefCountTracker
+    worker.ts          - Worker handshake: init(), spawnWorker(), acceptWorker()
+    env.ts             - Environment detection (isBun, isMainThread, etc.)
+  dist/esm/            - Compiled ESM output
+  test/                - Test files
+  bench/               - Benchmarks
+  examples/            - Example projects (todo-list, worker)
+
+DESIGN DOCUMENTATION
+====================
+  SPEC.md     - Project specification and milestones
+  DESIGN.md   - Memory architecture deep-dive
+  REFCOUNT.md - Reference counting details
+  BENCH.md    - Benchmark results table
