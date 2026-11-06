@@ -75,7 +75,9 @@ describe("P1.2 — RefCount ring buffer with multiple producers", () => {
         )};
         self.onmessage = (e) => {
           const sab = e.data.sab;
-          const buffer = new RefCountBuffer(sab, { ringSize: ${RING_SIZE} });
+          const buffer = new RefCountBuffer(sab, { ringSize: ${RING_SIZE}, maxWorkers: ${
+            WORKERS + 16
+          } });
           const workerId = buffer.allocateWorkerId();
           const perWorker = ${PER_WORKER};
           // Each worker writes globally-unique objectIds (no cross-worker
@@ -144,6 +146,31 @@ describe("P1.4 — RefCount multiplicity per worker", () => {
 // `maxWorkers` cells; an id >= maxWorkers indexes into the refcount table.
 // ---------------------------------------------------------------------------
 describe("P1.3 — Worker id boundaries are enforced", () => {
+  test("throws a hard error when the worker id pool is exhausted and reuses released ids", () => {
+    const MAX_WORKERS = 4;
+    const RING_SIZE = 8;
+    const MAX_OBJECTS = 16;
+    const buffer = new RefCountBuffer(undefined, {
+      ringSize: RING_SIZE,
+      maxWorkers: MAX_WORKERS,
+      maxObjects: MAX_OBJECTS,
+    });
+
+    const ids = new Set<number>();
+    for (let i = 0; i < MAX_WORKERS; i++) {
+      ids.add(buffer.allocateWorkerId());
+    }
+    // Exhausted: the allocator must fail hard instead of overflowing past
+    // maxWorkers.
+    expect(() => buffer.allocateWorkerId()).toThrow("worker id pool exhausted");
+
+    // Releasing an id makes room for a new worker to reuse it.
+    const released = [...ids][0]!;
+    buffer.releaseWorkerId(released);
+    const reused = buffer.allocateWorkerId();
+    expect(reused).toBe(released);
+  });
+
   test("heartbeat for a workerId beyond maxWorkers does not corrupt the refcount table", () => {
     const MAX_WORKERS = 4;
     const RING_SIZE = 8;
@@ -154,18 +181,20 @@ describe("P1.3 — Worker id boundaries are enforced", () => {
       maxObjects: MAX_OBJECTS,
     });
 
-    // Recompute the layout exactly as the class does (4 Int32 per event slot).
-    const hbOffset = 3 + RING_SIZE * 4;
+    // Recompute the layout exactly as the class does (4 Int32 per event slot,
+    // plus a worker-id bitmap of ceil(maxWorkers/32) words).
+    const workerBitsOffset = 3 + RING_SIZE * 4;
+    const workerBitsWords = Math.ceil(MAX_WORKERS / 32);
+    const hbOffset = workerBitsOffset + workerBitsWords;
     const refOffset = hbOffset + MAX_WORKERS;
     const view = new Int32Array(buffer.buffer);
 
-    // Allocate ids beyond the capacity, then heartbeat with those overflowing
-    // ids.
-    for (let i = 0; i < MAX_WORKERS + 4; i++) {
-      const id = buffer.allocateWorkerId();
-      buffer.heartbeat(id);
-      buffer.lastHeartbeat(id);
-    }
+    // Defense-in-depth: even out-of-range ids must not index into the
+    // refcount table.
+    buffer.heartbeat(MAX_WORKERS + 4);
+    buffer.lastHeartbeat(MAX_WORKERS + 4);
+    buffer.heartbeat(-1);
+    buffer.lastHeartbeat(-1);
 
     // The refcount table must be untouched by overflowing heartbeats.
     for (let i = 0; i < MAX_OBJECTS; i++) {

@@ -45,12 +45,13 @@ export interface RefEvent {
  * events, a heartbeat table, and a global refcount table.
  *
  * Layout (all Int32):
- *   [0]        write index (producer, workers, reserved atomically)
- *   [1]        read index (consumer, main thread)
- *   [2]        next worker id (allocated by workers)
- *   [3..]      ring buffer of events (workerId, op, objectId, seq per slot)
- *   [ringEnd..] heartbeat table (one cell per worker)
- *   [hbEnd..]   global refcount table (one cell per objectId)
+ *   [0]          write index (producer, workers, reserved atomically)
+ *   [1]          read index (consumer, main thread)
+ *   [2]          (reserved, unused)
+ *   [3..]        ring buffer of events (workerId, op, objectId, seq per slot)
+ *   [ringEnd..]   worker id bitmap (ceil(maxWorkers/32) words; bit = id in use)
+ *   [workerBitsEnd..] heartbeat table (one cell per worker)
+ *   [hbEnd..]     global refcount table (one cell per objectId)
  *
  * The ring is a bounded MPSC queue (multiple producers, single consumer).
  * Each 4-Int32 slot carries a `seq` cell used for two things:
@@ -70,7 +71,10 @@ export class RefCountBuffer {
   private readonly view: Int32Array;
   private readonly ringSize: number;
   private readonly hbOffset: number;
+  private readonly workerBitsOffset: number;
+  private readonly workerBitsWords: number;
   private readonly refOffset: number;
+  private readonly maxWorkers: number;
 
   constructor(
     buffer?: SharedArrayBuffer,
@@ -80,7 +84,10 @@ export class RefCountBuffer {
     const maxWorkers = opts.maxWorkers ?? 64;
     const maxObjects = opts.maxObjects ?? 1 << 16;
     this.ringSize = ringSize;
-    this.hbOffset = 3 + ringSize * 4;
+    this.maxWorkers = maxWorkers;
+    this.workerBitsOffset = 3 + ringSize * 4;
+    this.workerBitsWords = Math.ceil(maxWorkers / 32);
+    this.hbOffset = this.workerBitsOffset + this.workerBitsWords;
     this.refOffset = this.hbOffset + maxWorkers;
     const total = this.refOffset + maxObjects;
     this.buffer =
@@ -104,11 +111,51 @@ export class RefCountBuffer {
   }
 
   /**
-   * Allocate a unique worker id (worker side). Each worker calls this once to
-   * obtain its id, which it uses for heartbeats and events.
+   * Allocate a worker id (worker side). Each worker calls this once to obtain
+   * its id, which it uses for heartbeats and events.
+   *
+   * Worker ids are drawn from a fixed pool of `maxWorkers` slots (a bitmap
+   * stored in shared memory). Released ids are reused by later workers, so the
+   * id space never grows unboundedly. When every slot is in use the pool is
+   * exhausted and this throws an `Error` — a hard failure rather than silently
+   * wrapping, which would alias two live workers' heartbeats/events.
    */
   allocateWorkerId(): number {
-    return Atomics.add(this.view, 2, 1);
+    for (let attempt = 0; attempt < this.workerBitsWords; attempt++) {
+      const word = Atomics.load(this.view, this.workerBitsOffset + attempt);
+      const freeBits = ~word & 0xffffffff;
+      if (freeBits !== 0) {
+        // Lowest free bit: isolate the least-significant zero of `word`.
+        const bit = 31 - Math.clz32(freeBits & -freeBits);
+        const mask = 1 << bit;
+        const old = Atomics.compareExchange(
+          this.view,
+          this.workerBitsOffset + attempt,
+          word,
+          word | mask,
+        );
+        if (old === word) {
+          const id = attempt * 32 + bit;
+          if (id >= this.maxWorkers)
+            throw new Error("worker id pool exhausted");
+          return id;
+        }
+        // Lost the race, re-scan the same word.
+        attempt--;
+      }
+    }
+    throw new Error("worker id pool exhausted");
+  }
+
+  /**
+   * Release a worker id back to the free pool so it can be reused (coordinator
+   * side). Idempotent: releasing an already-free id is a no-op.
+   */
+  releaseWorkerId(workerId: number): void {
+    if (workerId < 0 || workerId >= this.maxWorkers) return;
+    const word = workerId >>> 5;
+    const bit = workerId & 31;
+    Atomics.and(this.view, this.workerBitsOffset + word, ~(1 << bit));
   }
 
   /**
@@ -180,12 +227,14 @@ export class RefCountBuffer {
    * worker that stopped heartbeating.
    */
   heartbeat(workerId: number): void {
+    if (workerId < 0 || workerId >= this.maxWorkers) return;
     const prev = Atomics.load(this.view, this.hbOffset + workerId);
     Atomics.store(this.view, this.hbOffset + workerId, prev + 1);
   }
 
   /** Read a worker's last heartbeat timestamp. */
   lastHeartbeat(workerId: number): number {
+    if (workerId < 0 || workerId >= this.maxWorkers) return 0;
     return Atomics.load(this.view, this.hbOffset + workerId);
   }
 
@@ -311,7 +360,7 @@ export class RefCountCoordinator {
       // a worker that has not started heartbeating yet is not reaped.
     }
     this.workerById.set(id, worker);
-    const release = () => this.releaseWorker(id);
+    const release = () => this.unregisterWorker(id);
     if (typeof worker.addEventListener === "function") {
       worker.addEventListener("close", release);
     } else if (worker.onclose !== undefined) {
@@ -449,11 +498,18 @@ export class RefCountCoordinator {
   unregisterWorker(worker: unknown | number): void {
     const id = typeof worker === "number" ? worker : this.idForWorker(worker);
     if (id === undefined) return;
+    if (!this.workerById.has(id) && !this.workerRefs.has(id)) {
+      // Already fully unregistered (e.g. close event then heartbeat reap).
+      return;
+    }
     this.releaseWorker(id);
     this.workerRefs.delete(id);
     this.workerById.delete(id);
     this.heartbeatSeen.delete(id);
     this.heartbeatMisses.delete(id);
+    // Return the worker id to the free pool so it can be reused. Releasing an
+    // already-free id is a no-op, so re-entrant cleanup is safe.
+    this.buffer.releaseWorkerId(id);
   }
 
   /** Map a worker object back to its workerId, if registered. */
