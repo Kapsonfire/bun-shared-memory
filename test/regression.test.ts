@@ -265,8 +265,8 @@ describe("P2.1 — Notifier reuse", () => {
       )};
       self.onmessage = (e) => {
         const notifier = new Notifier(e.data);
-        const first = notifier.wait(5000);
-        const second = notifier.wait(5000);
+        const first = notifier.wait(1500);
+        const second = notifier.wait(1500);
         self.postMessage({ first, second });
       };
     `;

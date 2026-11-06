@@ -24,16 +24,32 @@ export class Notifier {
   /**
    * Block the current thread until `notify()` is called.
    *
-   * Returns "ok" when woken by a notification, "not-equal" if the value
-   * changed before waiting, or "timed-out" if `timeoutMs` elapsed.
+   * Returns "ok" when woken by a notification (or when a notification was
+   * already pending), "timed-out" if `timeoutMs` elapsed.
    */
   wait(timeoutMs?: number): "ok" | "not-equal" | "timed-out" {
-    return Atomics.wait(this.cell, 0, 0, timeoutMs);
+    // Snapshot the current value, then block until it changes. Because each
+    // notify() advances a monotonic counter, a later wait() observes a fresh
+    // pulse and blocks again instead of returning immediately — making the
+    // notifier reusable (not single-shot).
+    const snapshot = Atomics.load(this.cell, 0);
+    const result = Atomics.wait(this.cell, 0, snapshot, timeoutMs);
+    if (result === "not-equal") {
+      // The value changed between our snapshot and the wait, meaning a
+      // notification already arrived — treat it as a successful wake.
+      return "ok";
+    }
+    return result;
   }
 
-  /** Wake up to `count` workers blocked in `wait()`. */
+  /**
+   * Wake up to `count` workers blocked in `wait()`.
+   *
+   * Advances a monotonic counter so subsequent waits block on the new value
+   * instead of being forever latched open by a one-time flag.
+   */
   notify(count = 1): number {
-    Atomics.store(this.cell, 0, 1);
+    Atomics.add(this.cell, 0, 1);
     return Atomics.notify(this.cell, 0, count);
   }
 }
