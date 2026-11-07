@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-07
+
+### Fixed
+
+- **Serialized writes (P1.1).** The normal write path was lock-free: it only
+  took the shared mutex while a defragmentation pass was running, so
+  concurrent writers to the same value could interleave or read/write stale
+  values and lose updates. `writeLock`, `writeProp`, `writeValue`, the object
+  accessor setter and the array-property setter now take the shared (re-entrant)
+  mutex on every write, serializing writers to the same key. Reads remain
+  lock-free. As a consequence writes are slower (~33× → ~47× vs native under
+  contention), matching the review's recommendation that writers be mutually
+  exclusive.
+- **Safe MPSC refcount ring (P1.2).** `pushEvent()` reserved its write slot
+  non-atomically (two producers could read the same cursor and overwrite each
+  other or publish a half-written slot). The ring now reserves the output
+  slot atomically via `Atomics.add` on the write pointer and guards each slot
+  with a per-slot sequence cell, so concurrent producers can never claim the
+  same slot, publish a torn event, or silently drop a refcount event when the
+  queue is full.
+- **Bound worker ids to a reusable pool (P1.3).** `allocateWorkerId()` was
+  unbounded and could index past the fixed heartbeat/refcount tables. It now
+  claims the lowest free bit of a fixed `maxWorkers`-sized bitmap via CAS and
+  reuses released ids, throwing a hard error when the pool is exhausted;
+  `heartbeat()`/`lastHeartbeat()` are bounds-checked.
+- **Refcount multiplicity per worker (P1.4).** The coordinator tracked
+  `Set<objectId>` per worker, so a worker holding several references to the
+  same objectId (e.g. three `read()` copies) under-released on close/crash.
+  `workerRefs` is now `Map<workerId, Map<objectId, count>>` and
+  `releaseWorker()` releases every reference a worker holds.
+- **Reusable `Notifier` (P2.1).** After one `notify()` the cell stayed `1`, so
+  a subsequent `wait()` returned `not-equal` immediately instead of blocking.
+  The notify/wait protocol now uses a monotonic sequence counter so repeated
+  wait/notify cycles behave correctly.
+
+### Changed
+
+- Remove unused benchmark files and dependencies.
+
+## [1.0.0] - 2026-11-06
+
 ### Added
 
 - **Browser support.** The library now runs in modern browsers and Web
@@ -367,6 +408,8 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[1.0.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.3...v1.0.0
 [0.2.3]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.0...v0.2.1
