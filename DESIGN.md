@@ -174,21 +174,63 @@ bit 2.. (0xFFFFFFFC) READER_COUNT   number of active readers (unit = 0b100)
   read lock must _not_ upgrade to a write lock: that would deadlock against the
   thread's own read hold, so it throws.
 
-The lock is exposed on `Shared` wrappers via `SharedOptions.rwLock`:
+When no `rwLock` is provided, `withRWLock`/`withWriteLock`/`withReadLock`
+fall back to the shared `Mutex`, so they remain correct (if less parallel).
+
+### V3: Seqlock embedded in the version cell
+
+From v1.0.1 onward the read/write lock lives in **each object's version cell**
+(`INDEX_VERSION_OFFSET` in the Index Table) instead of a separate `RWLock`
+buffer. A single `Atomics.load` yields both the version (high bits) and the
+lock state (low bits), so plain reads can check consistency without a mutex.
+
+**Bit layout** (Int32):
+
+```
+bit 0 (0x00000001)  WRITER        withWriteLock is active (exclusive)
+bit 1 (0x00000002)  READLOCK      withReadLock is active (one or more)
+bits 2.. (0xFFFFFFFC) VERSION     logical version, bumped by 4 on each write
+```
+
+- `bumpVersion` adds `4` (VERSION_STEP), which increments the version but
+  leaves lock bits untouched.
+- `getVersion` returns `cell >>> 2`, stripping the lock bits transparently
+  so existing callers and tests remain correct.
+- **Plain reads** (`readValue`, property accessors, `readProp`): a single
+  `Atomics.load`. If the result's lock bits are clear and the masked version
+  matches `fieldCache.version`, the cached value is returned. If a lock bit
+  is set the reader spins/`Atomics.wait`s until the cell is free, then
+  re-reads. The reader never sets a lock bit itself.
+- **`withWriteLock` / `withRWLock`**: acquire the WRITER bit via CAS, run the
+  callback, then release — a single `Atomics.add(cell, 3)` bumps the version
+  **and** clears the WRITER bit atomically, so waiting readers immediately
+  observe the new version without a second atomic op.
+- **`withReadLock`**: acquires the READLOCK bit via CAS, runs the callback,
+  then releases with `Atomics.add(cell, -2)` (clears the bit, version
+  untouched). While held, plain reads on this object must wait.
+- **Re-entrancy** (same thread): tracked via module-level `writeCellDepths` /
+  `readCellDepths` maps keyed by cell index. `waitForVersionCell` returns the
+  live version immediately if the caller already holds the lock for this cell
+  (read-inside-write / read-inside-read).
+- **Wake-up**: both `acquireCellLock` and `waitForVersionCell` use
+  `Atomics.wait`; `releaseCellLock` calls `Atomics.notify` so sleepers wake
+  when the cell is released.
+
+The old `SharedOptions.rwLock` field was removed because the cell-embedded
+Seqlock makes a separate lock buffer unnecessary for `with*` methods. The
+standalone `RWLock` class (`src/rwlock.ts`) remains for manual, worker-wide
+locking that does not need per-object granularity.
 
 ```ts
-const lock = new RWLock();
-const counter = Shared<number>("counter", 0, { rwLock: lock });
+const counter = Shared<number>("counter", 0);
 
 // Exclusive read-modify-write (atomic across workers):
 counter.withRWLock((c) => c.write(c.read() + 1));
 
-// Parallel readers (only meaningful with a shared RWLock):
+// Parallel readers — currently exclusive (one at a time), other plain reads
+// on the same object block until the lock is released.
 const v = counter.withReadLock((c) => c.read());
 ```
-
-When no `rwLock` is provided, `withRWLock`/`withWriteLock`/`withReadLock`
-fall back to the shared `Mutex`, so they remain correct (if less parallel).
 
 ## Open Questions
 

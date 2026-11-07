@@ -79,6 +79,30 @@ const INDEX_ENTRY_SIZE = 16;
 const INDEX_HEADER = 4;
 /** Byte offset of the version field within an index entry. */
 const INDEX_VERSION_OFFSET = 12;
+
+// The version cell doubles as a seqlock: the low bits carry the lock state
+// (WRITER / READLOCK), the high bits carry the object's version. A plain read
+// performs a single `Atomics.load` and treats the object as consistent when
+// the lock bits are clear; `withReadLock`/`withWriteLock` set the lock bits.
+const VERSION_LOCK_SHIFT = 2;
+/** Value added by `bumpVersion`, bumping the version without touching locks. */
+export const VERSION_STEP = 1 << VERSION_LOCK_SHIFT; // 4
+/** Shift of the version field within a raw version cell. */
+export const VERSION_LOCK_SHIFT_BITS = VERSION_LOCK_SHIFT;
+/** Mask over the low lock bits. */
+export const VERSION_LOCK_MASK = VERSION_STEP - 1; // 0b11
+/** Set while a `withWriteLock` block is actively writing (exclusive). */
+export const WRITER_BIT = 0x1;
+/** Set while a `withReadLock` block is active. */
+export const READLOCK_BIT = 0x2;
+/** The object's version component of a raw version cell. */
+export function versionFromCell(raw: number): number {
+  return raw >> VERSION_LOCK_SHIFT;
+}
+/** Whether any lock (read or write) is currently held on a raw version cell. */
+export function isVersionCellLocked(raw: number): boolean {
+  return (raw & VERSION_LOCK_MASK) !== 0;
+}
 const MAX_INDEX_TABLE_BYTES = 4 * 1024 * 1024 * 1024;
 /** Size of the objectId header at the start of each array block. */
 const ARRAY_HEADER = 4;
@@ -1288,14 +1312,26 @@ export class SharedMemory {
     return versionCellIndex(index);
   }
 
-  /** Read the current version for a key index (lock-free). */
-  getVersion(index: number): number {
+  /**
+   * Raw value of a key's version cell (lock bits + version combined). Callers
+   * that need both the lock state and the version in a single `load` use this
+   * to avoid a second atomic read.
+   */
+  loadVersionCell(index: number): number {
     return Atomics.load(this.versionView, versionCellIndex(index));
+  }
+
+  /** Read the current version for a key index (lock-free, locks excluded). */
+  getVersion(index: number): number {
+    return (
+      Atomics.load(this.versionView, versionCellIndex(index)) >>
+      VERSION_LOCK_SHIFT
+    );
   }
 
   /** Increment the version for a key index, invalidating read caches. */
   bumpVersion(index: number): void {
-    Atomics.add(this.versionView, versionCellIndex(index), 1);
+    Atomics.add(this.versionView, versionCellIndex(index), VERSION_STEP);
   }
 
   /** Insert a key → dataOffset mapping into the Index Table. */
