@@ -62,23 +62,15 @@ interface ArrayLocator {
 }
 
 /**
- * Run a write operation. Writes are lock-free by default: they increment the
- * in-flight write counter, and only fall back to the shared mutex if a
- * defragmentation pass is running (rare). This keeps the hot write path free
- * of the mutex's re-entrancy tracking while still preventing a write from
- * racing with a defragmentation pass.
+ * Run a write operation. Writes are serialized under the shared mutex so that
+ * concurrent writers to the same value cannot lose updates or interleave a
+ * multi-step write. The mutex is re-entrant, so a write that internally calls
+ * another write (e.g. `updateValue`) does not deadlock. It also protects
+ * writers against racing a defragmentation pass, which runs under the same
+ * lock.
  */
 function writeLock<T>(mem: SharedMemory, fn: () => T): T {
-  mem.beginWrite();
-  if (mem.isDefragmenting()) {
-    mem.endWrite();
-    return mem.withLock(fn);
-  }
-  try {
-    return fn();
-  } finally {
-    mem.endWrite();
-  }
+  return mem.withLock(fn);
 }
 
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
@@ -931,20 +923,10 @@ function writeProp(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Inline writeLock to avoid a closure allocation on the hot path.
-  mem.beginWrite();
-  if (mem.isDefragmenting()) {
-    mem.endWrite();
-    mem.withLock(() =>
-      writePropInner(mem, key, prop, val, arrayCapacity, target),
-    );
-    return;
-  }
-  try {
-    writePropInner(mem, key, prop, val, arrayCapacity, target);
-  } finally {
-    mem.endWrite();
-  }
+  // Serialize the write under the shared mutex (see `writeLock`).
+  mem.withLock(() =>
+    writePropInner(mem, key, prop, val, arrayCapacity, target),
+  );
 }
 
 function writePropInner(
@@ -1263,21 +1245,12 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          mem.beginWrite();
-          if (mem.isDefragmenting()) {
-            // A defrag pass may move the object block: drop the cached slot
-            // offset so it is re-resolved, and run the write under the mutex.
-            mem.endWrite();
-            slotOffset = undefined;
-            slotLayoutVersion = -1;
-            mem.withLock(() =>
-              writePropInner(mem, key, name, v, arrayCapacity, target),
-            );
-            return;
-          }
-          try {
+          mem.withLock(() => {
             // Write directly to the cached slot offset when still valid,
-            // skipping the getObjectLayout Map lookup + properties.get.
+            // skipping the getObjectLayout Map lookup + properties.get. The
+            // layout version cannot change while the mutex is held (defrag
+            // runs under the same lock), but the check keeps the read cache
+            // resilient.
             if (slotLayoutVersion !== mem.getLayoutVersion()) {
               slotOffset = undefined;
               slotLayoutVersion = mem.getLayoutVersion();
@@ -1299,9 +1272,7 @@ function createSharedRef<T>(
               slotOffset = so;
             }
             writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
-          } finally {
-            mem.endWrite();
-          }
+          });
         },
       });
     }
@@ -1428,18 +1399,8 @@ function writeValue(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Inline writeLock to avoid a closure allocation on the hot path.
-  mem.beginWrite();
-  if (mem.isDefragmenting()) {
-    mem.endWrite();
-    mem.withLock(() => writeValueInner(mem, key, value, arrayCapacity, target));
-    return;
-  }
-  try {
-    writeValueInner(mem, key, value, arrayCapacity, target);
-  } finally {
-    mem.endWrite();
-  }
+  // Serialize the write under the shared mutex (see `writeLock`).
+  mem.withLock(() => writeValueInner(mem, key, value, arrayCapacity, target));
 }
 
 function writeValueInner(
@@ -2088,18 +2049,9 @@ function createArrayProxy(
     },
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
-      // decoding and re-encoding the whole value. Inline writeLock to avoid
-      // a closure allocation on the hot path.
-      mem.beginWrite();
-      if (mem.isDefragmenting()) {
-        mem.endWrite();
-        return mem.withLock(() => writeArrayProp(arrProp, val));
-      }
-      try {
-        return writeArrayProp(arrProp, val);
-      } finally {
-        mem.endWrite();
-      }
+      // decoding and re-encoding the whole value. Serialize under the shared
+      // mutex (see `writeLock`).
+      return mem.withLock(() => writeArrayProp(arrProp, val));
     },
   });
 }

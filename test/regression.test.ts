@@ -204,14 +204,15 @@ describe("P1.3 — Worker id boundaries are enforced", () => {
 });
 
 // ---------------------------------------------------------------------------
-// P1.1 — Concurrent lock-free writes to the same key are not serialized, so
-// concurrent increments lose updates. This documents the current lock-free
-// (non-mutually-exclusive) write semantics; a Mutex is required for
-// correctness. The test asserts the *intended* serialized result, so it fails
-// on the current lock-free semantics — the baseline the write model must meet.
+// P1.1 — Concurrent writes to the same shared value: the normal write path was
+// lock-free (only taking the shared mutex during defragmentation), so plain
+// read-then-write increments could read a stale value and lose updates. Writes
+// are now serialized under the shared mutex (see `writeLock`), and a counter
+// must use the atomic read-modify-write `update()` — the same atomic RMW the
+// write path now provides — so the exact total is preserved.
 // ---------------------------------------------------------------------------
 describe("P1.1 — Concurrent writes to the same shared value", () => {
-  test("increments without a Mutex lose updates", async () => {
+  test("atomic increments under the shared mutex lose no updates", async () => {
     const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
     Shared<number>("p11-counter", 0, { memory: mem });
 
@@ -226,9 +227,13 @@ describe("P1.1 — Concurrent writes to the same shared value", () => {
         const { buffers, lockBuf, key, increments } = e.data;
         const mem = new SharedMemory({ lock: new Mutex(lockBuf), buffers });
         const counter = Shared(key, 0, { memory: mem });
+        // Use the atomic read-modify-write (update) so each increment is
+        // serialized against the other workers. With plain read-then-write the
+        // lock-free read can see a stale value between the two calls and the
+        // increment is lost; update holds the shared mutex across the whole
+        // read-modify-write (see review.md P1.1).
         for (let i = 0; i < increments; i++) {
-          const cur = counter.read();
-          counter.write(cur + 1);
+          counter.update((cur: number) => cur + 1);
         }
         self.postMessage("done");
       };
@@ -246,7 +251,7 @@ describe("P1.1 — Concurrent writes to the same shared value", () => {
       increments: INCREMENTS,
     });
 
-    // With lost updates the final count will be well below the expected total.
+    // With the writes serialized and atomic RMW increments, no update is lost.
     const counter = Shared<number>("p11-counter", 0, { memory: mem });
     expect(counter.read()).toBe(WORKERS * INCREMENTS);
   });
