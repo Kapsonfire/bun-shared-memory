@@ -174,21 +174,19 @@ describe("RWLock", () => {
 describe("RWLock integration with Shared", () => {
   test("withRWLock serializes concurrent RMW across workers", async () => {
     const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
-    const rwLock = new RWLock();
-    Shared<number>("rw-counter", 0, { memory: mem, rwLock });
+    Shared<number>("rw-counter", 0, { memory: mem });
 
     const WORKERS = 4;
     const INCREMENTS = 2000;
 
     const workerCode = `
-      import { SharedMemory, Mutex, RWLock, Shared } from ${JSON.stringify(
+      import { SharedMemory, Mutex, Shared } from ${JSON.stringify(
         new URL("../src/index.ts", import.meta.url).href,
       )};
       self.onmessage = (e) => {
-        const { buffers, lockBuf, rwLockBuf, key, increments } = e.data;
-        const mem = new SharedMemory({ lock: new Mutex(lockBuf), buffers });
-        const rwLock = new RWLock(rwLockBuf);
-        const counter = Shared(key, 0, { memory: mem, rwLock });
+        const { buffers, key, increments } = e.data;
+        const mem = new SharedMemory({ lock: new Mutex(buffers.lockBuf), buffers });
+        const counter = Shared(key, 0, { memory: mem });
         for (let i = 0; i < increments; i++) {
           counter.withRWLock(() => {
             counter.write(counter.read() + 1);
@@ -204,20 +202,18 @@ describe("RWLock integration with Shared", () => {
         dataTable: mem.dataTable.buffers[0],
         stringTable: mem.stringTable.buffers[0],
         arrayTable: mem.arrayTable.buffers[0],
+        lockBuf: mem.lock.buffer,
       },
-      lockBuf: mem.lock.buffer,
-      rwLockBuf: rwLock.buffer,
       key: "rw-counter",
       increments: INCREMENTS,
     });
 
-    const counter = Shared<number>("rw-counter", 0, { memory: mem, rwLock });
+    const counter = Shared<number>("rw-counter", 0, { memory: mem });
     expect(counter.read()).toBe(WORKERS * INCREMENTS);
   });
 
   test("withReadLock returns the callback result on a Shared value", () => {
-    const rwLock = new RWLock();
-    const obj = Shared<number>("rw-readonly", 42, { rwLock });
+    const obj = Shared<number>("rw-readonly", 42);
 
     // Callback receives the wrapper as an argument (per the API signature).
     const read = obj.withReadLock((self) => self.read());
@@ -226,5 +222,100 @@ describe("RWLock integration with Shared", () => {
     obj.withWriteLock((self) => self.write(43));
     expect(obj.withReadLock((self) => self.read())).toBe(43);
     expect(obj.read()).toBe(43);
+  });
+
+  test("a held withReadLock blocks a read in another worker until release", async () => {
+    const mem = new SharedMemory({ maxByteLength: 64 * 1024 * 1024 });
+    const obj = Shared<object>("rw-obj", { val: 1 }, { memory: mem });
+
+    // Coordination cells (raw Atomics, independent of the library's Notifier):
+    // control[0] = value read by the blocking reader (must end up 99)
+    const control = new Int32Array(new SharedArrayBuffer(8));
+    // held[0] = set by writer once its read lock is acquired
+    const held = new Int32Array(new SharedArrayBuffer(8));
+
+    const writerCode = `
+      import { SharedMemory, Mutex, Shared } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const { buffers } = e.data;
+        const mem = new SharedMemory({ lock: new Mutex(buffers.lockBuf), buffers });
+        const o = Shared("rw-obj", { val: 1 }, { memory: mem });
+        const held = new Int32Array(buffers.heldBuf);
+        const gate = new Int32Array(buffers.gateBuf);
+        o.withReadLock(() => {
+          // Signal that the read lock is held, then hold it long enough that a
+          // reader started from the main thread is guaranteed to try reading
+          // while the lock is still held (Atomics.wait timeout releases us).
+          Atomics.store(held, 0, 1);
+          Atomics.notify(held, 0);
+          Atomics.wait(gate, 0, 0, 200);
+          // Mutate only at the very end of the lock, just before releasing.
+          o.val = 99;
+        });
+        self.postMessage("done");
+      };
+    `;
+
+    const readerCode = `
+      import { SharedMemory, Mutex, Shared } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const { buffers } = e.data;
+        const mem = new SharedMemory({ lock: new Mutex(buffers.lockBuf), buffers });
+        const o = Shared("rw-obj", { val: 1 }, { memory: mem });
+        const control = new Int32Array(buffers.controlBuf);
+        // Must block until the writer releases its read lock. If it read too
+        // early it would see 1; only after release would it see the 99 the
+        // writer wrote inside the lock.
+        const v = o.val;
+        Atomics.store(control, 0, v);
+        self.postMessage("done");
+      };
+    `;
+
+    const url = (code: string) =>
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      );
+
+    const buffers = {
+      indexTable: mem.indexTable.buffers[0],
+      dataTable: mem.dataTable.buffers[0],
+      stringTable: mem.stringTable.buffers[0],
+      arrayTable: mem.arrayTable.buffers[0],
+      lockBuf: mem.lock.buffer,
+      controlBuf: control.buffer,
+      heldBuf: held.buffer,
+      gateBuf: new SharedArrayBuffer(8),
+    };
+
+    // Start the writer; it acquires the read lock and signals "held" via the
+    // shared cell. Wait for that signal (not for the writer's postMessage,
+    // which only fires after the lock is fully released).
+    const writer = new Worker(url(writerCode), { type: "module" });
+    writer.postMessage({ buffers });
+    await new Promise<void>((res) => {
+      const poll = () => {
+        if (Atomics.load(held, 0) === 1) res();
+        else setTimeout(poll, 2);
+      };
+      poll();
+    });
+
+    // Start the reader while the read lock is still held; on release it must
+    // observe the value written inside the lock (99).
+    const reader = new Worker(url(readerCode), { type: "module" });
+    await new Promise<void>((res) => {
+      reader.onmessage = () => res();
+      reader.postMessage({ buffers });
+    });
+    writer.terminate();
+    reader.terminate();
+
+    expect(Atomics.load(control, 0)).toBe(99);
   });
 });
