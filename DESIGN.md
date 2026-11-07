@@ -141,6 +141,55 @@ property assignment, `update`) are atomic across workers.
 `Notifier` (`src/notifier.ts`) wraps `Atomics.wait`/`Atomics.notify` for
 user-facing worker-to-worker signaling.
 
+### V2: Read/write lock (`RWLock`)
+
+The single `Mutex` serializes _every_ operation, which is the price of
+correctness (v1.0.1, review P1.1) but limits read-heavy workloads. V2 adds a
+read/write lock (`src/rwlock.ts`) that relaxes that: **any number of readers**
+may hold the lock concurrently, while **writers remain exclusive**.
+
+The lock occupies one Int32 cell of a `SharedArrayBuffer` and encodes its
+state in the low bits, leaving the high bits for a reader count:
+
+```
+bit 0 (0x00000001)  WRITER          a writer holds the lock exclusively
+bit 1 (0x00000002)  WRITES_QUEUED   >=1 writer waiting; new readers back off
+bit 2.. (0xFFFFFFFC) READER_COUNT   number of active readers (unit = 0b100)
+```
+
+- **Readers** acquire by atomically bumping `READER_COUNT`, so many can be
+  active at once — but only while no writer holds the lock and no writer is
+  queued (the `WRITES_QUEUED` bit prevents reader starvation of writers).
+- **Writers** acquire only when the cell is entirely free, or at a hand-off
+  when only the `WRITES_QUEUED` bit is set (a queued writer clearing it and
+  setting `WRITER`). While waiting, a writer sets `WRITES_QUEUED` so new
+  readers back off.
+- **Release** wakes others only when a transition could unblock a party:
+  after the last reader leaves, or after a writer releases with queued
+  waiters.
+- **Re-entrancy** is tracked per-thread (WeakMaps), mirroring `Mutex`. The same
+  thread may acquire for reading repeatedly, for writing repeatedly, and may
+  read while already holding the write lock — in the last case the read is a
+  no-op because the thread already has exclusive access. A thread holding a
+  read lock must _not_ upgrade to a write lock: that would deadlock against the
+  thread's own read hold, so it throws.
+
+The lock is exposed on `Shared` wrappers via `SharedOptions.rwLock`:
+
+```ts
+const lock = new RWLock();
+const counter = Shared<number>("counter", 0, { rwLock: lock });
+
+// Exclusive read-modify-write (atomic across workers):
+counter.withRWLock((c) => c.write(c.read() + 1));
+
+// Parallel readers (only meaningful with a shared RWLock):
+const v = counter.withReadLock((c) => c.read());
+```
+
+When no `rwLock` is provided, `withRWLock`/`withWriteLock`/`withReadLock`
+fall back to the shared `Mutex`, so they remain correct (if less parallel).
+
 ## Open Questions
 
 - **Index Table keying**: Currently a linear scan comparing stored key strings directly (O(n) lookup). A hash table could improve lookup for many keys — future optimization.

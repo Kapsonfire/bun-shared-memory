@@ -25,6 +25,7 @@ import {
   type ValueSlot,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
+import type { RWLock } from "./rwlock.ts";
 import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
@@ -225,6 +226,16 @@ export type SharedRef<T> = [T] extends [object]
       read(): T;
       write(value: T): void;
       update(fn: (current: T) => T): T;
+      /** Run `fn` while holding an exclusive write lock on this value. */
+      withRWLock<R>(fn: (self: SharedRef<T>) => R): R;
+      /** Run `fn` while holding the write lock (alias of `withRWLock`). */
+      withWriteLock<R>(fn: (self: SharedRef<T>) => R): R;
+      /**
+       * Run `fn` while holding a read lock, allowing concurrent readers. Only
+       * meaningful when a shared `RWLock` was provided; otherwise it falls
+       * back to the shared mutex.
+       */
+      withReadLock<R>(fn: (self: SharedRef<T>) => R): R;
       readonly key: string;
       readonly buffer: SharedArrayBuffer;
     }
@@ -232,6 +243,16 @@ export type SharedRef<T> = [T] extends [object]
       read(): T;
       write(value: T): void;
       update(fn: (current: T) => T): T;
+      /** Run `fn` while holding an exclusive write lock on this value. */
+      withRWLock<R>(fn: (self: SharedRef<T>) => R): R;
+      /** Run `fn` while holding the write lock (alias of `withRWLock`). */
+      withWriteLock<R>(fn: (self: SharedRef<T>) => R): R;
+      /**
+       * Run `fn` while holding a read lock, allowing concurrent readers. Only
+       * meaningful when a shared `RWLock` was provided; otherwise it falls
+       * back to the shared mutex.
+       */
+      withReadLock<R>(fn: (self: SharedRef<T>) => R): R;
       readonly key: string;
       readonly buffer: SharedArrayBuffer;
     };
@@ -670,6 +691,13 @@ export interface SharedOptions {
    * capacity is exhausted. Defaults to the array's length.
    */
   arrayCapacity?: number;
+  /**
+   * A shared read/write lock used by `withRWLock`/`withReadLock`/`withWriteLock`
+   * on the returned wrapper. When provided (and shared across workers),
+   * `withReadLock` allows many concurrent readers; otherwise these methods
+   * fall back to the shared mutex.
+   */
+  rwLock?: RWLock;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -719,6 +747,7 @@ export function Shared<T>(
     typeof initialOrLoader === "function" ? undefined : (initialOrLoader as T),
     options.refCount ?? getDefaultTracker() ?? undefined,
     options.arrayCapacity,
+    options.rwLock,
   );
   registry.set(key, ref as SharedRef<unknown>);
 
@@ -1076,6 +1105,7 @@ function createSharedRef<T>(
   initialValue: T | undefined,
   tracker?: RefCountTracker,
   arrayCapacity?: number,
+  rwLock?: RWLock,
 ): SharedRef<T> {
   const target = {
     key,
@@ -1123,6 +1153,19 @@ function createSharedRef<T>(
       target.__cache = undefined;
       return updateValue(mem, key, fn, arrayCapacity);
     },
+    withRWLock: <R>(fn: (self: SharedRef<T>) => R) => {
+      if (rwLock)
+        return rwLock.withWriteLock(() =>
+          fn(target as unknown as SharedRef<T>),
+        );
+      return mem.withLock(() => fn(target as unknown as SharedRef<T>));
+    },
+    withWriteLock: <R>(fn: (self: SharedRef<T>) => R) => target.withRWLock(fn),
+    withReadLock: <R>(fn: (self: SharedRef<T>) => R) => {
+      if (rwLock)
+        return rwLock.withReadLock(() => fn(target as unknown as SharedRef<T>));
+      return mem.withLock(() => fn(target as unknown as SharedRef<T>));
+    },
   };
 
   // Determine the object's property names so we can hard-bake accessor
@@ -1168,6 +1211,21 @@ function createSharedRef<T>(
       enumerable: false,
       configurable: false,
       value: target.update,
+    });
+    Object.defineProperty(proto, "withRWLock", {
+      enumerable: false,
+      configurable: false,
+      value: target.withRWLock,
+    });
+    Object.defineProperty(proto, "withWriteLock", {
+      enumerable: false,
+      configurable: false,
+      value: target.withWriteLock,
+    });
+    Object.defineProperty(proto, "withReadLock", {
+      enumerable: false,
+      configurable: false,
+      value: target.withReadLock,
     });
     // key/buffer are non-enumerable so they don't appear in JSON.stringify /
     // Object.keys (matching the previous Proxy behavior).
@@ -1289,6 +1347,9 @@ function createSharedRef<T>(
       if (prop === "read") return t.read;
       if (prop === "write") return t.write;
       if (prop === "update") return t.update;
+      if (prop === "withRWLock") return t.withRWLock;
+      if (prop === "withWriteLock") return t.withWriteLock;
+      if (prop === "withReadLock") return t.withReadLock;
       if (prop === "key") return t.key;
       if (prop === "buffer") return mem.dataTable.buffers[0];
       if (prop === Symbol.toPrimitive) return () => t.read();
