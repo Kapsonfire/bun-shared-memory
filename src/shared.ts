@@ -8,6 +8,11 @@ import {
   TYPE_OBJECT_REF,
   TYPE_STRING_REF,
   TYPE_STRING_VALUE_REF,
+  READLOCK_BIT,
+  VERSION_LOCK_MASK,
+  VERSION_LOCK_SHIFT_BITS,
+  VERSION_STEP,
+  WRITER_BIT,
   arrayRefSlot,
   bigintSlot,
   bigintStrSlot,
@@ -25,7 +30,6 @@ import {
   type ValueSlot,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
-import type { RWLock } from "./rwlock.ts";
 import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
@@ -231,9 +235,9 @@ export type SharedRef<T> = [T] extends [object]
       /** Run `fn` while holding the write lock (alias of `withRWLock`). */
       withWriteLock<R>(fn: (self: SharedRef<T>) => R): R;
       /**
-       * Run `fn` while holding a read lock, allowing concurrent readers. Only
-       * meaningful when a shared `RWLock` was provided; otherwise it falls
-       * back to the shared mutex.
+       * Run `fn` while holding a read lock on this value's version cell. While
+       * held, other read/write operations on this object wait; reentrant reads
+       * from within a write lock are allowed.
        */
       withReadLock<R>(fn: (self: SharedRef<T>) => R): R;
       readonly key: string;
@@ -248,9 +252,9 @@ export type SharedRef<T> = [T] extends [object]
       /** Run `fn` while holding the write lock (alias of `withRWLock`). */
       withWriteLock<R>(fn: (self: SharedRef<T>) => R): R;
       /**
-       * Run `fn` while holding a read lock, allowing concurrent readers. Only
-       * meaningful when a shared `RWLock` was provided; otherwise it falls
-       * back to the shared mutex.
+       * Run `fn` while holding a read lock on this value's version cell. While
+       * held, other read/write operations on this object wait; reentrant reads
+       * from within a write lock are allowed.
        */
       withReadLock<R>(fn: (self: SharedRef<T>) => R): R;
       readonly key: string;
@@ -270,6 +274,110 @@ const readCache = new Map<
   string,
   { version: number; value: unknown; index: number; cell: number }
 >();
+
+// ---------------------------------------------------------------------------
+// Version-cell based seqlock (the object's version cell doubles as a lock).
+//
+// The low bits of the version cell are the lock state, the high bits the
+// version (see VERSION_LOCK_MASK / WRITER_BIT / READLOCK_BIT). `withReadLock`
+// and `withWriteLock` set/clear those bits; a plain read performs one load and
+// waits whenever the lock bits are set. Because a worker is single-threaded,
+// a lock is only held across a synchronous call stack, so reentrancy is
+// tracked with simple depth maps keyed by the version-cell index.
+// ---------------------------------------------------------------------------
+
+/** Reentrancy depth per cell: how many nested write locks this thread holds. */
+const writeCellDepths = new Map<number, number>();
+/** Reentrancy depth per cell: how many nested read locks this thread holds. */
+const readCellDepths = new Map<number, number>();
+
+function bumpCellDepth(map: Map<number, number>, cell: number): void {
+  const d = map.get(cell);
+  map.set(cell, d === undefined ? 1 : d + 1);
+}
+function dropCellDepth(map: Map<number, number>, cell: number): void {
+  const d = map.get(cell)!;
+  if (d === 1) map.delete(cell);
+  else map.set(cell, d - 1);
+}
+
+/**
+ * Wait until the version cell @ `cell` is not locked (no READLOCK/WRITER set)
+ * across all workers, then return the object's version. Never blocks the
+ * calling worker when it itself holds the lock (read-inside-write), since a
+ * shared object may legitimately be read from within a lock block; in that
+ * case the version is read directly.
+ */
+function waitForVersionCell(mem: SharedMemory, cell: number): number {
+  if (writeCellDepths.has(cell) || readCellDepths.has(cell)) {
+    // This worker already holds a lock on this cell (reentrant read): read the
+    // live version directly, don't wait on our own lock.
+    return Atomics.load(mem.versionView, cell) >> VERSION_LOCK_SHIFT_BITS;
+  }
+  let raw = Atomics.load(mem.versionView, cell);
+  while ((raw & VERSION_LOCK_MASK) !== 0) {
+    Atomics.wait(mem.versionView, cell, raw);
+    raw = Atomics.load(mem.versionView, cell);
+  }
+  return raw >> VERSION_LOCK_SHIFT_BITS;
+}
+
+/**
+ * Acquire a lock bit on `cell`, spinning/waiting until it is free (or the
+ * calling worker already holds it, i.e. reentrant). Returns false when the
+ * current worker already holds the lock (caller must skip the free step).
+ */
+function acquireCellLock(
+  mem: SharedMemory,
+  cell: number,
+  bit: number,
+  depths: Map<number, number>,
+): boolean {
+  if (depths.has(cell)) {
+    bumpCellDepth(depths, cell);
+    return false;
+  }
+  let raw = Atomics.load(mem.versionView, cell);
+  for (;;) {
+    if ((raw & VERSION_LOCK_MASK) !== 0) {
+      Atomics.wait(mem.versionView, cell, raw);
+      raw = Atomics.load(mem.versionView, cell);
+      continue;
+    }
+    const next = raw | bit;
+    const taken = Atomics.compareExchange(mem.versionView, cell, raw, next);
+    if (taken === raw) {
+      bumpCellDepth(depths, cell);
+      return true;
+    }
+    raw = taken;
+  }
+}
+
+/**
+ * Release a lock bit that was freshly acquired (reentrant releases are no-ops
+ * at this layer; the outermost release clears the bit). Version and lock live
+ * in the same cell, so releasing is a single atomic operation: clearing the
+ * WRITER bit also bumps the version (readers that waited see the bump), while
+ * clearing the READLOCK bit leaves the version untouched (a read changes
+ * nothing).
+ */
+function releaseCellLock(
+  mem: SharedMemory,
+  cell: number,
+  bit: number,
+  depths: Map<number, number>,
+): void {
+  dropCellDepth(depths, cell);
+  if (depths.has(cell)) return; // still held reentrantly
+  // WRITER: version+1 and clear bit 0x1 in one add ((v<<2)|1 + 3 = (v+1)<<2).
+  // READLOCK: clear bit 0x2 only (add -2 leaves the version unchanged).
+  const delta = bit === WRITER_BIT ? VERSION_STEP - WRITER_BIT : -READLOCK_BIT;
+  Atomics.add(mem.versionView, cell, delta);
+  // Wake any workers parked in `Atomics.wait` (acquireCellLock/waitForVersionCell):
+  // a bare value change does not wake a sleeping waiter, only `notify` does.
+  Atomics.notify(mem.versionView, cell);
+}
 
 /**
  * Per-worker cache of a key's stable index in the Index Table.
@@ -692,12 +800,11 @@ export interface SharedOptions {
    */
   arrayCapacity?: number;
   /**
-   * A shared read/write lock used by `withRWLock`/`withReadLock`/`withWriteLock`
-   * on the returned wrapper. When provided (and shared across workers),
-   * `withReadLock` allows many concurrent readers; otherwise these methods
-   * fall back to the shared mutex.
+   * NOTE: The read/write lock for `withReadLock`/`withWriteLock`/`withRWLock`
+   * is now embedded in the object's own version cell (a seqlock), so no
+   * separate shared lock instance is required. The standalone `RWLock` class
+   * remains available for manual, worker-wide locking.
    */
-  rwLock?: RWLock;
 }
 
 type Loader<T> = () => T | Promise<T>;
@@ -747,7 +854,6 @@ export function Shared<T>(
     typeof initialOrLoader === "function" ? undefined : (initialOrLoader as T),
     options.refCount ?? getDefaultTracker() ?? undefined,
     options.arrayCapacity,
-    options.rwLock,
   );
   registry.set(key, ref as SharedRef<unknown>);
 
@@ -807,10 +913,17 @@ function readProp(
   // Inline the read-cache fast path (instead of calling readCachedValue, which
   // returns a polymorphic {hit,value} union and allocates an object on every
   // cache hit). Keeping this monomorphic lets the JIT optimize the hot read.
+  // The version cell doubles as a seqlock: a cache hit requires the lock bits
+  // to be clear (no withReadLock/withWriteLock active) and the cached version
+  // to match; otherwise we fall through to `readValue`, which waits out any
+  // active lock before decoding.
   const cached = readCache.get(key);
+  const raw =
+    cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
   const value =
     cached !== undefined &&
-    cached.version === Atomics.load(mem.versionView, cached.cell)
+    (raw & VERSION_LOCK_MASK) === 0 &&
+    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
       ? cached.value
       : readValue(mem, key);
   if (Array.isArray(value)) {
@@ -1105,7 +1218,6 @@ function createSharedRef<T>(
   initialValue: T | undefined,
   tracker?: RefCountTracker,
   arrayCapacity?: number,
-  rwLock?: RWLock,
 ): SharedRef<T> {
   const target = {
     key,
@@ -1154,17 +1266,28 @@ function createSharedRef<T>(
       return updateValue(mem, key, fn, arrayCapacity);
     },
     withRWLock: <R>(fn: (self: SharedRef<T>) => R) => {
-      if (rwLock)
-        return rwLock.withWriteLock(() =>
-          fn(target as unknown as SharedRef<T>),
-        );
-      return mem.withLock(() => fn(target as unknown as SharedRef<T>));
+      // The object's version cell is the lock: acquire the WRITER bit (one
+      // CAS; wait while any other worker holds read/write), run the callback,
+      // then release in a single add that also bumps the version.
+      const cell = mem.getVersionCellIndex(getIndex(mem, key));
+      const acquired = acquireCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+      try {
+        return fn(target as unknown as SharedRef<T>);
+      } finally {
+        if (acquired) releaseCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+      }
     },
     withWriteLock: <R>(fn: (self: SharedRef<T>) => R) => target.withRWLock(fn),
     withReadLock: <R>(fn: (self: SharedRef<T>) => R) => {
-      if (rwLock)
-        return rwLock.withReadLock(() => fn(target as unknown as SharedRef<T>));
-      return mem.withLock(() => fn(target as unknown as SharedRef<T>));
+      // Acquire the READLOCK bit so other readers/writers on this object wait,
+      // run the callback, then release (version untouched).
+      const cell = mem.getVersionCellIndex(getIndex(mem, key));
+      const acquired = acquireCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+      try {
+        return fn(target as unknown as SharedRef<T>);
+      } finally {
+        if (acquired) releaseCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+      }
     },
   };
 
@@ -1273,12 +1396,14 @@ function createSharedRef<T>(
         enumerable: true,
         configurable: false,
         get() {
-          // Lock-free fast path inlined so the JIT can optimize the hot
-          // cache-hit read without a function-call chain.
+          // Fast path inlined so the JIT can optimize the hot cache-hit read
+          // without a function-call chain. The version cell doubles as a
+          // seqlock: we wait (without a mutex) while a lock is held, then
+          // compare the version so reads that raced a write re-decode.
           if (cellIndex === null) {
             cellIndex = mem.getVersionCellIndex(getIndex(mem, key));
           }
-          const version = Atomics.load(mem.versionView, cellIndex);
+          const version = waitForVersionCell(mem, cellIndex);
           if (fieldCache.version === version) {
             return fieldCache.value;
           }
@@ -1412,11 +1537,15 @@ function readValue(
   },
 ): unknown {
   // Inline the read-cache fast path (see readProp) to avoid the polymorphic
-  // {hit,value} union returned by readCachedValue.
+  // {hit,value} union returned by readCachedValue. The version cell doubles as
+  // a seqlock: a hit requires clear lock bits and a matching version.
   const cached = readCache.get(key);
+  const raw =
+    cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
   if (
     cached !== undefined &&
-    cached.version === Atomics.load(mem.versionView, cached.cell)
+    (raw & VERSION_LOCK_MASK) === 0 &&
+    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
   ) {
     return cached.value;
   }
@@ -1424,7 +1553,10 @@ function readValue(
   const index = cached !== undefined ? cached.index : getIndex(mem, key);
   const cell =
     cached !== undefined ? cached.cell : mem.getVersionCellIndex(index);
-  const version = mem.getVersion(index);
+
+  // Wait out any in-flight lock (withReadLock/withWriteLock) so we never
+  // decode a half-written object, then read the version in the same loop.
+  const version = waitForVersionCell(mem, cell);
 
   // Cache miss: decode under the lock and cache with the observed version.
   const value = mem.withLock(() => {

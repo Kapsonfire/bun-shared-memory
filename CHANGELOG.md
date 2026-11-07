@@ -9,15 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **V3 Seqlock embedded in each object's version cell.** The read/write lock
+  for `withRWLock` / `withWriteLock` / `withReadLock` now lives in the
+  object's existing version cell (`INDEX_VERSION_OFFSET` in the Index Table)
+  instead of a separate `RWLock` buffer. A single `Atomics.load` yields
+  both the version (high bits) and the lock state (low bits), so plain reads
+  check consistency without a mutex. Bit layout: bit 0 = WRITER, bit 1 =
+  READLOCK, bits 2+ = VERSION (step 4). `bumpVersion` adds 4 (leaves lock
+  bits untouched). `withWriteLock` release bumps version and clears WRITER
+  in one atomic `add(cell, 3)`. `withReadLock` release clears the bit without
+  touching the version. Normal reads wait (`Atomics.wait`) when lock bits are
+  set, never set lock bits themselves. Re-entrancy tracked via `writeCellDepths`
+  / `readCellDepths` maps keyed by cell index. `SharedOptions.rwLock` removed
+  (the cell itself is now the lock). The standalone `RWLock` class remains
+  for manual, worker-wide locking.
+
 - **V2 read/write lock (`RWLock`).** A cross-worker, re-entrant
   `Atomics`-based read/write lock (`src/rwlock.ts`) stored in one Int32 cell
   (bit 0 = WRITER, bit 1 = WRITES_QUEUED, high bits = reader count). Any
   number of readers may hold it concurrently while writers stay exclusive,
   and re-entrancy is tracked per-thread (read, write, and read-inside-write);
   a reader→writer upgrade from the same thread throws (deadlock risk).
-  Exposed on `Shared` wrappers via `SharedOptions.rwLock` and the new
-  `withRWLock` / `withWriteLock` / `withReadLock` methods, which fall back to
-  the shared mutex when no `rwLock` is provided.
 
 ## [1.0.1] - 2026-11-07
 
