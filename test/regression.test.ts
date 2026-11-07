@@ -8,7 +8,7 @@ import {
 } from "../src/index.ts";
 
 /**
- * Regression tests derived from `review.md` (technical code review).
+ * Regression tests
  *
  * These tests intentionally *reproduce* the concurrency/consistency findings
  * against the current code. Several document current (buggy or unspecified)
