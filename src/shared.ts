@@ -881,7 +881,57 @@ export interface SharedOptions {
 
 type Loader<T> = () => T | Promise<T>;
 
-const registry = new Map<string, SharedRef<unknown>>();
+/**
+ * The wrapper of each key this thread uses, held weakly: a wrapper (and with
+ * it its closures and per-key state, about 1-2 KB) is freed once the program no
+ * longer holds the reference. `Shared(key)` hands out the live wrapper while
+ * one exists, so references to one key stay identical for as long as anyone can
+ * observe the difference.
+ */
+const registry = new Map<string, WeakRef<SharedRef<unknown>>>();
+
+/**
+ * When a wrapper is collected, drop the key's entries in the per-thread caches
+ * as well. They are keyed by name and would otherwise grow with every key ever
+ * touched; the read cache even holds the last decoded value of each.
+ */
+const reclaimKey =
+  typeof FinalizationRegistry === "function"
+    ? new FinalizationRegistry<string>(dropKey)
+    : null;
+
+function dropKey(key: string): void {
+  // A newer wrapper for the same key took over: its caches are in use.
+  if (registry.get(key)?.deref() !== undefined) return;
+  registry.delete(key);
+  readCache.delete(key);
+  indexCache.delete(key);
+  offsetCache.delete(key);
+  layoutCache.delete(key);
+}
+
+/** The live wrapper of `key`, if one exists. */
+function liveRef(key: string): SharedRef<unknown> | undefined {
+  return registry.get(key)?.deref();
+}
+
+function rememberRef(key: string, ref: SharedRef<unknown>): void {
+  registry.set(key, new WeakRef(ref));
+  reclaimKey?.register(ref as object, key);
+}
+
+/** Number of wrappers and cache entries this thread holds (for tests). */
+export function sharedCacheStats(): {
+  wrappers: number;
+  readCache: number;
+  indexCache: number;
+} {
+  return {
+    wrappers: registry.size,
+    readCache: readCache.size,
+    indexCache: indexCache.size,
+  };
+}
 
 /**
  * Maps each SharedRef wrapper object to its shared key. Used by `encodeValue`
@@ -929,7 +979,7 @@ export function Shared<T>(
   options: SharedOptions = {},
 ): SharedRef<T> | Promise<SharedRef<T>> {
   const isLoader = typeof initialOrLoader === "function";
-  const existing = registry.get(key);
+  const existing = liveRef(key);
   if (existing) {
     // A loader overload promises a Promise, even when the wrapper is cached.
     return isLoader
@@ -959,7 +1009,7 @@ export function Shared<T>(
     initialOrLoader as T,
     options.arrayCapacity,
   );
-  registry.set(key, ref as SharedRef<unknown>);
+  rememberRef(key, ref as SharedRef<unknown>);
   registerInitial(mem, key, ref, initialOrLoader as T);
   return ref;
 }
@@ -983,7 +1033,7 @@ async function loadShared<T>(
   const value = exists ? undefined : await loader();
   const ref = createSharedRef<T>(mem, key, value, arrayCapacity);
   if (!exists) registerInitial(mem, key, ref, value);
-  registry.set(key, ref as SharedRef<unknown>);
+  rememberRef(key, ref as SharedRef<unknown>);
   return ref;
 }
 
@@ -1848,10 +1898,10 @@ function getNestedSharedRef<T = unknown>(
   mem: SharedMemory,
   key: string,
 ): SharedRef<T> {
-  const existing = registry.get(key);
+  const existing = liveRef(key);
   if (existing) return existing as SharedRef<T>;
   const ref = createSharedRef<T>(mem, key, undefined) as SharedRef<T>;
-  registry.set(key, ref as SharedRef<unknown>);
+  rememberRef(key, ref as SharedRef<unknown>);
   return ref;
 }
 
