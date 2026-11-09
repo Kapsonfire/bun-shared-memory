@@ -30,10 +30,28 @@ import type { Methodology, Transport } from "./api.ts";
 
 const WORKERS_PER_METHOD = 4;
 const DEFAULT_REQUESTS = 100_000;
-/** Measured samples per worker; the worker reports the minimum. */
-const SAMPLES_PER_WORKER = 15;
+/**
+ * Measured samples per worker; the worker reports the minimum. Shared memory
+ * and SQLite finish a sample in milliseconds and are sensitive to CPU
+ * contention, so they take many samples. MySQL and Redis answer only ~5 000
+ * requests/s per connection, so the same settings would take 6-7 minutes each;
+ * their numbers are stable anyway, so they take few samples. Override both with
+ * `BENCH_SAMPLES` / `BENCH_RUNS`.
+ */
+const FAST_SAMPLES_PER_WORKER = 15;
+const SLOW_SAMPLES_PER_WORKER = 3;
 /** Full runs per methodology (each spawns the workers again); min is kept. */
-const RUNS_PER_METHOD = 5;
+const FAST_RUNS_PER_METHOD = 5;
+const SLOW_RUNS_PER_METHOD = 2;
+
+/** Whether a methodology is fast enough for the high sample/run counts. */
+const isFast = (m: Methodology) => m === "shared" || m === "sqlite";
+const samplesFor = (m: Methodology) =>
+  Number(process.env.BENCH_SAMPLES) ||
+  (isFast(m) ? FAST_SAMPLES_PER_WORKER : SLOW_SAMPLES_PER_WORKER);
+const runsFor = (m: Methodology) =>
+  Number(process.env.BENCH_RUNS) ||
+  (isFast(m) ? FAST_RUNS_PER_METHOD : SLOW_RUNS_PER_METHOD);
 
 const totalRequests = Number(process.argv[2] ?? DEFAULT_REQUESTS);
 
@@ -104,7 +122,7 @@ async function runMethodology(
       transport,
       count: perWorker,
       userId: 1 + w * 10,
-      samples: SAMPLES_PER_WORKER,
+      samples: samplesFor(methodology),
     });
   }
 
@@ -129,8 +147,11 @@ async function bench(label: string, m: Methodology, t: Transport | null) {
   // Run several times and keep the fastest. CPU contention can only slow a
   // run down, so the minimum is the best estimate of true throughput.
   let best: MethodResult | null = null;
-  for (let r = 0; r < RUNS_PER_METHOD; r++) {
+  const runs = runsFor(m);
+  for (let r = 0; r < runs; r++) {
     const res = await runMethodology(m, t);
+    // Progress, so a slow methodology does not look like a hang.
+    process.stdout.write(`${r + 1}/${runs} `);
     if (best === null || res.elapsedMs < best.elapsedMs) best = res;
   }
   outcomes.push(best!);
@@ -162,8 +183,12 @@ const sorted = [...outcomes].sort(
 console.log("\n── Real-world benchmark ────────────────────────────────────");
 console.log(`Requests per methodology: ${totalRequests.toLocaleString()}`);
 console.log(`Workers per methodology:  ${WORKERS_PER_METHOD}`);
-console.log(`Samples per worker:       ${SAMPLES_PER_WORKER} (min kept)`);
-console.log(`Runs per methodology:     ${RUNS_PER_METHOD} (min kept)`);
+console.log(
+  `Samples per worker:       ${FAST_SAMPLES_PER_WORKER} (shared, sqlite) / ${SLOW_SAMPLES_PER_WORKER} (mysql, redis), min kept`,
+);
+console.log(
+  `Runs per methodology:     ${FAST_RUNS_PER_METHOD} (shared, sqlite) / ${SLOW_RUNS_PER_METHOD} (mysql, redis), min kept`,
+);
 console.log("");
 console.log(
   "| Methodology | Transport | Requests | Elapsed (ms) | req/s      |",
@@ -214,8 +239,12 @@ lines.push(`Date: ${new Date().toISOString()}`);
 lines.push(`Platform: ${process.platform} (${process.arch})`);
 lines.push(`Requests per methodology: ${totalRequests}`);
 lines.push(`Workers per methodology: ${WORKERS_PER_METHOD}`);
-lines.push(`Samples per worker: ${SAMPLES_PER_WORKER} (min kept)`);
-lines.push(`Runs per methodology: ${RUNS_PER_METHOD} (min kept)`);
+lines.push(
+  `Samples per worker: ${FAST_SAMPLES_PER_WORKER} (shared, sqlite) / ${SLOW_SAMPLES_PER_WORKER} (mysql, redis), min kept`,
+);
+lines.push(
+  `Runs per methodology: ${FAST_RUNS_PER_METHOD} (shared, sqlite) / ${SLOW_RUNS_PER_METHOD} (mysql, redis), min kept`,
+);
 lines.push("");
 lines.push("| Methodology | Transport | Requests | Elapsed (ms) | req/s |");
 lines.push("|-------------|-----------|----------|--------------|-------|");

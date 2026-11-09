@@ -3,10 +3,12 @@
 # Start them with:
 #   docker compose -f bench/real-world/docker-compose.yml up -d
 #
-# Both services expose their data over a Unix socket (mounted from
-# ./sockets) in addition to TCP, so the benchmark can compare TCP vs socket
-# access. The benchmark connects with the credentials below (see run.ts /
-# api.ts).
+# This file exposes both services over TCP only, which works everywhere
+# (including Docker Desktop on macOS/Windows). To additionally benchmark Unix
+# sockets, which only work with a native Docker on Linux, add the override:
+#   docker compose -f bench/real-world/docker-compose.yml \
+#                  -f bench/real-world/docker-compose.sockets.yml up -d
+# The benchmark connects with the credentials below (see run.ts / api.ts).
 services:
   mysql:
     image: mysql:8.4
@@ -16,10 +18,15 @@ services:
       MYSQL_DATABASE: bench
       MYSQL_USER: bench
       MYSQL_PASSWORD: bench
+    # MySQL 8.4 disables mysql_native_password by default, but Bun's native SQL
+    # client cannot use the default caching_sha2_password over an insecure
+    # connection. Enable the plugin and give the bench user that auth method
+    # (see mysql-init.sql, run once when the container is first created).
+    command: ["--mysql-native-password=ON"]
     ports:
       - "3306:3306"
     volumes:
-      - ./sockets/mysql:/var/run/mysqld
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/01-native-password.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
       interval: 2s
@@ -31,16 +38,6 @@ services:
     container_name: bun-shared-memory-redis
     ports:
       - "6379:6379"
-    volumes:
-      - ./sockets/redis:/sockets
-    command:
-      [
-        "redis-server",
-        "--unixsocket",
-        "/sockets/redis.sock",
-        "--unixsocketperm",
-        "777",
-      ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

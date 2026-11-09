@@ -1,0 +1,26 @@
+# Linux-only override: also expose MySQL and Redis over Unix sockets (mounted
+# from ./sockets) so the benchmark can compare TCP vs socket access.
+#
+#   docker compose -f bench/real-world/docker-compose.yml \
+#                  -f bench/real-world/docker-compose.sockets.yml up -d
+#
+# Docker Desktop (macOS/Windows) cannot create Unix sockets on bind-mounted
+# host directories: Redis fails with "Failed opening Unix socket: bind: Not
+# supported" and MySQL's entrypoint aborts, so the containers exit immediately.
+# Use the plain docker-compose.yml there (TCP only).
+services:
+  mysql:
+    volumes:
+      - ./sockets/mysql:/var/run/mysqld
+
+  redis:
+    volumes:
+      - ./sockets/redis:/sockets
+    command:
+      [
+        "redis-server",
+        "--unixsocket",
+        "/sockets/redis.sock",
+        "--unixsocketperm",
+        "777",
+      ]
