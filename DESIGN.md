@@ -38,7 +38,7 @@ Maps a shared object's key to its location in the DataTable.
   most once per thread).
 - An entry is written completely _before_ the entry count is published
   (`Atomics.store`), so lock-free readers never see a half-initialized entry.
-  Inserts are serialized by the shared mutex.
+  Inserts are serialized by the global mutex.
 
 ### 2) DataTable
 
@@ -269,8 +269,8 @@ bit 2.. (0xFFFFFFFC) READER_COUNT   number of active readers (unit = 0b100)
   read lock must _not_ upgrade to a write lock: that would deadlock against the
   thread's own read hold, so it throws.
 
-When no `rwLock` is provided, `withRWLock`/`withWriteLock`/`withReadLock`
-fall back to the shared `Mutex`, so they remain correct (if less parallel).
+(Since V3 there is no separate `rwLock` option: the `with*` methods use the
+per-object version cell described below.)
 
 ### V3: Seqlock embedded in the version cell
 

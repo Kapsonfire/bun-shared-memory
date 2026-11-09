@@ -51,7 +51,7 @@ CORE API
      maxByteLength?: number,          // default: 64 MiB, min 32 MiB
      maxTotalBytes?: number,          // combined budget for Data/Str/Arr tables
      chunkSize?: number,              // default: 32 MiB, min 4 MiB
-     lock?: Mutex,                    // shared mutex for cross-worker use
+     lock?: Mutex,                    // global mutex; its buffer also holds the 256 key lock stripes
      internCapacity?: number,         // string interning cache, default: 256
      internMax?: number,              // intern cache max entries, default: 65536
    });
@@ -164,16 +164,23 @@ SUPPORTED TYPES
 
 SYNCHRONIZATION MODEL
 =====================
-1. Shared Mutex: All read/write operations acquire the shared Mutex (re-entrant).
+1. Per-key write locks: a write holds the lock stripe of its key (256 re-entrant
+   Mutex stripes, keyIndex & 255). Writers to different keys run in parallel,
+   writers to the same key are serialized. Key creation and defragmentation use
+   the global Mutex (defragmentation takes every stripe + the global Mutex).
 2. Read Cache: Each worker caches decoded values with a version number. Writes bump
    the version cell (in the Index Table), so caches auto-invalidate cross-worker.
+   Reads of unchanged values and object-property reads are lock-free; a
+   whole-value read after a change takes the key's stripe once.
 3. Offset Cache: Per-worker cache of key -> DataTable offsets, invalidated on
    defragmentation (via layoutVersion).
 4. Layout Version: Global cell bumped on GC/defragmentation, invalidating offset
    and layout caches across all workers.
-5. Lock-free Writes: Hot writes use a write counter; if defragmentation is running,
-   falls back to mutex.
-6. Atomic Registration: Initial value writes hold the lock, so racing workers from
+5. Bounded waits: every lock wait times out (default 30 s, LockTimeoutError);
+   a dead worker's locks are released by the RefCountCoordinator.
+6. One SharedMemory per thread, created on the main thread only; workers get it
+   through init() / SharedMemory.fromBuffers().
+7. Atomic Registration: Initial value writes hold the lock, so racing workers from
    different threads don't overwrite each other's values.
 
 PERFORMANCE OPTIMIZATIONS

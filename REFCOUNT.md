@@ -134,9 +134,9 @@ eagerly on every release.
 
 ### Correctness notes
 
-- Compaction runs under the shared mutex, so no worker can read/write during
-  the move.
-- All references are updated in a single pass before the mutex is released, so
+- Compaction runs while holding every key lock stripe and the global mutex, so
+  no worker can write (or decode a whole value) during the move.
+- All references are updated in a single pass before the locks are released, so
   workers never observe a half-moved state.
 - The `objectId` is stable across compaction (only the offset changes), so the
   refcount table stays valid.
