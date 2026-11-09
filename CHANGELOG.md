@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Torn reads of object properties.** A lock-free property read that overlapped
+  a write could return a value assembled from two writes: strings (inline and
+  heap) were seen with the offset of one value and the length of another, with
+  no error (measured: 205 000 wrong values in 52 M reads against a writer that
+  alternates two strings). Ordinary writes now mark the key's version cell while
+  they write (WRITER bit) and bump the version when done; lock-free reads
+  validate the cell after decoding and decode again if it changed (a seqlock).
+- `withWriteLock` / `withReadLock` / `withRWLock` passed an internal helper
+  object to the callback instead of the shared reference, so `self.prop = x`
+  inside the callback silently wrote a local property. The callback now gets the
+  reference.
+
+### Changed
+
+- Ordinary writes now wait for another thread's `withReadLock` /
+  `withWriteLock` on the same key (before, they ignored it), and a thread never
+  waits for lock bits it holds itself.
+- A lock-free read under a writer that writes the same key without pause ends on
+  the stripe path (a few µs per read instead of a wrong value).
+- Each write performs one more atomic operation (the WRITER mark): own-key
+  write micro benchmark +8…+18 %, 8-worker write throughput −16…−20 %.
+
+### Performance
+
+- **Readers of one hot key scale.** Cache hits read the version cell with a plain
+  load instead of `Atomics.load`: 8 workers reading the same key went from 27 to
+  1751 M reads/s (they used to get slower with every worker added); the
+  single-thread property read hit also got faster (2.7 → 1.9 ns). New
+  `bun run bench:readscale`.
+
+### Fixed
+
 - SonarCloud quality gate: `init()` no longer creates the main-thread memory as
   a bare `new SharedMemory(...)` statement (reported as a reliability bug); it
   passes the instance to `setDefaultMemory`.
