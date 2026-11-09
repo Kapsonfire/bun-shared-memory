@@ -111,10 +111,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A dead worker's stripes are released together with the global mutex
   (`SharedMemory.forceUnlockAll`).
 
+- Real-world benchmark tooling: `docker-compose.yml` is TCP-only and sets up the MySQL 8.4 native-password auth itself (Unix sockets moved to the Linux-only `docker-compose.sockets.yml`; the containers used to exit immediately on Docker Desktop); MySQL/Redis use fewer samples/runs and the runner prints progress, so the run no longer looks hung (6-7 min per methodology before).
 - Docs: README, DESIGN, REFCOUNT and `llms.txt` describe the per-key locking model; `AGENTS.md` requires `bun run bench:contention` for locking changes.
 
 ### Fixed
 
+- **Refcount ring wedged by a killed worker; `drainEvents` starving the event
+  loop.** A worker terminated between reserving a ring slot and publishing it
+  left an unpublished slot behind: the consumer could never move past it, the
+  ring filled up and every later worker blocked in `pushEvent` forever (the real
+  benchmark, which terminates its workers after each run, hung in ~5 % of the
+  runs). `popEvent` now skips a slot that stayed unpublished for `stallMs`
+  (default 300 ms) once the coordinator has seen a worker die
+  (`RefCountBuffer.noteWorkerDeath`, called from `unregisterWorker`); each slot
+  needs its own timer, so producers still waiting for their slot on a full ring
+  are never skipped. Separately, `drainEvents` ran until the ring was empty,
+  which never happens while producers keep it full, starving the main thread's
+  event loop (timers, worker messages); a drain is now bounded
+  (`drainEvents(maxEvents)`) and continues on later event-loop turns.
 - **Workers stalled on a full refcount event ring.** The ring is bounded (a full
   ring blocks the producer, since v1.0.0) and was only drained by the main
   thread's 100 ms maintenance timer. A worker reading in a loop (each `read()`

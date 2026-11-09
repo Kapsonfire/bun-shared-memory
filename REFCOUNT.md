@@ -85,6 +85,17 @@ A heartbeat is a secondary safety net: if a worker stops heartbeating without a
 close event (e.g. a hung worker), the main thread can reclaim its references
 after a timeout.
 
+**Crash in the middle of pushing an event.** A producer reserves a ring slot with
+`Atomics.add` and publishes it afterwards. A worker killed in between (for
+example by `worker.terminate()`) leaves a reserved but never published slot that
+would block the consumer, and through the full ring every other worker, for
+good. After the coordinator has seen a worker die, `popEvent` skips a slot that
+stayed unpublished for `stallMs` (default 300 ms); each slot has its own timer,
+and slots that are published or whose producers still wait for the consumer to
+re-arm them are never skipped. Without a recent worker death nothing is skipped,
+because a slow but live producer (GC pause, descheduled thread) must not lose
+its slot.
+
 ## Data structures
 
 ### Object/Array identity

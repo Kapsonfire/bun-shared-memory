@@ -69,6 +69,18 @@ export interface RefEvent {
  *     revolution by setting `seq` to `pos + ringSize`, so the slot is not
  *     overwritten by a producer before the consumer has drained it.
  */
+/** Run `fn` in a later event-loop turn (not as a microtask). */
+const scheduleMacrotask: (fn: () => void) => void =
+  typeof setImmediate === "function"
+    ? (fn) => void setImmediate(fn)
+    : (fn) => void setTimeout(fn, 0);
+
+/** How long after a worker death unpublished ring slots may be skipped. */
+const DEATH_WINDOW_MS = 10_000;
+
+/** Maximum events one drain call processes before yielding to the event loop. */
+const DRAIN_BATCH = 8192;
+
 /**
  * Default number of ring slots (16 bytes each). A larger ring lets bursts of
  * reads go through without ever blocking on the consumer.
@@ -79,6 +91,21 @@ export class RefCountBuffer {
   readonly buffer: SharedArrayBuffer;
   private readonly view: Int32Array;
   private readonly ringSize: number;
+  private readonly stallMs: number;
+  /** Consumer: ring position seen unpublished, and since when (ms). */
+  private stallPos = -1;
+  private stallSince = 0;
+  /**
+   * Positions below this were already armed for their producers when the
+   * current stall was first seen (see popEvent).
+   */
+  private abandonBelow = 0;
+  /** True once a stall timer expired: unpublished slots below `abandonBelow` are skipped at once. */
+  private batching = false;
+  /** Consumer: when a worker last died (performance.now() ms), see below. */
+  private lastDeathAt = -Infinity;
+  /** Number of slots skipped because their producer died before publishing. */
+  abandonedSlots = 0;
   private readonly hbOffset: number;
   private readonly workerBitsOffset: number;
   private readonly workerBitsWords: number;
@@ -87,12 +114,23 @@ export class RefCountBuffer {
 
   constructor(
     buffer?: SharedArrayBuffer,
-    opts: { ringSize?: number; maxWorkers?: number; maxObjects?: number } = {},
+    opts: {
+      ringSize?: number;
+      maxWorkers?: number;
+      maxObjects?: number;
+      /**
+       * How long (ms) the consumer waits for a reserved-but-unpublished slot
+       * before treating its producer as dead and skipping it (only after a
+       * worker died, see `noteWorkerDeath`). Default 300.
+       */
+      stallMs?: number;
+    } = {},
   ) {
     const ringSize = opts.ringSize ?? DEFAULT_RING_SIZE;
     const maxWorkers = opts.maxWorkers ?? 64;
     const maxObjects = opts.maxObjects ?? 1 << 16;
     this.ringSize = ringSize;
+    this.stallMs = opts.stallMs ?? 300;
     this.maxWorkers = maxWorkers;
     this.workerBitsOffset = 3 + ringSize * 4;
     this.workerBitsWords = Math.ceil(maxWorkers / 32);
@@ -217,24 +255,95 @@ export class RefCountBuffer {
    * revolution and wakes any producer blocked on a full ring.
    */
   popEvent(): RefEvent | null {
-    const read = Atomics.load(this.view, 1);
-    const slot = read % this.ringSize;
-    const seqIdx = 3 + slot * 4 + 3;
-    // The event at this position is only ready once its seq is exactly
-    // `read + 1`. A value of `read` (or less) means the producer has not
-    // published it yet.
-    if (Atomics.load(this.view, seqIdx) !== read + 1) return null;
-    const base = 3 + slot * 4;
-    const workerId = Atomics.load(this.view, base);
-    const op = Atomics.load(this.view, base + 1) as 0 | 1;
-    const objectId = Atomics.load(this.view, base + 2);
-    // Re-arm the slot for the producer at global position `read + ringSize`
-    // (which maps to this same ring slot), then advance the read pointer and
-    // wake any producer waiting for space.
-    Atomics.store(this.view, seqIdx, read + this.ringSize);
-    Atomics.store(this.view, 1, read + 1);
-    Atomics.notify(this.view, seqIdx, Infinity);
-    return { workerId, op, objectId };
+    for (;;) {
+      const read = Atomics.load(this.view, 1);
+      const slot = read % this.ringSize;
+      const seqIdx = 3 + slot * 4 + 3;
+      // The event at this position is only ready once its seq is exactly
+      // `read + 1`. A value of `read` (or less) means the producer has not
+      // published it yet.
+      if (Atomics.load(this.view, seqIdx) === read + 1) {
+        const base = 3 + slot * 4;
+        const workerId = Atomics.load(this.view, base);
+        const op = Atomics.load(this.view, base + 1) as 0 | 1;
+        const objectId = Atomics.load(this.view, base + 2);
+        // Re-arm the slot for the producer at global position
+        // `read + ringSize` (which maps to this same ring slot), then advance
+        // the read pointer and wake any producer waiting for space.
+        Atomics.store(this.view, seqIdx, read + this.ringSize);
+        Atomics.store(this.view, 1, read + 1);
+        Atomics.notify(this.view, seqIdx, Infinity);
+        this.stallPos = -1;
+        this.batching = false;
+        return { workerId, op, objectId };
+      }
+      // Not published. If no position at or after `read` was reserved the queue
+      // is simply empty.
+      if (((Atomics.load(this.view, 0) - read) | 0) <= 0) {
+        this.stallPos = -1;
+        return null;
+      }
+      // A producer reserved this position but has not published it. Normally
+      // that takes microseconds; but a producer that was terminated between
+      // reserving and publishing never will, and would wedge the ring for
+      // everyone (the consumer cannot move past it and all producers end up
+      // blocked on a full ring). Skip the slot once it has been pending for
+      // `stallMs`.
+      const now = performance.now();
+      // A slot can only have been abandoned by a producer that died, so only
+      // look for one shortly after a worker died. Skipping a slot whose
+      // producer is merely slow (GC pause, descheduled) would be wrong: its
+      // late write would land in a slot already re-armed for the next
+      // revolution and the producer for that slot would wait forever.
+      if (now - this.lastDeathAt > DEATH_WINDOW_MS) {
+        this.stallPos = -1;
+        return null;
+      }
+      // A slot is only skipped after its own `stallMs` of observed silence
+      // (producers that reserved later positions may simply still be waiting
+      // for the consumer to re-arm their slot on a full ring). Once one slot's
+      // timer has expired, the others of its window that are still unpublished
+      // are skipped without waiting again; a published slot ends that.
+      if (this.batching && ((this.abandonBelow - read) | 0) > 0) {
+        // Same window as a slot whose timer already expired: skip right away
+        // (see below).
+      } else {
+        this.batching = false;
+        if (this.stallPos !== read) {
+          this.stallPos = read;
+          this.stallSince = now;
+          // Positions in [read, read + ringSize) were all armed for their
+          // producers before this moment (the consumer already passed
+          // position - ringSize). So once `read` has stayed silent for
+          // `stallMs`, every such position that was reserved by now has been
+          // silent at least as long, and the unpublished ones can be skipped
+          // together instead of one `stallMs` each. Positions beyond the
+          // window may still be waiting for their slot to be re-armed and keep
+          // their own timer.
+          const reserved = (Atomics.load(this.view, 0) - read) | 0;
+          this.abandonBelow = read + Math.min(reserved, this.ringSize);
+          return null;
+        }
+        if (now - this.stallSince < this.stallMs) return null;
+        // The timer of this slot expired: from here on the window is batched.
+        this.batching = true;
+      }
+      Atomics.store(this.view, seqIdx, read + this.ringSize);
+      Atomics.store(this.view, 1, read + 1);
+      Atomics.notify(this.view, seqIdx, Infinity);
+      this.stallPos = -1;
+      this.abandonedSlots++;
+    }
+  }
+
+  /**
+   * Consumer side: tell the ring that a worker just died (closed, crashed or
+   * was terminated). A producer killed between reserving a slot and publishing
+   * it leaves an unpublished slot behind; for `DEATH_WINDOW_MS` after a death
+   * `popEvent` skips slots that stay unpublished for `stallMs`.
+   */
+  noteWorkerDeath(): void {
+    this.lastDeathAt = performance.now();
   }
 
   /**
@@ -517,12 +626,34 @@ export class RefCountCoordinator {
   }
 
   /** Drain pending acquire/release events from the ring buffer. */
-  drainEvents(): void {
+  drainEvents(maxEvents = Infinity): boolean {
     let ev: RefEvent | null;
+    let processed = 0;
     while ((ev = this.buffer.popEvent()) !== null) {
       if (ev.op === 1) this.acquire(ev.objectId, ev.workerId);
       else this.release(ev.objectId, ev.workerId);
+      // Bound the work of one call: producers that keep the ring full would
+      // otherwise keep this loop running forever and starve the event loop
+      // (timers, worker messages) of the thread it runs on.
+      if (++processed >= maxEvents) return true;
     }
+    return false;
+  }
+
+  private drainSoonPending = false;
+
+  /**
+   * Continue draining in later event-loop turns, in bounded batches, until the
+   * ring is empty. Lets timers and worker messages run between batches.
+   */
+  private drainSoon(): void {
+    if (this.drainSoonPending) return;
+    this.drainSoonPending = true;
+    scheduleMacrotask(() => {
+      this.drainSoonPending = false;
+      if (this.maintenanceTimer === null && !this.drainWakeActive) return;
+      if (this.drainEvents(DRAIN_BATCH)) this.drainSoon();
+    });
   }
 
   /**
@@ -602,6 +733,8 @@ export class RefCountCoordinator {
     }
     this.releaseWorker(id);
     this.recoverLockOf(id);
+    // The worker may have been killed in the middle of pushing an event.
+    this.buffer.noteWorkerDeath();
     this.workerRefs.delete(id);
     this.workerById.delete(id);
     this.heartbeatSeen.delete(id);
@@ -661,7 +794,7 @@ export class RefCountCoordinator {
     if (this.maintenanceTimer !== null) return () => {};
     this.startDrainWake();
     this.maintenanceTimer = setInterval(() => {
-      this.drainEvents();
+      if (this.drainEvents(DRAIN_BATCH)) this.drainSoon();
       if (this.heartbeatTicks > 0) this.reapDeadWorkers();
       if (this.needsDefrag()) this.runDefrag();
     }, intervalMs);
@@ -703,8 +836,12 @@ export class RefCountCoordinator {
       }
       void request.then(() => {
         if (!this.drainWakeActive) return;
-        this.drainEvents();
-        arm();
+        if (this.drainEvents(DRAIN_BATCH)) this.drainSoon();
+        // Re-arm on a fresh macrotask, never in the same microtask chain: a
+        // producer that keeps hitting a full ring bumps the counter faster than
+        // we re-arm, and a promise chain would then starve the event loop
+        // (timers, worker messages) indefinitely.
+        scheduleMacrotask(arm);
       });
     };
     arm();
