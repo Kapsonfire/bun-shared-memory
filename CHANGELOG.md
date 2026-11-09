@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-09
+
 ### Added
 
 - **V3 Seqlock embedded in each object's version cell.** The read/write lock
@@ -30,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   number of readers may hold it concurrently while writers stay exclusive,
   and re-entrancy is tracked per-thread (read, write, and read-inside-write);
   a reader→writer upgrade from the same thread throws (deadlock risk).
+
+### Fixed
+
+- **Quadratic key lookup.** `SharedMemory.lookupIndex` scanned the whole Index
+  Table and decoded every key string on each lookup, so creating many keys was
+  O(n²) (16 000 new keys took ~44 s). Each instance now keeps an incrementally
+  filled key → index `Map` (keys are never removed or reordered), so lookups
+  are O(1) amortized (16 000 keys: ~0.33 s).
+- **Index insert race.** `insert` published the new entry count before the
+  entry was written (and before the Index Table was grown), so a lock-free
+  reader could see a half-initialized entry. The entry is now fully written
+  first and the count is published last with `Atomics.store`.
 
 ## [1.0.1] - 2026-11-07
 
@@ -418,6 +432,7 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - Optimize the read hot path: direct cache on the proxy target.
 - Optimize `Mutex`: skip notify when no worker is waiting.
 - Start the refcount coordinator/tracker automatically in `init()`.
+[1.0.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.0.2
 - Document the minimum Bun version (`>= 1.4.0`).
 
 ## [0.1.0] - 2026-11-01
