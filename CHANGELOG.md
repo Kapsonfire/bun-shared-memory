@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docs: `DESIGN.md` rewritten to match the code (16-byte slots, slot types,
+  Index Table entry, lock-free reads, mutex owner/timeouts, one memory per
+  thread). `BENCH.md`/`AGENTS.md` use `variance` instead of the German
+  `Varianz`.
+- Tests: regression tests for many keys, Index Table insert ordering and
+  concurrent key creation from several workers.
+
 ## [1.1.0] - 2026-11-09
 
 ### Added
