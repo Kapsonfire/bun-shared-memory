@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which a busy main thread never reaches). Writes in worker threads still
   rely on the main thread's maintenance.
 
+### Changed
+
+- **One `SharedMemory` per thread; created on the main thread only.**
+  Constructing a second `SharedMemory` in a thread now throws (the per-thread
+  read/offset/layout/key caches are keyed by key name, so two instances in one
+  thread corrupted each other). A fresh memory (no `buffers`) can only be
+  created on the main thread; workers must obtain it through `init()` or
+  `SharedMemory.fromBuffers()`. New `SharedMemory.current()` and
+  `memory.dispose()` (frees the slot and clears the caches). `init()` on the
+  main thread creates the memory; `setDefaultMemory(mem)` now only accepts the
+  thread's live instance. **Breaking** for code that created several memories
+  in one thread.
+
 ### Fixed
 
 - **Mutex re-entrancy across instances.** Re-entrancy was tracked per `Mutex`

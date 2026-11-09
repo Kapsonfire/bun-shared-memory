@@ -34,6 +34,7 @@ import {
   type ObjectLayout,
   type StringRef,
   type ValueSlot,
+  onMemoryDisposed,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
 import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
@@ -834,6 +835,17 @@ const registry = new Map<string, SharedRef<unknown>>();
  * loop forever on self/mutual references).
  */
 const sharedKeyMap = new WeakMap<object, string>();
+
+// The per-thread caches are keyed by key name only, which is sound because a
+// thread has exactly one SharedMemory. When it is disposed, drop them so the
+// next memory never sees stale entries.
+onMemoryDisposed(() => {
+  readCache.clear();
+  indexCache.clear();
+  offsetCache.clear();
+  layoutCache.clear();
+  registry.clear();
+});
 
 /**
  * Get a wrapper to a named value in shared memory.

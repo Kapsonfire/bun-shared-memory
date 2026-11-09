@@ -299,6 +299,22 @@ const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 
 See [REFCOUNT.md](./REFCOUNT.md) for the full design.
 
+## One SharedMemory per thread
+
+A thread (the main thread or each worker) holds **exactly one** `SharedMemory`.
+Creating a second one throws, because the per-thread caches are keyed by key
+name only. The memory is **created on the main thread only**: workers never
+create a fresh memory, they receive the main thread's buffers via
+`await init()` (or `SharedMemory.fromBuffers()`), so every thread addresses the
+same data.
+
+```ts
+const mem = new SharedMemory(); // main thread: OK
+new SharedMemory(); // Error: a SharedMemory already exists in this thread
+SharedMemory.current(); // the single live instance (or null)
+mem.dispose(); // frees the slot and resets the caches (tests, teardown)
+```
+
 ## Worker integration
 
 A worker can simply call `Shared()` and automatically share the same buffers
