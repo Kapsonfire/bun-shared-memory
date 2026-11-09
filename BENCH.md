@@ -221,3 +221,7 @@ Reading across many keys is much faster (`bench/refspeed.ts`, 2000 different
 object keys, ns per property read: 47.7 → 16.5), because objects of one shape
 share their hidden class. `bench/refspeed.ts` runs several cases in one process
 and is only meant for such side-by-side checks of the same code state.
+
+`bun bench/gcheap.ts 100000` measures what stays in the JS heap after 100 000
+object keys were used once and the references dropped (the wrapper registry
+holds wrappers weakly, `perf/per-key-heap`): 2387 B per key before, 159 B after.

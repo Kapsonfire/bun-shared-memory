@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Proxy (primitives, arrays) keeps one trap call by creating its function on
   first use.
 
+- **Unused wrappers are garbage collected.** The per-thread registry held every
+  wrapper forever (1-2 KB each) and the caches kept an entry per key ever
+  touched, including the last decoded value. Wrappers are now held through
+  `WeakRef`; when one is collected a `FinalizationRegistry` callback drops the
+  key's read, index, offset and layout cache entries. While a reference is
+  alive, `Shared(key)` still returns the same object. Measured with
+  `bun bench/gcheap.ts` (100 000 object keys used once and dropped): 2387 B
+  per key stayed in the heap before, 159 B afterwards. Cost: a repeated
+  `Shared(key)` for a held key takes 6.4 instead of 4.0 ns. What remains per
+  key is the per-thread key → index map of the memory itself (every key of the
+  shared memory a thread has looked up).
+
 ### Changed (benchmark)
 
 - `bun run bench` runs every case in its own process, with its own measuring
