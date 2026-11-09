@@ -1,4 +1,4 @@
-import { isBun, isMainThread, supportsWorkerEvents } from "./env.ts";
+import { isBun, isMainThread } from "./env.ts";
 import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
 import { getThreadId } from "./mutex.ts";
 import {
@@ -92,8 +92,10 @@ export function hasDefaultMemory(): boolean {
  */
 export async function init(options?: SharedMemoryOptions): Promise<void> {
   if (isMainThread) {
-    // The memory is created here, on the main thread only.
-    if (!hasDefaultMemory()) new SharedMemory(options);
+    // The memory is created here, on the main thread only. Its constructor
+    // registers it as this thread's single instance; `setDefaultMemory`
+    // confirms that (and keeps the freshly created instance in use).
+    setDefaultMemory(SharedMemory.current() ?? new SharedMemory(options));
     if (isBun) {
       // In Bun, the main thread can auto-discover workers via
       // `process.on("worker", ...)`.
@@ -121,9 +123,6 @@ export function stopInit(): void {
 
 /** The main-thread RefCountCoordinator, started by `init()`. */
 let coordinator: RefCountCoordinator | null = null;
-
-/** workerId assigned to each live worker, for the handshake reply. */
-const workerIdByWorker = new Map<unknown, number>();
 
 /** The worker-side RefCountTracker, created from the shared refcount buffer. */
 let workerTracker: RefCountTracker | null = null;
@@ -195,7 +194,6 @@ function initMain(): void {
     // Register with the refcount coordinator and remember the assigned id so
     // the handshake reply can pass it back to the worker.
     const workerId = coordinator?.registerWorker(worker);
-    if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
     worker.addEventListener("message", (e) => {
       const msg = e.data as
         { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
@@ -213,7 +211,6 @@ function initMain(): void {
           buffers: mem.exportBuffers(),
           workerId,
         });
-        return;
       }
     });
   };
@@ -277,7 +274,6 @@ export function acceptWorker<
   // Register with the refcount coordinator and remember the assigned id so the
   // handshake reply can pass it back to the worker.
   const workerId = coordinator?.registerWorker(worker);
-  if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
   const listener = (e: { data: unknown }) => {
     const msg = e.data as
       { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;

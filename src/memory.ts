@@ -1,10 +1,4 @@
 import {
-  LockTimeoutError,
-  deadlineFor,
-  getDefaultLockTimeout,
-  waitUntil,
-} from "./wait.ts";
-import {
   BudgetExceededError,
   GrowableBuffer,
   MIN_BLOCK_SIZE,
@@ -1910,8 +1904,6 @@ export class SharedMemory {
     /** Offsets of live string-value blocks (no slots to remap). */
     const stringValueBlocks = new Set<number>();
 
-    const markString = (offset: number) => liveStrings.add(offset);
-
     const markValueSlot = (slot: ValueSlot) => {
       switch (slot.type) {
         case TYPE_STRING_REF:
@@ -1963,7 +1955,6 @@ export class SharedMemory {
       let cursor = offset + OBJECT_HEADER;
       for (let i = 0; i < count; i++) {
         const nameOffset = this.dataTable.getInt32(cursor);
-        const nameLength = this.dataTable.getInt32(cursor + 4);
         liveStrings.add(nameOffset);
         cursor += NAME_REF_SIZE;
         markValueSlot(readSlot(this.dataTable, cursor));
