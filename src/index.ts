@@ -3,6 +3,13 @@ export type { SharedRef, SharedOptions } from "./shared.ts";
 export { SharedMemory } from "./memory.ts";
 export type { SharedMemoryOptions } from "./memory.ts";
 export { Mutex } from "./mutex.ts";
+export type { MutexOptions } from "./mutex.ts";
+export {
+  LockTimeoutError,
+  setDefaultLockTimeout,
+  getDefaultLockTimeout,
+  DEFAULT_LOCK_TIMEOUT_MS,
+} from "./wait.ts";
 export { RWLock } from "./rwlock.ts";
 export { Notifier } from "./notifier.ts";
 export {

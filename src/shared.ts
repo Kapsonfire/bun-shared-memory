@@ -1,4 +1,10 @@
 import {
+  LockTimeoutError,
+  deadlineFor,
+  getDefaultLockTimeout,
+  waitUntil,
+} from "./wait.ts";
+import {
   SharedMemory,
   TYPE_ARRAY_REF,
   TYPE_BIGINT_STR,
@@ -28,6 +34,7 @@ import {
   type ObjectLayout,
   type StringRef,
   type ValueSlot,
+  onMemoryDisposed,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
 import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
@@ -75,7 +82,7 @@ interface ArrayLocator {
  * lock.
  */
 function writeLock<T>(mem: SharedMemory, fn: () => T): T {
-  return mem.withLock(fn);
+  return mem.withWriteLock(fn);
 }
 
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
@@ -315,9 +322,15 @@ function waitForVersionCell(mem: SharedMemory, cell: number): number {
     return Atomics.load(mem.versionView, cell) >> VERSION_LOCK_SHIFT_BITS;
   }
   let raw = Atomics.load(mem.versionView, cell);
-  while ((raw & VERSION_LOCK_MASK) !== 0) {
-    Atomics.wait(mem.versionView, cell, raw);
-    raw = Atomics.load(mem.versionView, cell);
+  if ((raw & VERSION_LOCK_MASK) !== 0) {
+    const timeoutMs = getDefaultLockTimeout();
+    const deadline = deadlineFor(timeoutMs);
+    do {
+      if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+        throw new LockTimeoutError("object lock", timeoutMs);
+      }
+      raw = Atomics.load(mem.versionView, cell);
+    } while ((raw & VERSION_LOCK_MASK) !== 0);
   }
   return raw >> VERSION_LOCK_SHIFT_BITS;
 }
@@ -338,9 +351,13 @@ function acquireCellLock(
     return false;
   }
   let raw = Atomics.load(mem.versionView, cell);
+  const timeoutMs = getDefaultLockTimeout();
+  const deadline = deadlineFor(timeoutMs);
   for (;;) {
     if ((raw & VERSION_LOCK_MASK) !== 0) {
-      Atomics.wait(mem.versionView, cell, raw);
+      if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+        throw new LockTimeoutError("object lock", timeoutMs);
+      }
       raw = Atomics.load(mem.versionView, cell);
       continue;
     }
@@ -819,6 +836,17 @@ const registry = new Map<string, SharedRef<unknown>>();
  */
 const sharedKeyMap = new WeakMap<object, string>();
 
+// The per-thread caches are keyed by key name only, which is sound because a
+// thread has exactly one SharedMemory. When it is disposed, drop them so the
+// next memory never sees stale entries.
+onMemoryDisposed(() => {
+  readCache.clear();
+  indexCache.clear();
+  offsetCache.clear();
+  layoutCache.clear();
+  registry.clear();
+});
+
 /**
  * Get a wrapper to a named value in shared memory.
  *
@@ -1066,7 +1094,7 @@ function writeProp(
   target?: WriteTarget,
 ): void {
   // Serialize the write under the shared mutex (see `writeLock`).
-  mem.withLock(() =>
+  mem.withWriteLock(() =>
     writePropInner(mem, key, prop, val, arrayCapacity, target),
   );
 }
@@ -1428,7 +1456,7 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          mem.withLock(() => {
+          mem.withWriteLock(() => {
             // Write directly to the cached slot offset when still valid,
             // skipping the getObjectLayout Map lookup + properties.get. The
             // layout version cannot change while the mutex is held (defrag
@@ -1593,7 +1621,9 @@ function writeValue(
   target?: WriteTarget,
 ): void {
   // Serialize the write under the shared mutex (see `writeLock`).
-  mem.withLock(() => writeValueInner(mem, key, value, arrayCapacity, target));
+  mem.withWriteLock(() =>
+    writeValueInner(mem, key, value, arrayCapacity, target),
+  );
 }
 
 function writeValueInner(
@@ -2244,7 +2274,7 @@ function createArrayProxy(
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole value. Serialize under the shared
       // mutex (see `writeLock`).
-      return mem.withLock(() => writeArrayProp(arrProp, val));
+      return mem.withWriteLock(() => writeArrayProp(arrProp, val));
     },
   });
 }

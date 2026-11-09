@@ -1,3 +1,4 @@
+import { waitUntil } from "./wait.ts";
 import { supportsWorkerEvents } from "./env.ts";
 import { SharedMemory } from "./memory.ts";
 
@@ -179,7 +180,7 @@ export class RefCountBuffer {
     // it does (the user signals it via Atomics.notify after re-arming).
     let seq = Atomics.load(this.view, seqIdx);
     while (seq !== pos) {
-      Atomics.wait(this.view, seqIdx, seq);
+      waitUntil(this.view, seqIdx, seq, Infinity);
       seq = Atomics.load(this.view, seqIdx);
     }
     const base = 3 + slot * 4;
@@ -323,6 +324,7 @@ export class RefCountCoordinator {
             mem.attachRefCountBuffer(b.sab);
             return b;
           })());
+    this.mem.reclaimHook = () => this.runDefrag();
     this.defragThreshold = opts.defragThreshold ?? 0.8;
     this.minFreeBlocks = opts.minFreeBlocks ?? 64;
     // Start periodic maintenance automatically so refcount events are drained
@@ -587,21 +589,31 @@ export class RefCountCoordinator {
     this.maintenanceTimer = setInterval(() => {
       this.drainEvents();
       if (this.heartbeatTicks > 0) this.reapDeadWorkers();
-      if (this.needsDefrag()) {
-        // Set the defrag flag so lock-free writes fall back to the mutex, then
-        // wait for any in-flight lock-free writes to finish before compacting.
-        this.mem.setDefragmenting();
-        this.mem.waitForWritesToFinish();
-        const buffers = this.mem.withLock(() => this.mem.defragment());
-        this.mem.clearDefragmenting();
-        this.onDefragment?.(buffers);
-      }
+      if (this.needsDefrag()) this.runDefrag();
     }, intervalMs);
     // Unref the timer so it does not keep the process alive. The coordinator
     // keeps draining events and defragmenting while the process runs, but the
     // process can still exit naturally when no other work is pending.
     (this.maintenanceTimer as unknown as { unref?: () => void }).unref?.();
     return () => this.stopAutoMaintenance();
+  }
+
+  /**
+   * Compact all tables now and notify `onDefragment` with the new chunk lists.
+   * Also installed as the memory's `reclaimHook`, so a write that exhausts the
+   * budget reclaims dead space immediately instead of waiting for the timer.
+   */
+  runDefrag(): void {
+    // Set the defrag flag so lock-free writes fall back to the mutex, then
+    // wait for any in-flight lock-free writes to finish before compacting.
+    this.mem.setDefragmenting();
+    try {
+      this.mem.waitForWritesToFinish();
+      const buffers = this.mem.withLock(() => this.mem.defragment());
+      this.onDefragment?.(buffers);
+    } finally {
+      this.mem.clearDefragmenting();
+    }
   }
 
   /** Stop the periodic maintenance timer, if running. */

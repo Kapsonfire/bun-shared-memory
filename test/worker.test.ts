@@ -21,6 +21,8 @@ describe("Worker integration (M4)", () => {
     user.write({ name: "Bob", age: 31 });
 
     const buffers = mem.exportBuffers();
+    // One SharedMemory per thread: release the first before reconstructing.
+    mem.dispose();
     const mem2 = SharedMemory.fromBuffers(buffers);
     const user2 = Shared<{ name: string; age: number }>(
       "m4-roundtrip",

@@ -687,7 +687,11 @@ describe("SharedMemory total memory budget", () => {
       maxByteLength: 4096,
       chunkSize: 16,
     });
-    const workerMem = SharedMemory.fromBuffers(mem.exportBuffers());
+    const exported = mem.exportBuffers();
+    // One SharedMemory per thread: release the first before simulating a
+    // second thread that reconstructs it (the buffers stay valid).
+    mem.dispose();
+    const workerMem = SharedMemory.fromBuffers(exported);
 
     for (let i = 0; i < 200; i++) {
       mem.insert(`index-key-${i}`, i);
@@ -733,7 +737,11 @@ describe("SharedMemory total memory budget", () => {
       maxTotalBytes: 96,
       chunkSize: 16,
     });
-    const workerMem = SharedMemory.fromBuffers(mem.exportBuffers());
+    const exported = mem.exportBuffers();
+    // One SharedMemory per thread: release the first before simulating a
+    // second thread that reconstructs it (the buffers stay valid).
+    mem.dispose();
+    const workerMem = SharedMemory.fromBuffers(exported);
 
     // The clamped budget is shared atomically across workers.
     expect(workerMem.maxTotalBytes).toBe(32 * 1024 * 1024);

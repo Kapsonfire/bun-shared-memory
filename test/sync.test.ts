@@ -116,13 +116,17 @@ describe("Read cache invalidation across workers", () => {
       import { SharedMemory, Mutex, Shared } from ${JSON.stringify(
         new URL("../src/index.ts", import.meta.url).href,
       )};
+      // One SharedMemory per worker: create it on the first message only.
+      let user;
       self.onmessage = (e) => {
         const { buffers, lockBuf, key } = e.data;
-        const mem = new SharedMemory({
-          lock: new Mutex(lockBuf),
-          buffers,
-        });
-        const user = Shared(key, { name: "Alice", age: 30 }, { memory: mem });
+        if (user === undefined) {
+          const mem = new SharedMemory({
+            lock: new Mutex(lockBuf),
+            buffers,
+          });
+          user = Shared(key, { name: "Alice", age: 30 }, { memory: mem });
+        }
         if (e.data.action === "read") {
           self.postMessage({ name: user.name, age: user.age });
         }

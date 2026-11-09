@@ -1,9 +1,17 @@
 import {
+  LockTimeoutError,
+  deadlineFor,
+  getDefaultLockTimeout,
+  waitUntil,
+} from "./wait.ts";
+import {
+  BudgetExceededError,
   GrowableBuffer,
   MIN_BLOCK_SIZE,
   SharedBudget,
   nextPowerOfTwo,
 } from "./growable-buffer.ts";
+import { isMainThread } from "./env.ts";
 import { Mutex } from "./mutex.ts";
 
 /**
@@ -347,9 +355,26 @@ function makeBuffer(
   );
 }
 
+/** The one live SharedMemory of this thread (each worker has its own module). */
+let liveMemory: SharedMemory | null = null;
+/** Callbacks run when the live memory is disposed (per-thread cache resets). */
+const disposeListeners: Array<() => void> = [];
+
+/** Register a callback that runs whenever the live SharedMemory is disposed. */
+export function onMemoryDisposed(fn: () => void): void {
+  disposeListeners.push(fn);
+}
+
 /**
  * Manages the four shared buffers and provides operations to store and read
  * strings, arrays, and objects.
+ *
+ * **One instance per thread.** All per-thread caches (read/offset/layout/key
+ * caches) are keyed by key name only, so a thread may hold exactly one live
+ * `SharedMemory`; creating a second throws until the first is `dispose()`d.
+ * **The memory is created on the main thread only.** Workers never create a
+ * fresh memory: they receive the main thread's buffers through `init()` (or
+ * `fromBuffers()`), so every thread addresses the same shared data.
  */
 export class SharedMemory {
   readonly indexTable: GrowableBuffer;
@@ -414,6 +439,19 @@ export class SharedMemory {
   private nextObjectId = 1;
 
   constructor(options?: SharedMemoryOptions) {
+    if (liveMemory !== null) {
+      throw new Error(
+        "A SharedMemory already exists in this thread. Only one instance is " +
+          "allowed per thread/worker: reuse it (SharedMemory.current() or " +
+          "getDefaultMemory()) or call dispose() on it first.",
+      );
+    }
+    if (options?.buffers === undefined && !isMainThread) {
+      throw new Error(
+        "A fresh SharedMemory can only be created on the main thread. In a " +
+          "worker, call `await init()` to receive the main thread's buffers.",
+      );
+    }
     const initial = options?.initialSize ?? DEFAULT_INITIAL;
     // `maxTotalBytes` caps the combined physical size of DataTable,
     // StringTable, and ArrayTable. IndexTable has its independent 4 GiB cap.
@@ -511,11 +549,70 @@ export class SharedMemory {
     this.refCountBuffer = buffers?.refCount ?? null;
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
     this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
+    liveMemory = this;
+  }
+
+  /** The live SharedMemory of this thread, or null if none exists. */
+  static current(): SharedMemory | null {
+    return liveMemory;
+  }
+
+  /**
+   * Release this thread's single-instance slot and reset the per-thread
+   * caches, so a new `SharedMemory` may be created afterwards. The shared
+   * buffers themselves are untouched (other threads keep using them). Mostly
+   * useful for tests and teardown.
+   */
+  dispose(): void {
+    if (liveMemory !== this) return;
+    liveMemory = null;
+    this.reclaimHook = null;
+    for (const fn of disposeListeners) fn();
   }
 
   /** Run `fn` while holding the shared lock. */
   withLock<T>(fn: () => T): T {
     return this.lock.withLock(fn);
+  }
+
+  /**
+   * Optional callback that compacts the tables to reclaim dead space. Set by
+   * the `RefCountCoordinator` (main thread), which also broadcasts the new
+   * chunk lists to workers. Left `null` where no safe owner of defragmentation
+   * exists (standalone memory, worker threads).
+   */
+  reclaimHook: (() => void) | null = null;
+  private reclaiming = false;
+
+  /**
+   * Run a write under the shared lock. If the write fails because the memory
+   * budget is exhausted and a `reclaimHook` is installed, the dead space left
+   * behind by overwritten values is reclaimed and the write is retried once,
+   * instead of failing until the next periodic maintenance tick (which a busy
+   * main thread may never get to run).
+   */
+  withWriteLock<T>(fn: () => T): T {
+    return this.lock.withLock(() => {
+      try {
+        return fn();
+      } catch (error) {
+        const hook = this.reclaimHook;
+        if (
+          !(error instanceof BudgetExceededError) ||
+          hook === null ||
+          this.reclaiming
+        ) {
+          throw error;
+        }
+        this.reclaiming = true;
+        try {
+          hook();
+        } finally {
+          this.reclaiming = false;
+        }
+        return fn();
+      }
+    });
   }
 
   /**
@@ -1417,8 +1514,16 @@ export class SharedMemory {
 
   /** Wait until no lock-free writes are in flight. */
   waitForWritesToFinish(): void {
-    while (Atomics.load(this.layoutVersion, 1) !== 0) {
-      Atomics.wait(this.layoutVersion, 1, Atomics.load(this.layoutVersion, 1));
+    const timeoutMs = getDefaultLockTimeout();
+    const deadline = deadlineFor(timeoutMs);
+    for (;;) {
+      const inFlight = Atomics.load(this.layoutVersion, 1);
+      if (inFlight === 0) return;
+      if (
+        waitUntil(this.layoutVersion, 1, inFlight, deadline) === "timed-out"
+      ) {
+        throw new LockTimeoutError("waitForWritesToFinish", timeoutMs);
+      }
     }
   }
 

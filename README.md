@@ -203,6 +203,37 @@ mutex.withLock(() => {
 });
 ```
 
+#### Crashed lock holders: timeouts and recovery
+
+Every lock wait (`Mutex`, `RWLock`, the per-object `withReadLock` /
+`withWriteLock` seqlock) is bounded. If a worker dies while holding a lock,
+waiters throw a `LockTimeoutError` after 30 s instead of hanging forever.
+
+```ts
+import {
+  Mutex,
+  setDefaultLockTimeout,
+  LockTimeoutError,
+} from "bun-shared-memory";
+
+setDefaultLockTimeout(5_000); // per thread; Infinity = wait forever
+const mutex = new Mutex(buffer, { timeoutMs: 1_000 }); // per lock
+
+try {
+  mutex.lock();
+} catch (e) {
+  if (e instanceof LockTimeoutError) {
+    // The holder is probably dead. Its thread id is recorded in the lock:
+    mutex.forceUnlock(mutex.owner); // only if you know the owner is gone!
+  }
+}
+```
+
+A forced unlock may leave the protected data half-written, so only use it when
+the owner is known to be dead. The mutex records the owning thread and
+re-entrancy depth in the shared buffer, so several `Mutex` instances over the
+same buffer in one thread correctly see each other's holds.
+
 ### Notifier
 
 A cross-worker notification primitive built on `Atomics.wait`/`Atomics.notify`.
@@ -267,6 +298,22 @@ const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 ```
 
 See [REFCOUNT.md](./REFCOUNT.md) for the full design.
+
+## One SharedMemory per thread
+
+A thread (the main thread or each worker) holds **exactly one** `SharedMemory`.
+Creating a second one throws, because the per-thread caches are keyed by key
+name only. The memory is **created on the main thread only**: workers never
+create a fresh memory, they receive the main thread's buffers via
+`await init()` (or `SharedMemory.fromBuffers()`), so every thread addresses the
+same data.
+
+```ts
+const mem = new SharedMemory(); // main thread: OK
+new SharedMemory(); // Error: a SharedMemory already exists in this thread
+SharedMemory.current(); // the single live instance (or null)
+mem.dispose(); // frees the slot and resets the caches (tests, teardown)
+```
 
 ## Worker integration
 
@@ -382,6 +429,17 @@ overhead in Bun, where workers are auto-registered). If you prefer to build the
 >
 > This means reference counting and automatic defragmentation work in the
 > browser exactly as they do in Bun.
+
+> **Blocking on the browser main thread.** `Atomics.wait` is forbidden on the
+> browser main thread. Locks, `Notifier` and the object seqlock fall back to a
+> bounded busy-wait there, which works but blocks the UI while a lock is
+> contended. Do heavy or write-intensive work in Web Workers and keep main-thread
+> access to short, mostly read-only operations.
+
+> **Write scalability.** All writes are serialized by one global mutex, and a
+> read that misses its cache also takes it. Reads of unchanged values are
+> lock-free and fast (~3–5× native); writes cost ~25–40× native and do not
+> scale with the number of writer threads.
 
 ## Memory budget
 

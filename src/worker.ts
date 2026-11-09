@@ -29,45 +29,51 @@ import {
  * workers) just works too.
  */
 
-/** The module-level singleton SharedMemory, shared across all workers. */
-let defaultMemory: SharedMemory | null = null;
 /** Set while a worker is awaiting the buffers from the main thread. */
 let waitingForInit = false;
 
 /** Get the singleton SharedMemory, creating it on first use. */
 export function getDefaultMemory(): SharedMemory {
-  if (defaultMemory === null) {
-    if (waitingForInit) {
-      throw new Error(
-        "Shared() called before the shared buffers arrived from the main thread. " +
-          "Await init() before using Shared().",
-      );
-    }
-    if (!isMainThread) {
-      // A worker must call `await init()` to receive the shared buffers from
-      // the main thread. Without it, creating a fresh memory here would
-      // silently give the worker its own, unshared buffers — a hard-to-debug
-      // bug where reads/writes don't propagate to the main thread.
-      throw new Error(
-        "Shared() called in a worker without init(). " +
-          "Call `await init()` at the top of the worker to receive the shared " +
-          "buffers from the main thread before using Shared().",
-      );
-    }
-    // Standalone process (or main thread): create a fresh memory.
-    defaultMemory = new SharedMemory();
+  const live = SharedMemory.current();
+  if (live !== null) return live;
+  if (waitingForInit) {
+    throw new Error(
+      "Shared() called before the shared buffers arrived from the main thread. " +
+        "Await init() before using Shared().",
+    );
   }
-  return defaultMemory;
+  if (!isMainThread) {
+    // A worker must call `await init()` to receive the shared buffers from
+    // the main thread. Without it, creating a fresh memory here would
+    // silently give the worker its own, unshared buffers — a hard-to-debug
+    // bug where reads/writes don't propagate to the main thread. (The
+    // SharedMemory constructor enforces this too.)
+    throw new Error(
+      "Shared() called in a worker without init(). " +
+        "Call `await init()` at the top of the worker to receive the shared " +
+        "buffers from the main thread before using Shared().",
+    );
+  }
+  // Standalone process (or main thread): create the one fresh memory.
+  return new SharedMemory();
 }
 
-/** Set the singleton SharedMemory (e.g. from buffers received in a worker). */
+/**
+ * Declare `mem` as the default memory. A thread has exactly one SharedMemory
+ * (the one that was constructed last and not disposed), so this only verifies
+ * that `mem` is that instance; it exists for API compatibility.
+ */
 export function setDefaultMemory(mem: SharedMemory): void {
-  defaultMemory = mem;
+  if (SharedMemory.current() !== mem) {
+    throw new Error(
+      "setDefaultMemory: only the thread's single live SharedMemory can be the default.",
+    );
+  }
 }
 
-/** Whether the singleton has been initialized yet. */
+/** Whether this thread already has its SharedMemory. */
 export function hasDefaultMemory(): boolean {
-  return defaultMemory !== null;
+  return SharedMemory.current() !== null;
 }
 
 /**
@@ -85,9 +91,8 @@ export function hasDefaultMemory(): boolean {
  */
 export async function init(options?: SharedMemoryOptions): Promise<void> {
   if (isMainThread) {
-    if (!hasDefaultMemory()) {
-      setDefaultMemory(new SharedMemory(options));
-    }
+    // The memory is created here, on the main thread only.
+    if (!hasDefaultMemory()) new SharedMemory(options);
     if (isBun) {
       // In Bun, the main thread can auto-discover workers via
       // `process.on("worker", ...)`.
