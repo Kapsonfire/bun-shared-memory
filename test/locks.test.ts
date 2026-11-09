@@ -6,7 +6,9 @@ import {
   RefCountCoordinator,
   Shared,
   SharedMemory,
+  StripeLock,
   getDefaultLockTimeout,
+  getThreadId,
   setDefaultLockTimeout,
 } from "../src/index.ts";
 import { BudgetExceededError } from "../src/growable-buffer.ts";
@@ -44,6 +46,49 @@ function holdForever(
     w.postMessage(buf);
   });
 }
+
+describe("StripeLock (per-thread depth, shared owner)", () => {
+  const region = () => new SharedArrayBuffer(64);
+
+  test("is re-entrant and publishes/clears its owner in the shared cell", () => {
+    const lock = new StripeLock(region());
+    expect(lock.owner).toBe(0);
+    lock.lock();
+    expect(lock.owner).toBe(getThreadId());
+    expect(lock.heldByCurrentThread).toBe(true);
+    lock.lock(); // re-entrant
+    lock.unlock();
+    expect(lock.owner).toBe(getThreadId()); // still held once
+    lock.unlock();
+    expect(lock.owner).toBe(0);
+    expect(lock.heldByCurrentThread).toBe(false);
+  });
+
+  test("unlock without lock is rejected", () => {
+    expect(() => new StripeLock(region()).unlock()).toThrow();
+  });
+
+  test("a held stripe can be force-released by its owner id", () => {
+    const sab = region();
+    const lock = new StripeLock(sab);
+    lock.lock();
+    const other = new StripeLock(sab, { timeoutMs: 100 });
+    expect(() => other.lock()).toThrow(LockTimeoutError);
+    expect(other.forceUnlock(getThreadId())).toBe(true);
+    other.lock(); // free again
+    other.unlock();
+  });
+
+  test("withLock releases on exceptions", () => {
+    const lock = new StripeLock(region());
+    expect(() =>
+      lock.withLock(() => {
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(lock.owner).toBe(0);
+  });
+});
 
 describe("Mutex re-entrancy and ownership", () => {
   test("two instances over the same buffer share re-entrancy", () => {
