@@ -63,6 +63,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Memory per key (JS heap).** Every key used to own a prototype object, 6+
+  closures and a Proxy handler, which also gave each key its own set of
+  hidden classes (Structures) with property tables. The public methods, the
+  prototype and the Proxy handler are now shared by all keys, and the
+  per-property state is a plain object, created lazily where possible. Measured
+  with `bun bench/heap.ts` (20 000 keys, after a warm-up): object with 4
+  properties 3.8 → 2.0 KB, number/string/array 1.4 → 0.9 KB. Reads over many
+  keys got faster as well, because objects of one shape now share their
+  Structure (2000 different keys: 47.7 → 16.5 ns per property read, measured
+  with `bench/refspeed.ts`); in the benchmark suite writes are unchanged and
+  single-key reads are 0…13 % slower (object property reads -5…-13 %). The
+  methods (`read`, `write`, ...) are shared functions that use `this`, so
+  detaching one (`const { write } = ref`) no longer works. `read()` through a
+  Proxy (primitives, arrays) keeps one trap call by creating its function on
+  first use, so a detached `read` still works there.
+
+- **Unused wrappers are garbage collected.** The per-thread registry held every
+  wrapper forever (1-2 KB each) and the caches kept an entry per key ever
+  touched, including the last decoded value. Wrappers are now held through
+  `WeakRef`; when one is collected a `FinalizationRegistry` callback drops the
+  key's read, index, offset and layout cache entries. While a reference is
+  alive, `Shared(key)` still returns the same object. Measured with
+  `bun bench/gcheap.ts` (100 000 object keys used once and dropped): 2387 B
+  per key stayed in the heap before, 159 B afterwards. Cost: a repeated
+  `Shared(key)` for a held key takes 6.4 instead of 4.0 ns. What remains per
+  key is the per-thread key → index map of the memory itself (every key of the
+  shared memory a thread has looked up).
+
+### Changed (benchmark)
+
+- `bun run bench` runs every case in its own process, with its own measuring
+  loop, and each measurement lasts 1 s instead of 5 s (a run takes about 1.5
+  minutes). Results are stable run to run but **not comparable** with earlier
+  rows, see `BENCH.md`.
 - **Readers of one hot key scale.** Cache hits read the version cell with a plain
   load instead of `Atomics.load`: 8 workers reading the same key went from 27 to
   1751 M reads/s (they used to get slower with every worker added); the

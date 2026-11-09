@@ -362,6 +362,20 @@ write.
 - **Fixed-length chunk views** (created after the one-time growth of a chunk)
   are faster than length-tracking ones; everything that can still grow by
   another thread keeps a length-tracking view.
+- **Little JS heap per key.** The reference of a key must be cheap, because a
+  thread can hold many. The prototype of object refs, their methods (`read`,
+  `write`, `update`, `with*Lock`, which find their key through a hidden
+  `TARGET` property) and the Proxy handler for arrays/primitives are shared by
+  all keys; per-key state is one `RefTarget` plus one small state object per
+  property, and a property's write callback is only created on its first
+  write. Sharing the prototype also lets all objects of one shape share their
+  hidden classes (a prototype per key gave each key six Structures with
+  property tables), which makes reads across many keys faster. `ref.read()` on
+  a Proxy answers in one trap call: its function is created per target on first
+  use (a shared method would need a second trap to find the target and made
+  that read 2.5× slower). The registry of wrappers is weak (`WeakRef`), and a
+  `FinalizationRegistry` callback removes the read/index/offset/layout cache
+  entries of a collected wrapper.
 - **No allocation per operation.** No closure per write (the lock body is
   created once; the value travels through saved/restored variables), no
   `ValueSlot`/`Uint8Array`/`Map` on common reads, no `TextEncoder` or

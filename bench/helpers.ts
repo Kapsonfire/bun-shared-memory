@@ -30,10 +30,29 @@ function classify(name: string): BenchResult["kind"] {
 }
 
 /**
+ * How benchPair behaves, chosen by the environment:
+ *
+ * - `BENCH_LIST=1`: only print the case names (as `BENCHCASES <json>`).
+ * - `BENCH_CASE=<name>`: run just that case and print `BENCHRESULT <json>`.
+ *   `bench.ts` starts one such process per case, so no case sees the JIT type
+ *   feedback of an earlier one (a single process made results depend on the
+ *   order of the cases).
+ * - neither: run every case in this process (`bun benc./index.ts`).
+ */
+const listOnly = process.env.BENCH_LIST === "1";
+const onlyCase = process.env.BENCH_CASE;
+const listed: string[] = [];
+
+/** Print the collected case names when listing (called by benc./index.ts). */
+export function finishListing(): void {
+  if (listOnly) console.log(`BENCHCASES ${JSON.stringify(listed)}`);
+}
+
+/**
  * Run a shared-vs-native benchmark for a single operation.
  *
  * `native` and `shared` are the two functions to compare. Each is invoked
- * `iterations` times per sample. Results are reported as ops/sec.
+ * `iterations` times per batch. Results are reported as ops/sec.
  */
 export function benchPair(
   name: string,
@@ -41,18 +60,22 @@ export function benchPair(
   shared: () => unknown,
   iterations = 1_000_000,
 ): void {
-  // On the very first benchmark, run a couple of full measurement passes so
-  // the JIT's one-time warmup boost (constant folding) is consumed before the
-  // first real test. Without this, the first test (number · read) is a large
-  // outlier (~11.5 Mrd ops/s instead of ~7 Mrd) because the very first
-  // measure() loop after process start gets an aggressive JIT optimization
-  // that later runs don't. A plain CPU busy-loop does NOT trigger this, so we
-  // run real measure() passes with a constant-folding closure.
+  if (listOnly) {
+    listed.push(name);
+    return;
+  }
+  if (onlyCase !== undefined && name !== onlyCase) return;
+
+  // The first measure() loop after process start gets a one-time JIT
+  // constant-folding boost (~11 Mrd ops/s instead of ~7 Mrd for a native
+  // read). Consume it with real measure() passes on a constant closure, so the
+  // measured case does not get it. A plain CPU busy-loop does NOT trigger it.
   if (!warmedUp) {
     warmedUp = true;
     const warmConst = 0;
-    measure(() => warmConst, 1_000_000, 2_000);
-    measure(() => warmConst, 1_000_000, 2_000);
+    const warmMeasure = makeMeasure();
+    warmMeasure(() => warmConst, 1_000_000, 300);
+    warmMeasure(() => warmConst, 1_000_000, 300);
   }
 
   // Warm up both paths so JIT compilation doesn't skew the comparison.
@@ -64,17 +87,32 @@ export function benchPair(
     shared();
   }
 
-  // Run a short measurement pass with the native function itself before the
-  // real measurement. The JIT gives the very first measure() loop of a given
-  // closure a one-time constant-folding boost (~10 Mrd ops/s), while later
-  // runs of the same closure are much slower (~500 Mio). Warming up the exact
-  // native closure consumes that boost so the real measurement is consistent
-  // across tests (otherwise the first read test is a large outlier).
-  measure(native, iterations, 2_000);
+  // Warm up the exact native closure (it also gets a one-time boost on its
+  // first measure() loop) and let the shared path reach its optimized tier.
+  // Each function gets its own measuring loop (see makeMeasure).
+  const measureNative = makeMeasure(true);
+  const measureShared = makeMeasure();
+  measureNative(native, iterations, 500);
+  measureShared(shared, iterations, 300);
 
-  const sharedOps = measure(shared, iterations);
-  const nativeOps = measure(native, iterations);
+  const sharedOps = measureShared(shared, iterations);
+  const nativeOps = measureNative(native, iterations);
 
+  if (onlyCase !== undefined) {
+    console.log(
+      `BENCHRESULT ${JSON.stringify({ name, nativeOps, sharedOps })}`,
+    );
+    return;
+  }
+  recordResult(name, nativeOps, sharedOps);
+}
+
+/** Store and print one result (the orchestrator calls this per case). */
+export function recordResult(
+  name: string,
+  nativeOps: number,
+  sharedOps: number,
+): void {
   const ratio = nativeOps / sharedOps;
   const slower =
     ratio >= 1
@@ -180,17 +218,21 @@ function currentCommit(): { commit: string; timestamp: number } {
   }
 }
 
-/** Measure ops/sec for `fn` over a fixed wall-clock duration. */
-function measure(
-  fn: () => unknown,
-  iterations: number,
-  minDurationMs = 5_000,
-): number {
-  // Measure a fixed wall-clock duration (5s) rather than a fixed iteration
-  // count. A fixed count is unreliable for very fast ops (e.g. native reads
-  // at hundreds of millions of ops/s finish in a few ms), which makes the
-  // measurement dominated by background noise. Running for a fixed duration
-  // averages out that noise. `iterations` is used only to size the batch.
+/**
+ * Source of the measuring loop. Every measurement gets its own copy compiled
+ * with `new Function`: closures of one function share one JIT profile, so a
+ * single `measure` that timed the native closure, the shared closure and the
+ * warm-up closure had a call site with several targets, and whether the
+ * optimizer inlined the measured call depended on compile timing. The same
+ * `read()` then ran either at ~200 or at ~440 M ops/s from one process to the
+ * next. With a loop per function the call site sees one target.
+ */
+const MEASURE_SOURCE = `return function measure(fn, iterations, minDurationMs) {
+  // Measure a fixed wall-clock duration rather than a fixed iteration count. A
+  // fixed count is unreliable for very fast ops (native reads at hundreds of
+  // millions of ops/s finish in a few ms), which makes the measurement
+  // dominated by background noise. 1 s is enough: 5 fresh processes per case
+  // showed the same spread at 5 s, 1 s and 0.5 s. \`iterations\` only sizes the batch.
   const batch = Math.max(1, Math.floor(iterations / 10));
   let total = 0;
   const start = performance.now();
@@ -201,6 +243,40 @@ function measure(
     elapsed = performance.now() - start;
   } while (elapsed < minDurationMs);
   return Math.round(total / (elapsed / 1000));
+}`;
+
+type Measure = (
+  fn: () => unknown,
+  iterations: number,
+  minDurationMs?: number,
+) => number;
+
+let measureCopies = 0;
+
+/**
+ * A fresh measuring loop (own code block, own JIT profile).
+ *
+ * `opaque` makes the loop's call site megamorphic first (by timing a few
+ * unrelated functions), so the optimizer cannot inline the measured call. The
+ * native side needs this: a trivial `() => value` inlined into the loop is
+ * folded away and "runs" at 11 G ops/s, which says nothing about the cost of a
+ * call and made every ratio meaningless. Native has always been measured as an
+ * ordinary call (about 1 G ops/s); this keeps it so.
+ */
+function makeMeasure(opaque = false): Measure {
+  const copy = new Function(
+    `${MEASURE_SOURCE}\n//# sourceURL=bench-measure-${measureCopies++}`,
+  )() as Measure;
+  if (opaque) {
+    for (let k = 0; k < 8; k++) {
+      const dummy = new Function(
+        `let x = ${k}; return () => (x += ${k + 1});`,
+      )();
+      copy(dummy, 1_000_000, 10);
+    }
+  }
+  return (fn, iterations, minDurationMs = 1_000) =>
+    copy(fn, iterations, minDurationMs);
 }
 
 /** A unique key per benchmark run, so runs don't collide in the registry. */
