@@ -63,6 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Memory per key (JS heap).** Every key used to own a prototype object, 6+
+  closures and a Proxy handler, which also gave each key its own set of
+  hidden classes (Structures) with property tables. The public methods, the
+  prototype and the Proxy handler are now shared by all keys, and the
+  per-property state is a plain object, created lazily where possible. Measured
+  with `bun bench/heap.ts` (20 000 keys, after a warm-up): object with 4
+  properties 3.8 → 2.0 KB, number/string/array 1.4 → 0.9 KB. Reads over many
+  keys got faster as well, because objects of one shape now share their
+  Structure (2000 different keys: 47.7 → 16.5 ns per property read); single-key
+  reads and writes are unchanged (`bench/refspeed.ts`). The methods
+  (`read`, `write`, ...) are shared functions that use `this`, so detaching one
+  (`const { read } = ref`) no longer works.
 - **Readers of one hot key scale.** Cache hits read the version cell with a plain
   load instead of `Atomics.load`: 8 workers reading the same key went from 27 to
   1751 M reads/s (they used to get slower with every worker added); the
