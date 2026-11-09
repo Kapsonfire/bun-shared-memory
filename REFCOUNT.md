@@ -58,8 +58,14 @@ Worker                          Main thread
 Workers and the main thread communicate over a dedicated **RefCount
 SharedArrayBuffer** (a 5th buffer). It contains:
 
-- A **message queue** (ring buffer) for acquire/release events from workers to
-  the main thread.
+- A **message queue** (ring buffer, 4096 slots) for acquire/release events from
+  workers to the main thread. It is bounded: when it is full a producer blocks
+  until the main thread has drained it, and it asks the main thread to drain
+  _immediately_ (a counter in the buffer header + `Atomics.notify`, awaited by
+  the coordinator with `Atomics.waitAsync`) instead of waiting for the next
+  maintenance tick. Without that wake-up a worker reading in a loop (every
+  `read()` pushes an acquire event) would stall for up to one tick (100 ms) per
+  `ringSize` events.
 - A **heartbeat table**: one cell per worker, updated periodically by the
   worker; the main thread reads it to detect crashes.
 - A **global refcount table**: one cell per object/array, holding the total
@@ -172,7 +178,7 @@ Without this, refcount events accumulate unprocessed and dead space is never
 compacted. To disable it, pass `{ autoMaintenance: false }` to the constructor
 and call `startAutoMaintenance(intervalMs)` manually. `stopAutoMaintenance()`
 stops the timer. `needsDefrag()` is also available for manual checks, and
-`defragment()` can be called directly under `withLock`.
+`defragment()` can be called directly under `withAllLocks`.
 
 The maintenance timer is **unref'd**, so it does not keep the process alive.
 The coordinator keeps draining events and defragmenting while the process

@@ -115,6 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Workers stalled on a full refcount event ring.** The ring is bounded (a full
+  ring blocks the producer, since v1.0.0) and was only drained by the main
+  thread's 100 ms maintenance timer. A worker reading in a loop (each `read()`
+  pushes an acquire event) therefore stalled for up to a whole tick every
+  1024 events, capping all workers together at ~10 000 events/s; the real-world
+  benchmark (`bun run bench:real`) appeared to hang. A producer that finds the
+  ring full now wakes the coordinator immediately (`Atomics.waitAsync`), and the
+  default ring is 4096 slots. 20 000 `read()` calls in a worker: 1.2 s → 6 ms.
+  Where `Atomics.waitAsync` is unavailable the timer remains the only trigger.
 - **Mutex re-entrancy across instances.** Re-entrancy was tracked per `Mutex`
   object, so two instances over the same buffer in one thread deadlocked. It is
   now tracked in the shared buffer.

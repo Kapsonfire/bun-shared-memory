@@ -587,3 +587,49 @@ describe(">4 GiB shared memory", () => {
     expect(mem.arrayTable.getInt32(offset)).toBe(123456789);
   });
 });
+
+describe("RefCount ring: a full ring does not wait for the timer", () => {
+  test("a worker pushing many events is drained immediately", async () => {
+    const mem = new SharedMemory();
+    // A very long maintenance interval: only the "ring full" wake-up can drain
+    // the ring in time. Without it the producer would block for a whole tick
+    // every `ringSize` events.
+    const coordinator = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: true,
+      maintenanceInterval: 60_000,
+    });
+    const workerId = coordinator.registerWorker({});
+    const EVENTS = 30_000; // many ring revolutions (default ring: 4096 slots)
+    const code = `
+      import { RefCountBuffer } from ${JSON.stringify(
+        new URL("../src/refcount.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const { sab, workerId, events } = e.data;
+        const buffer = new RefCountBuffer(sab);
+        for (let i = 0; i < events / 2; i++) {
+          buffer.pushEvent(workerId, 1, 1 + (i % 500)); // acquire
+          buffer.pushEvent(workerId, 0, 1 + (i % 500)); // release
+        }
+        self.postMessage("done");
+      };
+    `;
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+    const started = performance.now();
+    await new Promise<void>((resolve, reject) => {
+      worker.onerror = (e) => reject(e);
+      worker.onmessage = () => resolve();
+      worker.postMessage({ sab: coordinator.sab, workerId, events: EVENTS });
+    });
+    const elapsed = performance.now() - started;
+    worker.terminate();
+    coordinator.stopAutoMaintenance();
+    expect(elapsed).toBeLessThan(5000);
+  }, 20000);
+});
