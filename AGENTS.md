@@ -36,7 +36,10 @@ Key entry points:
 `BENCH.md` contains a running, chronological table of benchmark results. For
 **every** codebase change (even ones expected to have no performance impact):
 
-- Run `bun run bench`.
+- Run `bun run bench`. Every case runs in its own process with its own measuring
+  loop (about 1.5 minutes per run), so results do not depend on the order of the
+  cases. Rows measured before this method (see `BENCH.md`) are not comparable;
+  compare against a run of the previous commit made the same way.
 - The benchmark automatically writes a full log to
   `benchlogs/<unix-timestamp>-<commit-hash>.md` (one file per run, named after
   the commit it was measured on, timestamp-prefixed for chronological sorting).

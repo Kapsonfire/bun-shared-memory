@@ -326,6 +326,21 @@ A write that runs out of budget also reclaims dead space immediately
 (`memory.reclaimHook`), without waiting for the timer. See
 [DESIGN.md](./DESIGN.md) for the details.
 
+## Memory use per thread
+
+The values live in the shared buffers (about 40 bytes of index entry, key name
+and slot for a number key). In addition each thread keeps a small JS object per
+key it uses — the reference `Shared()` returns — of roughly 0.9 KB for a
+primitive or array and 2 KB for an object with four properties, plus a few
+entries in per-thread caches. References are held weakly: once your code drops a
+reference, the garbage collector frees it and its cache entries (about 160 bytes
+per key remain, the thread's key → index map). While you hold a reference,
+`Shared(key)` returns the same object. `bun bench/heap.ts` and
+`bun bench/gcheap.ts` measure this.
+
+Methods such as `ref.write` use `this`, so call them on the reference
+(`ref.write(x)`); a detached `const { write } = ref` does not work.
+
 ## One SharedMemory per thread
 
 A thread (the main thread or each worker) holds **exactly one** `SharedMemory`.
@@ -540,8 +555,10 @@ every supported data type and its arrays:
 - **Arrays**: `number[]`, `string[]`, `boolean[]`, `bigint[]`, `mixed[]` (index read, index write)
 - **Objects**: property read/write and array-property access
 
-Each benchmark reports ops/sec for the native and shared paths, plus the
-relative slowdown. Results are in `bench/`.
+Each case runs in its own process (so the JIT feedback of one case cannot
+change the next one; a run takes about 1.5 minutes) and reports ops/sec for the
+native and shared paths, plus the relative slowdown. `bun run bench` writes a log
+to `benchlogs/`; see [BENCH.md](./BENCH.md) for the history.
 
 With the read cache and offset cache, **reads** are typically 3–11× slower than
 native (the remaining cost is the proxy dispatch). **Writes** are slower because
