@@ -48,7 +48,9 @@ export interface RefEvent {
  * Layout (all Int32):
  *   [0]          write index (producer, workers, reserved atomically)
  *   [1]          read index (consumer, main thread)
- *   [2]          (reserved, unused)
+ *   [2]          drain-request counter (producers bump + notify it when the
+ *                ring is full, so the consumer drains immediately instead of
+ *                at its next timer tick)
  *   [3..]        ring buffer of events (workerId, op, objectId, seq per slot)
  *   [ringEnd..]   worker id bitmap (ceil(maxWorkers/32) words; bit = id in use)
  *   [workerBitsEnd..] heartbeat table (one cell per worker)
@@ -67,6 +69,12 @@ export interface RefEvent {
  *     revolution by setting `seq` to `pos + ringSize`, so the slot is not
  *     overwritten by a producer before the consumer has drained it.
  */
+/**
+ * Default number of ring slots (16 bytes each). A larger ring lets bursts of
+ * reads go through without ever blocking on the consumer.
+ */
+const DEFAULT_RING_SIZE = 4096;
+
 export class RefCountBuffer {
   readonly buffer: SharedArrayBuffer;
   private readonly view: Int32Array;
@@ -81,7 +89,7 @@ export class RefCountBuffer {
     buffer?: SharedArrayBuffer,
     opts: { ringSize?: number; maxWorkers?: number; maxObjects?: number } = {},
   ) {
-    const ringSize = opts.ringSize ?? 1024;
+    const ringSize = opts.ringSize ?? DEFAULT_RING_SIZE;
     const maxWorkers = opts.maxWorkers ?? 64;
     const maxObjects = opts.maxObjects ?? 1 << 16;
     this.ringSize = ringSize;
@@ -179,9 +187,16 @@ export class RefCountBuffer {
     // ring is full, the consumer has not re-armed it yet and we block until
     // it does (the user signals it via Atomics.notify after re-arming).
     let seq = Atomics.load(this.view, seqIdx);
-    while (seq !== pos) {
-      waitUntil(this.view, seqIdx, seq, Infinity);
-      seq = Atomics.load(this.view, seqIdx);
+    if (seq !== pos) {
+      // The ring is full. Ask the consumer to drain right away: without this a
+      // blocked producer would wait for the consumer's next timer tick (100 ms),
+      // capping the event rate of all workers together at ringSize / tick.
+      Atomics.add(this.view, 2, 1);
+      Atomics.notify(this.view, 2);
+      do {
+        waitUntil(this.view, seqIdx, seq, Infinity);
+        seq = Atomics.load(this.view, seqIdx);
+      } while (seq !== pos);
     }
     const base = 3 + slot * 4;
     // Fill the slot, then publish it. The closing seq store is a release:
@@ -220,6 +235,29 @@ export class RefCountBuffer {
     Atomics.store(this.view, 1, read + 1);
     Atomics.notify(this.view, seqIdx, Infinity);
     return { workerId, op, objectId };
+  }
+
+  /**
+   * Consumer side: a promise that resolves once a producer has asked for an
+   * immediate drain (see `pushEvent`), or `null` where `Atomics.waitAsync` is
+   * unavailable (the caller then relies on its periodic timer). A pending wait
+   * does not keep the process alive.
+   */
+  waitForDrainRequest(): Promise<unknown> | null {
+    const waitAsync = (
+      Atomics as unknown as {
+        waitAsync?: (
+          view: Int32Array,
+          index: number,
+          value: number,
+        ) => { async: boolean; value: Promise<unknown> | string };
+      }
+    ).waitAsync;
+    if (typeof waitAsync !== "function") return null;
+    const result = waitAsync(this.view, 2, Atomics.load(this.view, 2));
+    return result.async
+      ? (result.value as Promise<unknown>)
+      : Promise.resolve();
   }
 
   /**
@@ -287,6 +325,8 @@ export class RefCountCoordinator {
   /** Minimum number of freed blocks before a table is considered fragmented. */
   private readonly minFreeBlocks: number;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Whether the "ring full" wake-up loop is running (see `startDrainWake`). */
+  private drainWakeActive = false;
   /** Called after a defragmentation pass with the new chunk lists. */
   private readonly onDefragment?: (buffers: {
     indexTable: SharedArrayBuffer[];
@@ -619,6 +659,7 @@ export class RefCountCoordinator {
    */
   startAutoMaintenance(intervalMs = 100): () => void {
     if (this.maintenanceTimer !== null) return () => {};
+    this.startDrainWake();
     this.maintenanceTimer = setInterval(() => {
       this.drainEvents();
       if (this.heartbeatTicks > 0) this.reapDeadWorkers();
@@ -643,8 +684,35 @@ export class RefCountCoordinator {
     this.onDefragment?.(buffers);
   }
 
+  /**
+   * Drain the event ring as soon as a producer reports it full, instead of
+   * waiting for the next timer tick. Without this a worker that reads in a loop
+   * (every `read()` pushes an acquire event) stalls on the full ring for up to
+   * a whole maintenance interval each time. No-op where `Atomics.waitAsync` is
+   * unavailable; the timer then remains the only drain trigger.
+   */
+  private startDrainWake(): void {
+    if (this.drainWakeActive) return;
+    this.drainWakeActive = true;
+    const arm = (): void => {
+      if (!this.drainWakeActive) return;
+      const request = this.buffer.waitForDrainRequest();
+      if (request === null) {
+        this.drainWakeActive = false;
+        return;
+      }
+      void request.then(() => {
+        if (!this.drainWakeActive) return;
+        this.drainEvents();
+        arm();
+      });
+    };
+    arm();
+  }
+
   /** Stop the periodic maintenance timer, if running. */
   stopAutoMaintenance(): void {
+    this.drainWakeActive = false;
     if (this.maintenanceTimer !== null) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
