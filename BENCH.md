@@ -174,3 +174,23 @@ Notes:
   engine from hoisting it out of a loop. JavaScriptCore did not in our test
   (`test/seqlock.test.ts`: a change by another thread became visible to a tight
   loop of cache hits within the timeout).
+
+## Memory per key
+
+`bun bench/heap.ts <object|number|string|array> 20000` measures the JS heap
+that one `Shared()` key costs (the wrapper, its closures and the per-thread
+caches; the shared buffers are not counted) after a warm-up key of every kind,
+so the one-off activation of the 32 MiB table chunks is not spread over the
+keys. `bun bench/refspeed.ts "<case>"` measures single hot paths in one process
+per case.
+
+| Date       | Commit              | Change                                                                                 | object (4 props) | number | string | array  |
+| ---------- | ------------------- | -------------------------------------------------------------------------------------- | ---------------- | ------ | ------ | ------ |
+| 2026-11-09 | `c6a8d70`           | `release/1.1.0` (per-key prototype, closures, Proxy handler)                           | 3826 B           | 1373 B | 1374 B | 1374 B |
+| 2026-11-09 | `perf/per-key-heap` | Shared prototype/methods/Proxy handler, per-property state object, lazy write callback | 1997 B           | 877 B  | -      | 877 B  |
+
+Hot paths, ns/op (`bench/refspeed.ts`, same machine, `release/1.1.0` → branch):
+object property read 2.91 → 2.30, 2000 different object keys 47.67 → 16.46,
+object property write 20.59 → 20.29, array index read 12.57 → 12.32, array
+index write 34.38 → 34.64, `read()` of a number 5.32 → 5.69, `write()` of a
+number 26.26 → 26.57 (differences below 5 % are variance).

@@ -1398,6 +1398,336 @@ function writePropInner(
   );
 }
 
+/** Hidden own property of every SharedRef: its `RefTarget`. */
+const TARGET: unique symbol = Symbol("shared.target");
+
+/**
+ * Per-key state of a SharedRef: the write/read hot-path caches plus the
+ * methods behind `read`/`write`/`update`/`with*Lock`. The methods live on the
+ * class (one copy for all keys) instead of being closures created per key.
+ */
+class RefTarget<T = unknown> {
+  /**
+   * Fast-path cache: mirrors the module-level readCache entry for this key so
+   * the proxy get handler can read it without a Map lookup. Invalidated on
+   * every local write/update; cross-worker invalidation is detected by the
+   * version check in the get handler.
+   */
+  __cache:
+    | {
+        version: number;
+        value: unknown;
+        index: number;
+        cell: number;
+        ev: number;
+      }
+    | undefined = undefined;
+  /**
+   * Cached DataTable offset for this key, valid only while the global layout
+   * version is unchanged (no defragmentation has moved it). Mirrors the
+   * module-level offsetCache to avoid a Map lookup on the write hot path.
+   */
+  __offset: number | undefined = undefined;
+  __layoutVersion = -1;
+  /** Cached slot type, so the write hot path can skip the DataTable read. */
+  __type: number | undefined = undefined;
+  /**
+   * Cached ArrayRef for a top-level array value, so index writes skip
+   * re-reading the 3 header Int32s. Valid only while the global layout version
+   * is unchanged and the array has not grown past the cached count.
+   */
+  __arrayRef: { offset: number; count: number; capacity: number } | undefined =
+    undefined;
+  __arrayRefLayoutVersion = -1;
+  /** Cached version-cell index (stable for the key's lifetime). */
+  __index: number | undefined = undefined;
+  /**
+   * The reference handed back to the caller (accessor object or proxy). Lock
+   * callbacks receive it, not this target, so `self.prop = x` inside
+   * `withWriteLock` writes to shared memory.
+   */
+  publicRef: unknown = undefined;
+
+  constructor(
+    readonly mem: SharedMemory,
+    readonly key: string,
+    readonly arrayCapacity: number | undefined,
+  ) {}
+
+  read(): T {
+    return copyValue(readValue(this.mem, this.key, this)) as T;
+  }
+
+  write(value: T): void {
+    this.__cache = undefined;
+    writeValue(this.mem, this.key, value, this.arrayCapacity, this);
+  }
+
+  update(fn: (current: T) => T): T {
+    this.__cache = undefined;
+    return updateValue(this.mem, this.key, fn, this.arrayCapacity);
+  }
+
+  withRWLock<R>(fn: (self: SharedRef<T>) => R): R {
+    // The object's version cell is the lock: acquire the WRITER bit (one CAS;
+    // wait while any other worker holds read/write), run the callback, then
+    // release in a single add that also bumps the version.
+    const mem = this.mem;
+    const cell = mem.getVersionCellIndex(getIndex(mem, this.key));
+    const acquired = acquireCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+    try {
+      return fn((this.publicRef ?? this) as SharedRef<T>);
+    } finally {
+      if (acquired) releaseCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+    }
+  }
+
+  withReadLock<R>(fn: (self: SharedRef<T>) => R): R {
+    // Acquire the READLOCK bit so other readers/writers on this object wait,
+    // run the callback, then release (version untouched).
+    const mem = this.mem;
+    const cell = mem.getVersionCellIndex(getIndex(mem, this.key));
+    const acquired = acquireCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+    try {
+      return fn((this.publicRef ?? this) as SharedRef<T>);
+    } finally {
+      if (acquired) releaseCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+    }
+  }
+}
+
+/**
+ * The public methods, shared by all refs. They find their key through the
+ * hidden TARGET property of `this` (the object ref itself, or the proxy, whose
+ * `get` trap answers TARGET).
+ */
+type TargetOf = { [TARGET]: RefTarget<any> };
+const REF_METHODS = {
+  read(this: TargetOf) {
+    return this[TARGET].read();
+  },
+  write(this: TargetOf, value: unknown) {
+    this[TARGET].write(value);
+  },
+  update(this: TargetOf, fn: (current: any) => any) {
+    return this[TARGET].update(fn);
+  },
+  withRWLock(this: TargetOf, fn: (self: any) => unknown) {
+    return this[TARGET].withRWLock(fn);
+  },
+  withWriteLock(this: TargetOf, fn: (self: any) => unknown) {
+    return this[TARGET].withRWLock(fn);
+  },
+  withReadLock(this: TargetOf, fn: (self: any) => unknown) {
+    return this[TARGET].withReadLock(fn);
+  },
+  toPrimitive(this: TargetOf) {
+    return this[TARGET].read();
+  },
+};
+
+/**
+ * Prototype of all object refs. Methods are non-enumerable, so they don't
+ * appear in JSON.stringify / Object.keys.
+ */
+const REF_PROTO: object = (() => {
+  const proto: Record<string | symbol, unknown> = {
+    [Symbol.toPrimitive]: REF_METHODS.toPrimitive,
+  };
+  for (const name of [
+    "read",
+    "write",
+    "update",
+    "withRWLock",
+    "withWriteLock",
+    "withReadLock",
+  ] as const) {
+    Object.defineProperty(proto, name, {
+      enumerable: false,
+      configurable: false,
+      value: REF_METHODS[name],
+    });
+  }
+  Object.defineProperty(proto, "key", {
+    enumerable: false,
+    configurable: false,
+    get(this: TargetOf) {
+      return this[TARGET].key;
+    },
+  });
+  Object.defineProperty(proto, "buffer", {
+    enumerable: false,
+    configurable: false,
+    get(this: TargetOf) {
+      return this[TARGET].mem.dataTable.buffers[0];
+    },
+  });
+  return proto;
+})();
+
+/** State of one accessor property of an object ref (one per key and property). */
+interface PropState {
+  t: RefTarget;
+  name: string;
+  /** Version-cell index, resolved lazily; -1 until then. */
+  cell: number;
+  /** Version and decoded value of the property cache (`readObjectProp` fills them). */
+  version: number;
+  value: unknown;
+  /** Stable array proxy for an array property (survives writes). */
+  arrayProxy: unknown[] | undefined;
+  /** Cached slot offset, valid while `slotLayoutVersion` is the layout version. */
+  slotOffset: number | undefined;
+  slotLayoutVersion: number;
+  /** Value of the write in progress, read by `writeBody`. */
+  pending: unknown;
+  writeBody: (() => void) | undefined;
+}
+
+/**
+ * The property's slot offset, cached per accessor and re-resolved when the
+ * global layout version `lv` changed (defragmentation or array growth moved
+ * blocks). Shared by the getter's miss path and the setter.
+ */
+function resolveSlot(st: PropState, lv: number): number {
+  if (st.slotLayoutVersion !== lv) {
+    st.slotOffset = undefined;
+    st.slotLayoutVersion = lv;
+  }
+  if (st.slotOffset === undefined) {
+    const { mem, key } = st.t;
+    const layout = getObjectLayout(mem, key);
+    const so = layout?.properties.get(st.name);
+    if (so === undefined) {
+      // Not an object, or the property does not exist.
+      throw new TypeError(
+        `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+      );
+    }
+    st.slotOffset = so;
+  }
+  return st.slotOffset;
+}
+
+/** The setter's write callback; created on the first write of an accessor. */
+function makeWriteBody(st: PropState): () => void {
+  return () => {
+    const t = st.t;
+    // The layout version cannot change while the key's stripe is held
+    // (defrag takes every stripe), so the plain read is enough here.
+    writeObjectSlot(
+      t.mem,
+      t.key,
+      resolveSlot(st, t.mem.layoutVersionInLock()),
+      st.pending,
+      t.arrayCapacity,
+      t,
+    );
+  };
+}
+
+/**
+ * The getter's miss path, kept out of the getter itself so the hot hit path
+ * stays small enough for the JIT to inline.
+ */
+function readPropMiss(st: PropState): unknown {
+  const { mem, key, arrayCapacity } = st.t;
+  const name = st.name;
+  const cell = st.cell; // set by the getter before it gets here
+  // Miss: wait until nobody is writing, then decode and validate.
+  let raw = stableRaw(mem, cell);
+  if (st.version === raw >> VERSION_LOCK_SHIFT_BITS) {
+    return st.value;
+  }
+  // If this property is an array, return the stable cached proxy (which reads
+  // fresh data on each access) instead of recreating it on every write.
+  if (st.arrayProxy !== undefined) {
+    return st.arrayProxy;
+  }
+  // The slot is read without a lock, so a write that overlaps the read could
+  // be seen half done (a string assembled from two writes). The version cell
+  // is a seqlock: a writer holds its WRITER bit while it writes and bumps the
+  // version when done, so if the cell is not exactly what it was before the
+  // read, decode again. The validating add(…, 0) is a full barrier, keeping
+  // the data reads before it.
+  let value: unknown;
+  for (let attempt = 0; ; attempt++) {
+    value = readObjectProp(
+      mem,
+      key,
+      name,
+      st,
+      raw >> VERSION_LOCK_SHIFT_BITS,
+      arrayCapacity,
+      resolveSlot(st, mem.getLayoutVersion()),
+    );
+    if (Atomics.add(mem.versionView, cell, 0) === raw) break;
+    if (attempt === 8) {
+      // Heavily written object: read once under the key's lock.
+      const keyIndex = getIndex(mem, key);
+      raw = stableRaw(mem, cell);
+      value = mem.withKeyLock(keyIndex, () =>
+        readObjectProp(
+          mem,
+          key,
+          name,
+          st,
+          raw >> VERSION_LOCK_SHIFT_BITS,
+          arrayCapacity,
+          resolveSlot(st, mem.getLayoutVersion()),
+        ),
+      );
+      break;
+    }
+    raw = stableRaw(mem, cell);
+  }
+  if (Array.isArray(value)) {
+    st.arrayProxy = value;
+  }
+  return value;
+}
+
+/**
+ * Proxy handler for array/primitive refs, shared by all keys (a handler object
+ * with its own closures per key costs about a quarter of a kilobyte each).
+ */
+const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
+  get(t, prop) {
+    if (prop === "read") return REF_METHODS.read;
+    if (prop === "write") return REF_METHODS.write;
+    if (prop === "update") return REF_METHODS.update;
+    if (prop === "withRWLock") return REF_METHODS.withRWLock;
+    if (prop === "withWriteLock") return REF_METHODS.withWriteLock;
+    if (prop === "withReadLock") return REF_METHODS.withReadLock;
+    if (prop === "key") return t.key;
+    if (prop === "buffer") return t.mem.dataTable.buffers[0];
+    if (prop === TARGET) return t;
+    if (prop === Symbol.toPrimitive) return REF_METHODS.toPrimitive;
+
+    // push/pop on a top-level array: operate directly on the array ref
+    // without decoding the whole array (O(1) amortized).
+    if (prop === "push" || prop === "pop") {
+      const resolved = resolveArrayRef(t.mem, { key: t.key, path: [] });
+      if (resolved !== null) {
+        return (...args: unknown[]) =>
+          mutateArrayRef(t.mem, { key: t.key, path: [] }, prop, args);
+      }
+    }
+
+    return readProp(t.mem, t.key, prop, t.arrayCapacity);
+  },
+  set(t, prop, val) {
+    t.__cache = undefined;
+    writeProp(t.mem, t.key, prop, val, t.arrayCapacity, t);
+    return true;
+  },
+  deleteProperty() {
+    throw new TypeError(
+      "Shared values have a fixed shape: properties may not be added or removed",
+    );
+  },
+};
+
 /** Create a SharedRef proxy backed by a SharedMemory instance. */
 function createSharedRef<T>(
   mem: SharedMemory,
@@ -1405,82 +1735,7 @@ function createSharedRef<T>(
   initialValue: T | undefined,
   arrayCapacity?: number,
 ): SharedRef<T> {
-  // The reference handed back to the caller (accessor object or proxy), set
-  // once it exists. Lock callbacks receive it, not the internal `target`, so
-  // `self.prop = x` inside `withWriteLock` writes to shared memory.
-  let publicRef: SharedRef<T> | undefined;
-  const target = {
-    key,
-    mem,
-    // Fast-path cache: mirrors the module-level readCache entry for this key
-    // so the proxy get handler can read it without a Map lookup. Invalidated
-    // on every local write/update; cross-worker invalidation is detected by
-    // the version check in the get handler.
-    __cache: undefined as
-      | {
-          version: number;
-          value: unknown;
-          index: number;
-          cell: number;
-          ev: number;
-        }
-      | undefined,
-    // Cached DataTable offset for this key, valid only while the global
-    // layout version is unchanged (i.e. no defragmentation has moved it).
-    // Mirrors the module-level offsetCache to avoid a Map lookup on the
-    // write hot path.
-    __offset: undefined as number | undefined,
-    __layoutVersion: -1,
-    // Cached slot type for this key, so the write hot path can skip the
-    // DataTable type read when the value's type is known to be stable.
-    __type: undefined as number | undefined,
-    // Cached ArrayRef for a top-level array value, so the write hot path can
-    // skip re-reading the 3 header Int32s on every index write. Valid only
-    // while the global layout version is unchanged (no defragmentation) and
-    // while the array has not grown past the cached count (checked by the
-    // caller via `index < ref.count`).
-    __arrayRef: undefined as
-      { offset: number; count: number; capacity: number } | undefined,
-    __arrayRefLayoutVersion: -1,
-    // Cached version-cell index for this key, so the write hot path can bump
-    // the version cell without a Map lookup. Stable for the key's lifetime.
-    __index: undefined as number | undefined,
-    read: () => {
-      return copyValue(readValue(mem, key, target)) as T;
-    },
-    write: (value: T) => {
-      target.__cache = undefined;
-      writeValue(mem, key, value, arrayCapacity, target);
-    },
-    update: (fn: (current: T) => T) => {
-      target.__cache = undefined;
-      return updateValue(mem, key, fn, arrayCapacity);
-    },
-    withRWLock: <R>(fn: (self: SharedRef<T>) => R) => {
-      // The object's version cell is the lock: acquire the WRITER bit (one
-      // CAS; wait while any other worker holds read/write), run the callback,
-      // then release in a single add that also bumps the version.
-      const cell = mem.getVersionCellIndex(getIndex(mem, key));
-      const acquired = acquireCellLock(mem, cell, WRITER_BIT, writeCellDepths);
-      try {
-        return fn((publicRef ?? target) as unknown as SharedRef<T>);
-      } finally {
-        if (acquired) releaseCellLock(mem, cell, WRITER_BIT, writeCellDepths);
-      }
-    },
-    withWriteLock: <R>(fn: (self: SharedRef<T>) => R) => target.withRWLock(fn),
-    withReadLock: <R>(fn: (self: SharedRef<T>) => R) => {
-      // Acquire the READLOCK bit so other readers/writers on this object wait,
-      // run the callback, then release (version untouched).
-      const cell = mem.getVersionCellIndex(getIndex(mem, key));
-      const acquired = acquireCellLock(mem, cell, READLOCK_BIT, readCellDepths);
-      try {
-        return fn((publicRef ?? target) as unknown as SharedRef<T>);
-      } finally {
-        if (acquired) releaseCellLock(mem, cell, READLOCK_BIT, readCellDepths);
-      }
-    },
-  };
+  const target = new RefTarget<T>(mem, key, arrayCapacity);
 
   // Determine the object's property names so we can hard-bake accessor
   // getters/setters instead of routing every access through a Proxy trap.
@@ -1504,189 +1759,24 @@ function createSharedRef<T>(
   // setters (no Proxy). This avoids the Proxy trap overhead on every property
   // read (~2.6× faster) and stays a plain, serializable object.
   if (propNames !== null && propNames.length > 0) {
-    // Methods live on the prototype, not on the object itself. Keeping the
-    // data properties as the only own properties lets the JIT treat the
-    // object as monomorphic, which is ~2× faster for accessor reads than
-    // having extra own properties (read/write/update/key/buffer).
-    const proto: Record<string | symbol, unknown> = {
-      [Symbol.toPrimitive]: () => target.read(),
-    };
-    Object.defineProperty(proto, "read", {
-      enumerable: false,
-      configurable: false,
-      value: target.read,
-    });
-    Object.defineProperty(proto, "write", {
-      enumerable: false,
-      configurable: false,
-      value: target.write,
-    });
-    Object.defineProperty(proto, "update", {
-      enumerable: false,
-      configurable: false,
-      value: target.update,
-    });
-    Object.defineProperty(proto, "withRWLock", {
-      enumerable: false,
-      configurable: false,
-      value: target.withRWLock,
-    });
-    Object.defineProperty(proto, "withWriteLock", {
-      enumerable: false,
-      configurable: false,
-      value: target.withWriteLock,
-    });
-    Object.defineProperty(proto, "withReadLock", {
-      enumerable: false,
-      configurable: false,
-      value: target.withReadLock,
-    });
-    // key/buffer are non-enumerable so they don't appear in JSON.stringify /
-    // Object.keys (matching the previous Proxy behavior).
-    Object.defineProperty(proto, "key", {
-      enumerable: false,
-      configurable: false,
-      value: key,
-    });
-    Object.defineProperty(proto, "buffer", {
-      enumerable: false,
-      configurable: false,
-      get() {
-        return mem.dataTable.buffers[0];
-      },
-    });
-    const ref = Object.create(proto) as Record<string | symbol, unknown>;
-    // Resolve the object's stable version-cell index lazily (the value may not
-    // be written to shared memory until after this accessor is built) and cache
-    // it so the hot getter can load the version cell directly without a Map
-    // lookup or an index→cell computation on every read. The cell index is
-    // stable for the key's lifetime (the Index Table is never reordered).
-    let cellIndex: number | null = null;
+    // The prototype is shared by every key, so objects of the same shape also
+    // share their hidden classes (a prototype of their own per key would give
+    // each key its own set of Structures and property tables). The only own
+    // non-data property is the hidden TARGET, which the shared methods use.
+    const ref = Object.create(REF_PROTO) as Record<string | symbol, unknown>;
+    Object.defineProperty(ref, TARGET, { value: target });
     for (const name of propNames) {
-      // Per-property cache slot bound to this getter closure (mirrors
-      // cofusion's per-field `desc.cachedVer`/`desc.cachedVal`). On a cache
-      // hit the getter returns the already-decoded value directly, avoiding
-      // the `readCache` Map hash lookup and the whole-object `v[name]`
-      // extraction on the hot path.
-      const fieldCache: { version: number; value: unknown } = {
+      const st: PropState = {
+        t: target,
+        name,
+        cell: -1,
         version: -1,
         value: undefined,
-      };
-      // Stable array proxy for this property, cached across writes. A write
-      // bumps the version and invalidates `fieldCache`, which would otherwise
-      // recreate the array proxy on every access. The proxy reads fresh data
-      // on each access, so it stays correct without being recreated.
-      let arrayProxy: unknown[] | undefined;
-      // Cached object slot offset for this property so writes skip the
-      // getObjectLayout Map lookup + properties.get on the hot path.
-      // Invalidated when the layout version changes (defragmentation moves
-      // the object block).
-      let slotOffset: number | undefined;
-      let slotLayoutVersion = -1;
-      // Value of the write in progress; read by `writeBody`. A write is
-      // synchronous and re-entrancy on the same accessor cannot happen inside
-      // the body, so one slot per accessor is enough.
-      let pending: unknown;
-      /**
-       * The property's slot offset, cached per accessor and re-resolved when
-       * the global layout version `lv` changed (defragmentation or array
-       * growth moved blocks). Shared by the getter's miss path and the setter.
-       */
-      const resolveSlot = (lv: number): number => {
-        if (slotLayoutVersion !== lv) {
-          slotOffset = undefined;
-          slotLayoutVersion = lv;
-        }
-        if (slotOffset === undefined) {
-          const layout = getObjectLayout(mem, key);
-          if (layout === null) {
-            // Not an object (shouldn't happen for an object accessor).
-            throw new TypeError(
-              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-            );
-          }
-          const so = layout.properties.get(name);
-          if (so === undefined) {
-            throw new TypeError(
-              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-            );
-          }
-          slotOffset = so;
-        }
-        return slotOffset;
-      };
-      const writeBody = (): void => {
-        // The layout version cannot change while the key's stripe is held
-        // (defrag takes every stripe), so the plain read is enough here.
-        writeObjectSlot(
-          mem,
-          key,
-          resolveSlot(mem.layoutVersionInLock()),
-          pending,
-          arrayCapacity,
-          target,
-        );
-      };
-
-      /**
-       * The getter's miss path, kept out of the getter itself so the hot hit
-       * path stays small enough for the JIT to inline.
-       */
-      const readMiss = (): unknown => {
-        // Set by the getter before it gets here.
-        const cell = cellIndex!;
-        // Miss: wait until nobody is writing, then decode and validate.
-        let raw = stableRaw(mem, cell);
-        if (fieldCache.version === raw >> VERSION_LOCK_SHIFT_BITS) {
-          return fieldCache.value;
-        }
-        // If this property is an array, return the stable cached proxy
-        // (which reads fresh data on each access) instead of recreating it
-        // on every write.
-        if (arrayProxy !== undefined) {
-          return arrayProxy;
-        }
-        // The slot is read without a lock, so a write that overlaps the read
-        // could be seen half done (a string assembled from two writes). The
-        // version cell is a seqlock: a writer holds its WRITER bit while it
-        // writes and bumps the version when done, so if the cell is not
-        // exactly what it was before the read, decode again. The validating
-        // add(…, 0) is a full barrier, keeping the data reads before it.
-        let value: unknown;
-        for (let attempt = 0; ; attempt++) {
-          value = readObjectProp(
-            mem,
-            key,
-            name,
-            fieldCache,
-            raw >> VERSION_LOCK_SHIFT_BITS,
-            arrayCapacity,
-            resolveSlot(mem.getLayoutVersion()),
-          );
-          if (Atomics.add(mem.versionView, cell, 0) === raw) break;
-          if (attempt === 8) {
-            // Heavily written object: read once under the key's lock.
-            const keyIndex = getIndex(mem, key);
-            raw = stableRaw(mem, cell);
-            value = mem.withKeyLock(keyIndex, () =>
-              readObjectProp(
-                mem,
-                key,
-                name,
-                fieldCache,
-                raw >> VERSION_LOCK_SHIFT_BITS,
-                arrayCapacity,
-                resolveSlot(mem.getLayoutVersion()),
-              ),
-            );
-            break;
-          }
-          raw = stableRaw(mem, cell);
-        }
-        if (Array.isArray(value)) {
-          arrayProxy = value;
-        }
-        return value;
+        arrayProxy: undefined,
+        slotOffset: undefined,
+        slotLayoutVersion: -1,
+        pending: undefined,
+        writeBody: undefined,
       };
       Object.defineProperty(ref, name, {
         enumerable: true,
@@ -1696,31 +1786,32 @@ function createSharedRef<T>(
           // without a function-call chain. The version cell doubles as a
           // seqlock: we wait (without a mutex) while a lock is held, then
           // compare the version so reads that raced a write re-decode.
-          if (cellIndex === null) {
-            cellIndex = mem.getVersionCellIndex(getIndex(mem, key));
+          let cell = st.cell;
+          if (cell < 0) {
+            cell = st.cell = mem.getVersionCellIndex(getIndex(mem, key));
           }
           // Hit: a plain (non-atomic) read of the version cell. An atomic load
           // of a cache line that many workers read does not scale (readers of
           // the same hot key got slower with every worker added); a plain load
           // does, and a stale value only delays seeing a change.
-          const seen = mem.versionView[cellIndex]!;
+          const seen = mem.versionView[cell]!;
           if (
             (seen & VERSION_LOCK_MASK) === 0 &&
-            fieldCache.version === seen >> VERSION_LOCK_SHIFT_BITS
+            st.version === seen >> VERSION_LOCK_SHIFT_BITS
           ) {
-            return fieldCache.value;
+            return st.value;
           }
-          return readMiss();
+          return readPropMiss(st);
         },
         set(v: unknown) {
           target.__cache = undefined;
-          // `writeBody` is created once per accessor (see above); the value
-          // travels through `pending`, so a write allocates no closure.
-          pending = v;
+          // `writeBody` is created on the first write of this accessor; the
+          // value travels through `pending`, so a write allocates no closure.
+          st.pending = v;
           try {
-            writeLock(mem, key, writeBody, target);
+            writeLock(mem, key, (st.writeBody ??= makeWriteBody(st)), target);
           } finally {
-            pending = undefined;
+            st.pending = undefined;
           }
         },
       });
@@ -1728,50 +1819,16 @@ function createSharedRef<T>(
     // Fixed shape: reject adding new properties (throws in strict mode).
     Object.preventExtensions(ref);
     sharedKeyMap.set(ref, key);
-    publicRef = ref as unknown as SharedRef<T>;
-    return publicRef;
+    target.publicRef = ref as unknown as SharedRef<T>;
+    return target.publicRef as SharedRef<T>;
   }
 
   // Arrays, primitives, or unknown shape: use a Proxy (index access, array
   // methods, and dynamic properties require interception).
-  const proxy = new Proxy(target, {
-    get(t, prop) {
-      if (prop === "read") return t.read;
-      if (prop === "write") return t.write;
-      if (prop === "update") return t.update;
-      if (prop === "withRWLock") return t.withRWLock;
-      if (prop === "withWriteLock") return t.withWriteLock;
-      if (prop === "withReadLock") return t.withReadLock;
-      if (prop === "key") return t.key;
-      if (prop === "buffer") return mem.dataTable.buffers[0];
-      if (prop === Symbol.toPrimitive) return () => t.read();
-
-      // push/pop on a top-level array: operate directly on the array ref
-      // without decoding the whole array (O(1) amortized).
-      if (prop === "push" || prop === "pop") {
-        const resolved = resolveArrayRef(mem, { key, path: [] });
-        if (resolved !== null) {
-          return (...args: unknown[]) =>
-            mutateArrayRef(mem, { key, path: [] }, prop, args);
-        }
-      }
-
-      return readProp(mem, key, prop, arrayCapacity);
-    },
-    set(t, prop, val) {
-      t.__cache = undefined;
-      writeProp(mem, key, prop, val, arrayCapacity, t);
-      return true;
-    },
-    deleteProperty() {
-      throw new TypeError(
-        "Shared values have a fixed shape: properties may not be added or removed",
-      );
-    },
-  });
+  const proxy = new Proxy(target, REF_PROXY_HANDLER);
   sharedKeyMap.set(proxy, key);
-  publicRef = proxy as unknown as SharedRef<T>;
-  return publicRef;
+  target.publicRef = proxy as unknown as SharedRef<T>;
+  return target.publicRef as SharedRef<T>;
 }
 
 /**
