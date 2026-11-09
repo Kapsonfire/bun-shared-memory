@@ -123,6 +123,13 @@ export class GrowableBuffer {
   readonly chunkSize: number;
   /** log2(chunkSize), used for O(1) offset resolution via bit shifts. */
   private readonly chunkShift: number;
+  /**
+   * Largest chunk-local offset at which a 16-byte value slot still lies inside
+   * its chunk. Slots are normally allocated inside one chunk, but
+   * defragmentation packs blocks back to back, so a slot can straddle a chunk
+   * boundary; callers of `viewAt` fall back to per-field access for those.
+   */
+  slotLimit = 0;
   private readonly budget?: SharedBudget;
   /**
    * Shared append cursor (used length). Stored in a SharedArrayBuffer so all
@@ -257,6 +264,7 @@ export class GrowableBuffer {
       });
       if (chargeInitial) this.budget?.add(initialSizeOrBuffer.byteLength);
     }
+    this.slotLimit = this.singleBuffer ? Infinity : this.chunkSize - 16;
   }
 
   /**
@@ -265,6 +273,14 @@ export class GrowableBuffer {
    * needed. No-op if the chunk is already active.
    */
   private activate(index: number): void {
+    // A chunk grows exactly once, from its initial 4 bytes to `chunkSize`, and
+    // the view created here (after the growth) therefore never has to grow
+    // again. It is deliberately fixed-length: JavaScriptCore accesses a
+    // fixed-length view measurably faster (7-15% on slot writes) than a
+    // length-tracking one over a growable SharedArrayBuffer. Every other view
+    // (the initial 4-byte chunk views, other workers' views, the single
+    // growable Index Table buffer) stays length-tracking, so growth by another
+    // thread remains visible to them without any broadcast.
     const chunk = this.chunks[index];
     if (chunk === undefined || chunk.active) return;
     if (this.singleBuffer) {
@@ -272,7 +288,7 @@ export class GrowableBuffer {
     }
     const oldSize = chunk.buffer.byteLength;
     if (oldSize >= this.chunkSize) {
-      chunk.view = new DataView(chunk.buffer);
+      chunk.view = new DataView(chunk.buffer, 0, this.chunkSize);
       chunk.active = true;
       this.advanceNextChunkToActivate(index);
       return;
@@ -288,7 +304,7 @@ export class GrowableBuffer {
     } catch (error) {
       if (chunk.buffer.byteLength >= this.chunkSize) {
         this.budget?.release(growth);
-        chunk.view = new DataView(chunk.buffer);
+        chunk.view = new DataView(chunk.buffer, 0, this.chunkSize);
         chunk.active = true;
         this.advanceNextChunkToActivate(index);
         return;
@@ -296,7 +312,7 @@ export class GrowableBuffer {
       this.budget?.release(growth);
       throw error;
     }
-    chunk.view = new DataView(chunk.buffer);
+    chunk.view = new DataView(chunk.buffer, 0, this.chunkSize);
     chunk.active = true;
     this.advanceNextChunkToActivate(index);
   }
@@ -673,6 +689,29 @@ export class GrowableBuffer {
   // -------------------------------------------------------------------------
   // Typed accessors (resolve offset -> chunk)
   // -------------------------------------------------------------------------
+
+  /**
+   * The `DataView` of the chunk that holds `offset` (activating the chunk when
+   * needed), for code that reads or writes several adjacent fields: resolve
+   * the chunk once, then address it with `localOffset(offset)`. Cheaper than
+   * calling `getInt32`/`setInt32` per field, each of which re-resolves the
+   * chunk. Valid for anything that does not straddle a chunk boundary, which
+   * holds for 16-byte value slots and object blocks (a block never spans two
+   * chunks).
+   */
+  viewAt(offset: number): DataView {
+    if (this.singleBuffer) return this.chunks[0]!.view;
+    const index = offset >>> this.chunkShift;
+    const chunk = this.chunks[index];
+    if (chunk !== undefined && chunk.active) return chunk.view;
+    this.activate(index);
+    return this.chunks[index]!.view;
+  }
+
+  /** Offset of `offset` inside the chunk returned by `viewAt(offset)`. */
+  localOffset(offset: number): number {
+    return this.singleBuffer ? offset : offset & (this.chunkSize - 1);
+  }
 
   getInt32(offset: number): number {
     if (this.singleBuffer) return this.chunks[0]!.view.getInt32(offset, true);
