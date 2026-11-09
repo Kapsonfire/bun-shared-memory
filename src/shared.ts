@@ -34,6 +34,7 @@ import {
   type ObjectLayout,
   type StringRef,
   type ValueSlot,
+  NOT_PRIMITIVE,
   onMemoryDisposed,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
@@ -139,7 +140,11 @@ function encodeValue(
         return bigintSlot(value);
       }
       return bigintStrSlot(mem.storeString(value.toString()));
-    case "string":
+    case "string": {
+      // Short strings are stored inline in the slot (no heap block, and no
+      // TextDecoder call when read back).
+      const inline = mem.inlineStringSlot(value);
+      if (inline !== null) return inline;
       // Reuse the existing string block in place when the new string fits.
       const oldRef =
         oldSlot?.type === TYPE_STRING_VALUE_REF
@@ -150,6 +155,7 @@ function encodeValue(
             }
           : undefined;
       return stringValueRefSlot(mem.storeStringValue(value, oldRef));
+    }
     default:
       if (value === null) {
         // `null` is a supported value (stored as TYPE_NULL). `undefined` is
@@ -300,7 +306,14 @@ export type SharedRef<T> = [T] extends [object]
  */
 const readCache = new Map<
   string,
-  { version: number; value: unknown; index: number; cell: number }
+  {
+    version: number;
+    value: unknown;
+    index: number;
+    cell: number;
+    /** Version at which a single array element was read without caching. */
+    ev: number;
+  }
 >();
 
 // ---------------------------------------------------------------------------
@@ -337,22 +350,24 @@ function dropCellDepth(map: Map<number, number>, cell: number): void {
  * case the version is read directly.
  */
 function waitForVersionCell(mem: SharedMemory, cell: number): number {
+  let raw = Atomics.load(mem.versionView, cell);
+  // Common case: no lock bits set, so nobody (this thread included) holds a
+  // lock on the object. Checked first so the hot cache-hit read does not pay
+  // for the depth-map lookups below.
+  if ((raw & VERSION_LOCK_MASK) === 0) return raw >> VERSION_LOCK_SHIFT_BITS;
   if (writeCellDepths.has(cell) || readCellDepths.has(cell)) {
     // This worker already holds a lock on this cell (reentrant read): read the
     // live version directly, don't wait on our own lock.
-    return Atomics.load(mem.versionView, cell) >> VERSION_LOCK_SHIFT_BITS;
+    return raw >> VERSION_LOCK_SHIFT_BITS;
   }
-  let raw = Atomics.load(mem.versionView, cell);
-  if ((raw & VERSION_LOCK_MASK) !== 0) {
-    const timeoutMs = getDefaultLockTimeout();
-    const deadline = deadlineFor(timeoutMs);
-    do {
-      if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
-        throw new LockTimeoutError("object lock", timeoutMs);
-      }
-      raw = Atomics.load(mem.versionView, cell);
-    } while ((raw & VERSION_LOCK_MASK) !== 0);
-  }
+  const timeoutMs = getDefaultLockTimeout();
+  const deadline = deadlineFor(timeoutMs);
+  do {
+    if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+      throw new LockTimeoutError("object lock", timeoutMs);
+    }
+    raw = Atomics.load(mem.versionView, cell);
+  } while ((raw & VERSION_LOCK_MASK) !== 0);
   return raw >> VERSION_LOCK_SHIFT_BITS;
 }
 
@@ -789,24 +804,31 @@ function readValueAtLocator(mem: SharedMemory, locator: ArrayLocator): unknown {
  */
 function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
   if (Array.isArray(value)) {
-    // Lazily create the cycle-tracking map only when the first container is
-    // reached, so primitives keep the zero-allocation fast path.
-    const map = (seen ??= new Map<object, unknown>());
-    const cached = map.get(value);
-    if (cached !== undefined) return cached;
     const copy: unknown[] = [];
-    map.set(value, copy);
-    for (const v of value) copy.push(copyValue(v, map));
+    for (let i = 0; i < value.length; i++) {
+      copy.push(copyValue(value[i], seen));
+    }
     return copy;
   }
   if (value !== null && typeof value === "object") {
-    const map = (seen ??= new Map<object, unknown>());
-    const cached = map.get(value);
-    if (cached !== undefined) return cached;
+    if (sharedKeyMap.has(value)) {
+      // A live `Shared` reference: the only way a value can contain itself
+      // (self/mutual references), so cycle tracking starts here. Plain decoded
+      // values are trees, which keeps the common case (no references) free of
+      // the tracking map and its allocations.
+      const map = (seen ??= new Map<object, unknown>());
+      const cached = map.get(value);
+      if (cached !== undefined) return cached;
+      const copy = Object.assign({} as Record<string, unknown>, value);
+      map.set(value, copy);
+      for (const k in copy) {
+        copy[k] = copyValue(copy[k], map);
+      }
+      return copy;
+    }
     const copy = Object.assign({} as Record<string, unknown>, value);
-    map.set(value, copy);
     for (const k in copy) {
-      copy[k] = copyValue(copy[k], map);
+      copy[k] = copyValue(copy[k], seen);
     }
     return copy;
   }
@@ -973,12 +995,23 @@ function readProp(
   const cached = readCache.get(key);
   const raw =
     cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
-  const value =
+  let value: unknown;
+  if (
     cached !== undefined &&
     (raw & VERSION_LOCK_MASK) === 0 &&
     cached.version === raw >> VERSION_LOCK_SHIFT_BITS
-      ? cached.value
-      : readValue(mem, key);
+  ) {
+    value = cached.value;
+  } else {
+    // Miss (typically right after a write). A single element of an array need
+    // not decode the whole array.
+    const index = parseIndex(prop);
+    if (index >= 0) {
+      const element = tryReadElement(mem, key, null, index);
+      if (element !== NOT_PRIMITIVE) return element;
+    }
+    value = readValue(mem, key);
+  }
   if (Array.isArray(value)) {
     return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
   }
@@ -1016,17 +1049,28 @@ function readObjectProp(
   fieldCache: { version: number; value: unknown },
   version: number,
   arrayCapacity?: number,
+  knownSlotOffset?: number,
 ): unknown {
-  const layout = getObjectLayout(mem, key);
-  if (layout === null) {
-    // Not an object (shouldn't happen for an object accessor); fall back.
-    return readProp(mem, key, prop, arrayCapacity);
-  }
-  const slotOffset = layout.properties.get(prop);
+  let slotOffset = knownSlotOffset;
   if (slotOffset === undefined) {
-    throw new TypeError(
-      `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-    );
+    const layout = getObjectLayout(mem, key);
+    if (layout === null) {
+      // Not an object (shouldn't happen for an object accessor); fall back.
+      return readProp(mem, key, prop, arrayCapacity);
+    }
+    slotOffset = layout.properties.get(prop);
+    if (slotOffset === undefined) {
+      throw new TypeError(
+        `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+      );
+    }
+  }
+  // Allocation-free path for the common primitive slots.
+  const primitive = mem.readPrimitiveAt(slotOffset);
+  if (primitive !== NOT_PRIMITIVE) {
+    fieldCache.version = version;
+    fieldCache.value = primitive;
+    return primitive;
   }
   const slot = mem.readValueSlot(slotOffset);
   if (slot.type === TYPE_OBJECT_REF || slot.type === TYPE_KEY_REF) {
@@ -1059,39 +1103,38 @@ function readObjectProp(
  * (cached by the caller, e.g. the accessor setter). Avoids the
  * `getObjectLayout` Map lookup + `properties.get` per write on the hot path.
  */
-function writeObjectSlot(
+/**
+ * Write `val` into the object property slot at `slotOffset` (fast paths for
+ * numbers, booleans, int64 bigints and inline strings, the general encode
+ * otherwise) without bumping the version; callers bump once per write.
+ */
+function storeObjectSlot(
   mem: SharedMemory,
-  key: string,
   slotOffset: number,
   val: unknown,
   arrayCapacity?: number,
-  target?: WriteTarget,
 ): void {
   if (typeof val === "number") {
     // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
     // and no in-place string reuse; write the float64 directly.
     mem.updateNumberSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "boolean") {
     // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op)
     // and no in-place string reuse; write the 4 Int32s directly.
     mem.updateBooleanSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64) {
     // Fast path: int64 bigints are written directly, avoiding the ValueSlot
     // object allocation of the generic path.
     mem.updateBigIntSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "string") {
     // Fast path: short strings are written inline into the slot itself.
     if (mem.updateInlineStringSlot(slotOffset, val)) {
-      bumpTarget(mem, key, target);
       return;
     }
   }
@@ -1101,6 +1144,17 @@ function writeObjectSlot(
     slotOffset,
     encodeValue(mem, val, arrayCapacity, oldSlot),
   );
+}
+
+function writeObjectSlot(
+  mem: SharedMemory,
+  key: string,
+  slotOffset: number,
+  val: unknown,
+  arrayCapacity?: number,
+  target?: WriteTarget,
+): void {
+  storeObjectSlot(mem, slotOffset, val, arrayCapacity);
   bumpTarget(mem, key, target);
 }
 
@@ -1110,6 +1164,23 @@ function writeObjectSlot(
  * Shared by the proxy `set` handler and the generated accessor setters. Uses
  * the cached layout to update only the affected slot.
  */
+// State of the `writeProp` in progress. The lock body is a module-level
+// function that reads it, so a write allocates no closure (the closure and its
+// captured variables were a measurable part of an array index write). A write
+// is synchronous; `writeProp` saves and restores the state so a write started
+// from inside a write (for example by a getter of the value being encoded)
+// cannot clobber the outer one.
+let wpMem: SharedMemory;
+let wpKey = "";
+let wpProp: string | symbol = "";
+let wpVal: unknown;
+let wpCapacity: number | undefined;
+let wpTarget: WriteTarget | undefined;
+
+function writePropBody(): void {
+  writePropInner(wpMem, wpKey, wpProp, wpVal, wpCapacity, wpTarget);
+}
+
 function writeProp(
   mem: SharedMemory,
   key: string,
@@ -1118,13 +1189,29 @@ function writeProp(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the key's lock stripe (see `writeLock`).
-  writeLock(
-    mem,
-    key,
-    () => writePropInner(mem, key, prop, val, arrayCapacity, target),
-    target,
-  );
+  const sMem = wpMem;
+  const sKey = wpKey;
+  const sProp = wpProp;
+  const sVal = wpVal;
+  const sCapacity = wpCapacity;
+  const sTarget = wpTarget;
+  wpMem = mem;
+  wpKey = key;
+  wpProp = prop;
+  wpVal = val;
+  wpCapacity = arrayCapacity;
+  wpTarget = target;
+  try {
+    // Serialize the write under the key's lock stripe (see `writeLock`).
+    writeLock(mem, key, writePropBody, target);
+  } finally {
+    wpMem = sMem;
+    wpKey = sKey;
+    wpProp = sProp;
+    wpVal = sVal;
+    wpCapacity = sCapacity;
+    wpTarget = sTarget;
+  }
 }
 
 function writePropInner(
@@ -1168,12 +1255,9 @@ function writePropInner(
   if (target !== undefined && target.__type === undefined) {
     target.__type = slotType;
   }
-  if (
-    slotType === TYPE_ARRAY_REF &&
-    typeof prop === "string" &&
-    /^\d+$/.test(prop)
-  ) {
-    const index = Number(prop);
+  const parsedIndex = slotType === TYPE_ARRAY_REF ? parseIndex(prop) : -1;
+  if (parsedIndex >= 0) {
+    const index = parsedIndex;
     // Use the cached ArrayRef when it is still valid (same layout version,
     // i.e. no defragmentation or array growth has moved it). Otherwise
     // re-read the 3 header Int32s and refresh the cache.
@@ -1283,7 +1367,13 @@ function createSharedRef<T>(
     // on every local write/update; cross-worker invalidation is detected by
     // the version check in the get handler.
     __cache: undefined as
-      | { version: number; value: unknown; index: number; cell: number }
+      | {
+          version: number;
+          value: unknown;
+          index: number;
+          cell: number;
+          ev: number;
+        }
       | undefined,
     // Cached DataTable offset for this key, valid only while the global
     // layout version is unchanged (i.e. no defragmentation has moved it).
@@ -1448,6 +1538,50 @@ function createSharedRef<T>(
       // the object block).
       let slotOffset: number | undefined;
       let slotLayoutVersion = -1;
+      // Value of the write in progress; read by `writeBody`. A write is
+      // synchronous and re-entrancy on the same accessor cannot happen inside
+      // the body, so one slot per accessor is enough.
+      let pending: unknown;
+      /**
+       * The property's slot offset, cached per accessor and re-resolved when
+       * the global layout version `lv` changed (defragmentation or array
+       * growth moved blocks). Shared by the getter's miss path and the setter.
+       */
+      const resolveSlot = (lv: number): number => {
+        if (slotLayoutVersion !== lv) {
+          slotOffset = undefined;
+          slotLayoutVersion = lv;
+        }
+        if (slotOffset === undefined) {
+          const layout = getObjectLayout(mem, key);
+          if (layout === null) {
+            // Not an object (shouldn't happen for an object accessor).
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          const so = layout.properties.get(name);
+          if (so === undefined) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          slotOffset = so;
+        }
+        return slotOffset;
+      };
+      const writeBody = (): void => {
+        // The layout version cannot change while the key's stripe is held
+        // (defrag takes every stripe), so the plain read is enough here.
+        writeObjectSlot(
+          mem,
+          key,
+          resolveSlot(mem.layoutVersionInLock()),
+          pending,
+          arrayCapacity,
+          target,
+        );
+      };
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
@@ -1476,6 +1610,7 @@ function createSharedRef<T>(
             fieldCache,
             version,
             arrayCapacity,
+            resolveSlot(mem.getLayoutVersion()),
           );
           if (Array.isArray(value)) {
             arrayProxy = value;
@@ -1484,40 +1619,14 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          writeLock(
-            mem,
-            key,
-            () => {
-              // Write directly to the cached slot offset when still valid,
-              // skipping the getObjectLayout Map lookup + properties.get. The
-              // layout version cannot change while the key's stripe is held
-              // (defrag takes every stripe), but the check keeps the read
-              // cache resilient.
-              const lv = mem.layoutVersionInLock();
-              if (slotLayoutVersion !== lv) {
-                slotOffset = undefined;
-                slotLayoutVersion = lv;
-              }
-              if (slotOffset === undefined) {
-                const layout = getObjectLayout(mem, key);
-                if (layout === null) {
-                  // Not an object (shouldn't happen for an object accessor).
-                  throw new TypeError(
-                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                  );
-                }
-                const so = layout.properties.get(name);
-                if (so === undefined) {
-                  throw new TypeError(
-                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                  );
-                }
-                slotOffset = so;
-              }
-              writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
-            },
-            target,
-          );
+          // `writeBody` is created once per accessor (see above); the value
+          // travels through `pending`, so a write allocates no closure.
+          pending = v;
+          try {
+            writeLock(mem, key, writeBody, target);
+          } finally {
+            pending = undefined;
+          }
         },
       });
     }
@@ -1595,7 +1704,13 @@ function readValue(
   mem: SharedMemory,
   key: string,
   cacheTarget?: {
-    __cache?: { version: number; value: unknown; index: number; cell: number };
+    __cache?: {
+      version: number;
+      value: unknown;
+      index: number;
+      cell: number;
+      ev: number;
+    };
   },
 ): unknown {
   // Inline the read-cache fast path (see readProp) to avoid the polymorphic
@@ -1629,10 +1744,23 @@ function readValue(
     }
     const type = mem.dataTable.getInt32(offset);
     if (type === 5) {
-      // Object block.
-      const properties = mem.readObject(offset);
+      // Object block. The cached layout already holds the property names and
+      // slot offsets (static: the shape is fixed), so only the values are
+      // decoded; reading the names from the StringTable again on every miss
+      // (a TextDecoder call each) was over half the time of this read.
+      const layout = getObjectLayout(mem, key);
       const obj: Record<string, unknown> = {};
-      for (const [name, slot] of properties) {
+      if (layout !== null && layout.totalOffset === offset) {
+        for (const [name, slotOffset] of layout.properties) {
+          const primitive = mem.readPrimitiveAt(slotOffset);
+          obj[name] =
+            primitive !== NOT_PRIMITIVE
+              ? primitive
+              : decodeValue(mem, mem.readValueSlot(slotOffset));
+        }
+        return obj;
+      }
+      for (const [name, slot] of mem.readObject(offset)) {
         obj[name] = decodeValue(mem, slot);
       }
       return obj;
@@ -1641,13 +1769,27 @@ function readValue(
     return decodeValue(mem, mem.readValueSlot(offset));
   });
 
-  const entry = { version, value, index, cell };
+  const entry = { version, value, index, cell, ev: -1 };
   readCache.set(key, entry);
   if (cacheTarget) cacheTarget.__cache = entry;
   return value;
 }
 
 /** Write a full value for a key to shared memory. */
+// State of the `writeValue` in progress (see `writeProp` above for why): the
+// lock body is a module-level function, so a write allocates no closure. Saved
+// and restored by `writeValue` so a write started from inside a write cannot
+// clobber the outer one.
+let wvMem: SharedMemory;
+let wvKey = "";
+let wvValue: unknown;
+let wvCapacity: number | undefined;
+let wvTarget: WriteTarget | undefined;
+
+function writeValueBody(): void {
+  writeValueInner(wvMem, wvKey, wvValue, wvCapacity, wvTarget);
+}
+
 function writeValue(
   mem: SharedMemory,
   key: string,
@@ -1655,13 +1797,26 @@ function writeValue(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the key's lock stripe (see `writeLock`).
-  writeLock(
-    mem,
-    key,
-    () => writeValueInner(mem, key, value, arrayCapacity, target),
-    target,
-  );
+  const sMem = wvMem;
+  const sKey = wvKey;
+  const sValue = wvValue;
+  const sCapacity = wvCapacity;
+  const sTarget = wvTarget;
+  wvMem = mem;
+  wvKey = key;
+  wvValue = value;
+  wvCapacity = arrayCapacity;
+  wvTarget = target;
+  try {
+    // Serialize the write under the key's lock stripe (see `writeLock`).
+    writeLock(mem, key, writeValueBody, target);
+  } finally {
+    wvMem = sMem;
+    wvKey = sKey;
+    wvValue = sValue;
+    wvCapacity = sCapacity;
+    wvTarget = sTarget;
+  }
 }
 
 function writeValueInner(
@@ -1686,8 +1841,36 @@ function writeValueInner(
     }
     if (type === 5) {
       // Update existing object's property slots in place.
-      const properties = mem.readObject(existing);
       const valueObj = value as Record<string, unknown>;
+      const layout = getObjectLayout(mem, key);
+      if (layout !== null && layout.totalOffset === existing) {
+        // The cached layout holds the property names and slot offsets (the
+        // shape is fixed), so nothing is read back from the StringTable and no
+        // temporary arrays/sets are built. Validate first so a rejected write
+        // leaves the object untouched.
+        let present = 0;
+        for (const name of layout.properties.keys()) {
+          if (!(name in valueObj)) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          present++;
+        }
+        let total = 0;
+        for (const _name in valueObj) total++;
+        if (total !== present) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+          );
+        }
+        for (const [name, slotOffset] of layout.properties) {
+          storeObjectSlot(mem, slotOffset, valueObj[name], arrayCapacity);
+        }
+        bumpTarget(mem, key, target);
+        return;
+      }
+      const properties = mem.readObject(existing);
       for (let i = 0; i < properties.length; i++) {
         const [name] = properties[i]!;
         if (!(name in valueObj)) {
@@ -2032,6 +2215,96 @@ function readPathValue(
   return current;
 }
 
+/** Returned by `peekCached` when the whole-value cache cannot serve a read. */
+const CACHE_MISS: unique symbol = Symbol("cache-miss");
+
+/**
+ * The cached whole value of `key` when its cache entry is current (lock bits
+ * clear, version matching), else `CACHE_MISS`. The single lookup of the hit
+ * path, shared by callers that want to try something cheaper than a full
+ * decode before falling back to `readValue`.
+ */
+function peekCached(mem: SharedMemory, key: string): unknown {
+  const cached = readCache.get(key);
+  if (cached === undefined) return CACHE_MISS;
+  const raw = Atomics.load(mem.versionView, cached.cell);
+  if (
+    (raw & VERSION_LOCK_MASK) === 0 &&
+    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
+  ) {
+    return cached.value;
+  }
+  return CACHE_MISS;
+}
+
+/**
+ * A read of one array element that missed the whole-value cache (it follows a
+ * write): read just that element's slot, without decoding the whole root value
+ * (a large array or object decoded for one element is what made such reads
+ * slow). `name` is `null` for a top-level array, or the array property of an
+ * object value. The first miss at a given version takes this path; a second
+ * miss at the same version returns `NOT_PRIMITIVE` so the caller decodes the
+ * value once and fills the cache, keeping read-heavy loops on the fast cached
+ * path. Also returns `NOT_PRIMITIVE` when the general path is needed (first
+ * access, a held object lock, nested array/object elements, other shapes);
+ * `undefined` means the index is out of bounds.
+ */
+function tryReadElement(
+  mem: SharedMemory,
+  key: string,
+  name: string | null,
+  index: number,
+): unknown {
+  const cached = readCache.get(key);
+  if (cached === undefined) return NOT_PRIMITIVE;
+  const raw = Atomics.load(mem.versionView, cached.cell);
+  if ((raw & VERSION_LOCK_MASK) !== 0) return NOT_PRIMITIVE;
+  const version = raw >> VERSION_LOCK_SHIFT_BITS;
+  if (cached.version === version || cached.ev === version) {
+    return NOT_PRIMITIVE;
+  }
+  cached.ev = version;
+  // Consistent against concurrent writers of this key, like the whole-value
+  // read, but without a closure.
+  const stripe = mem.lockKey(cached.index);
+  try {
+    let refSlotOffset: number;
+    if (name === null) {
+      const offset = mem.lookupByIndex(cached.index);
+      if (offset === null) return NOT_PRIMITIVE;
+      refSlotOffset = offset;
+    } else {
+      const layout = getObjectLayout(mem, key);
+      const so = layout === null ? undefined : layout.properties.get(name);
+      if (so === undefined) return NOT_PRIMITIVE;
+      refSlotOffset = so;
+    }
+    return mem.readArrayElementAt(refSlotOffset, index);
+  } finally {
+    mem.unlockKey(stripe);
+  }
+}
+
+/**
+ * Array index encoded in a property key, or -1 if `prop` is not a non-empty
+ * string of decimal digits (the same set the former `/^\d+$/` test accepted).
+ * A character loop instead of a regular expression plus `Number()`: array
+ * proxies parse the key of every element access and write.
+ */
+function parseIndex(prop: string | symbol): number {
+  if (typeof prop !== "string") return -1;
+  const length = prop.length;
+  if (length === 0) return -1;
+  if (length > 15) return /^\d+$/.test(prop) ? Number(prop) : -1;
+  let index = 0;
+  for (let i = 0; i < length; i++) {
+    const digit = prop.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return -1;
+    index = index * 10 + digit;
+  }
+  return index;
+}
+
 /** Get a member of a top-level array value, with read-modify-write for mutating methods. */
 function getTopLevelArrayMember(
   mem: SharedMemory,
@@ -2041,8 +2314,8 @@ function getTopLevelArrayMember(
   arrayCapacity?: number,
 ): unknown {
   if (prop === "length") return value.length;
-  if (typeof prop === "string" && /^\d+$/.test(prop)) {
-    const index = Number(prop);
+  const index = parseIndex(prop);
+  if (index >= 0) {
     const element = value[index];
     if (Array.isArray(element)) {
       return createArrayProxy(
@@ -2155,8 +2428,8 @@ function createArrayProxy(
    * every write.
    */
   function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
-    if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-      const index = Number(arrProp);
+    const index = parseIndex(arrProp);
+    if (index >= 0) {
       const ref = getRef(index + 1);
       if (index >= ref.count) {
         throw new RangeError(
@@ -2237,6 +2510,11 @@ function createArrayProxy(
     );
   }
 
+  // Pending array write (see the proxy's `set` handler).
+  let apProp: string | symbol = "";
+  let apVal: unknown;
+  const arraySetBody = (): boolean => writeArrayProp(apProp, apVal);
+
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
       // push/pop on the array: operate directly on the array ref without
@@ -2253,9 +2531,27 @@ function createArrayProxy(
         // grew the array is reflected (the version bump invalidates the cache).
         return readArrayValue(mem, locator).length;
       }
-      if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-        const index = Number(arrProp);
-        const element = readArrayValue(mem, locator)[index];
+      const index = parseIndex(arrProp);
+      if (index >= 0) {
+        let root = peekCached(mem, key);
+        if (root === CACHE_MISS) {
+          // Miss (typically right after a write). For a one-step path to an
+          // array property, read just the element instead of decoding the
+          // whole root object.
+          if (locator.path.length === 1) {
+            const step = locator.path[0]!;
+            if (step.kind === "prop") {
+              const fast = tryReadElement(mem, key, step.name, index);
+              if (fast !== NOT_PRIMITIVE) return fast;
+            }
+          }
+          root = readValue(mem, key);
+        }
+        const rootArray = readPathValue(mem, locator, root);
+        if (!Array.isArray(rootArray)) {
+          throw new TypeError("Value is not an array");
+        }
+        const element = rootArray[index];
         if (Array.isArray(element)) {
           return createArrayProxy(
             mem,
@@ -2310,9 +2606,20 @@ function createArrayProxy(
     },
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
-      // decoding and re-encoding the whole value. Serialize under the shared
-      // mutex (see `writeLock`).
-      return writeLock(mem, locator.key, () => writeArrayProp(arrProp, val));
+      // decoding and re-encoding the whole value. Serialize under the key's
+      // lock stripe (see `writeLock`). The pending property and value travel
+      // through `apProp`/`apVal` (saved and restored for re-entrancy) so the
+      // write allocates no closure.
+      const sProp = apProp;
+      const sVal = apVal;
+      apProp = arrProp;
+      apVal = val;
+      try {
+        return writeLock(mem, locator.key, arraySetBody);
+      } finally {
+        apProp = sProp;
+        apVal = sVal;
+      }
     },
   });
 }

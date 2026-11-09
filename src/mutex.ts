@@ -66,9 +66,9 @@ export interface MutexOptions {
 }
 
 export class Mutex {
-  private readonly cell: Int32Array;
+  protected readonly cell: Int32Array;
   /** Whether the buffer has the owner/depth cells (>= 12 bytes). */
-  private readonly full: boolean;
+  protected readonly full: boolean;
   private readonly timeoutMs: number | undefined;
 
   constructor(buffer?: SharedArrayBuffer, options?: MutexOptions) {
@@ -113,7 +113,7 @@ export class Mutex {
     this.lockSlow();
   }
 
-  private lockSlow(): void {
+  protected lockSlow(): void {
     const timeoutMs = this.timeoutMs ?? getDefaultLockTimeout();
     const deadline = deadlineFor(timeoutMs);
     while (true) {
@@ -137,7 +137,7 @@ export class Mutex {
     }
   }
 
-  private markOwned(): void {
+  protected markOwned(): void {
     if (this.full) {
       Atomics.store(this.cell, 2, 1);
       Atomics.store(this.cell, 1, THREAD_ID);
@@ -201,6 +201,66 @@ export class Mutex {
       return fn();
     } finally {
       this.unlock();
+    }
+  }
+}
+
+/**
+ * A `Mutex` whose re-entrancy depth is a plain field of this instance instead
+ * of a cell in the shared buffer. It halves the atomic operations of an
+ * uncontended lock/unlock pair (4 instead of 8), which matters on the write
+ * hot path.
+ *
+ * Only valid where exactly one `StripeLock` instance per thread wraps a given
+ * cell, so that the instance sees every acquisition made by its thread. That
+ * holds for the per-key lock stripes of `SharedMemory` (one `SharedMemory` per
+ * thread). The owner id is still published in the shared cell, so recovery of
+ * a lock held by a dead thread (`forceUnlock`) works as before.
+ */
+export class StripeLock extends Mutex {
+  private depth = 0;
+
+  constructor(buffer: SharedArrayBuffer, options?: MutexOptions) {
+    super(buffer, options);
+    if (!this.full) throw new RangeError("StripeLock needs a 12-byte cell");
+  }
+
+  override get heldByCurrentThread(): boolean {
+    return this.depth > 0;
+  }
+
+  override lock(): void {
+    if (this.depth > 0) {
+      this.depth++;
+      return;
+    }
+    if (Atomics.compareExchange(this.cell, 0, 0, 1) === 0) {
+      Atomics.store(this.cell, 1, THREAD_ID);
+      this.depth = 1;
+      return;
+    }
+    this.lockSlow();
+  }
+
+  protected override markOwned(): void {
+    Atomics.store(this.cell, 1, THREAD_ID);
+    this.depth = 1;
+  }
+
+  override unlock(): void {
+    if (this.depth > 1) {
+      this.depth--;
+      return;
+    }
+    if (this.depth === 0) {
+      throw new Error("Mutex: unlock() by a thread that does not hold it");
+    }
+    this.depth = 0;
+    // Clear ownership before releasing so a stale owner id can never make
+    // another thread look like the owner.
+    Atomics.store(this.cell, 1, 0);
+    if (Atomics.exchange(this.cell, 0, 0) === 2) {
+      Atomics.notify(this.cell, 0, Infinity);
     }
   }
 }
