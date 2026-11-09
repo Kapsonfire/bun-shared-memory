@@ -140,7 +140,11 @@ function encodeValue(
         return bigintSlot(value);
       }
       return bigintStrSlot(mem.storeString(value.toString()));
-    case "string":
+    case "string": {
+      // Short strings are stored inline in the slot (no heap block, and no
+      // TextDecoder call when read back).
+      const inline = mem.inlineStringSlot(value);
+      if (inline !== null) return inline;
       // Reuse the existing string block in place when the new string fits.
       const oldRef =
         oldSlot?.type === TYPE_STRING_VALUE_REF
@@ -151,6 +155,7 @@ function encodeValue(
             }
           : undefined;
       return stringValueRefSlot(mem.storeStringValue(value, oldRef));
+    }
     default:
       if (value === null) {
         // `null` is a supported value (stored as TYPE_NULL). `undefined` is
@@ -799,24 +804,31 @@ function readValueAtLocator(mem: SharedMemory, locator: ArrayLocator): unknown {
  */
 function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
   if (Array.isArray(value)) {
-    // Lazily create the cycle-tracking map only when the first container is
-    // reached, so primitives keep the zero-allocation fast path.
-    const map = (seen ??= new Map<object, unknown>());
-    const cached = map.get(value);
-    if (cached !== undefined) return cached;
     const copy: unknown[] = [];
-    map.set(value, copy);
-    for (const v of value) copy.push(copyValue(v, map));
+    for (let i = 0; i < value.length; i++) {
+      copy.push(copyValue(value[i], seen));
+    }
     return copy;
   }
   if (value !== null && typeof value === "object") {
-    const map = (seen ??= new Map<object, unknown>());
-    const cached = map.get(value);
-    if (cached !== undefined) return cached;
+    if (sharedKeyMap.has(value)) {
+      // A live `Shared` reference: the only way a value can contain itself
+      // (self/mutual references), so cycle tracking starts here. Plain decoded
+      // values are trees, which keeps the common case (no references) free of
+      // the tracking map and its allocations.
+      const map = (seen ??= new Map<object, unknown>());
+      const cached = map.get(value);
+      if (cached !== undefined) return cached;
+      const copy = Object.assign({} as Record<string, unknown>, value);
+      map.set(value, copy);
+      for (const k in copy) {
+        copy[k] = copyValue(copy[k], map);
+      }
+      return copy;
+    }
     const copy = Object.assign({} as Record<string, unknown>, value);
-    map.set(value, copy);
     for (const k in copy) {
-      copy[k] = copyValue(copy[k], map);
+      copy[k] = copyValue(copy[k], seen);
     }
     return copy;
   }
@@ -1722,10 +1734,23 @@ function readValue(
     }
     const type = mem.dataTable.getInt32(offset);
     if (type === 5) {
-      // Object block.
-      const properties = mem.readObject(offset);
+      // Object block. The cached layout already holds the property names and
+      // slot offsets (static: the shape is fixed), so only the values are
+      // decoded; reading the names from the StringTable again on every miss
+      // (a TextDecoder call each) was over half the time of this read.
+      const layout = getObjectLayout(mem, key);
       const obj: Record<string, unknown> = {};
-      for (const [name, slot] of properties) {
+      if (layout !== null && layout.totalOffset === offset) {
+        for (const [name, slotOffset] of layout.properties) {
+          const primitive = mem.readPrimitiveAt(slotOffset);
+          obj[name] =
+            primitive !== NOT_PRIMITIVE
+              ? primitive
+              : decodeValue(mem, mem.readValueSlot(slotOffset));
+        }
+        return obj;
+      }
+      for (const [name, slot] of mem.readObject(offset)) {
         obj[name] = decodeValue(mem, slot);
       }
       return obj;
@@ -1741,6 +1766,20 @@ function readValue(
 }
 
 /** Write a full value for a key to shared memory. */
+// State of the `writeValue` in progress (see `writeProp` above for why): the
+// lock body is a module-level function, so a write allocates no closure. Saved
+// and restored by `writeValue` so a write started from inside a write cannot
+// clobber the outer one.
+let wvMem: SharedMemory;
+let wvKey = "";
+let wvValue: unknown;
+let wvCapacity: number | undefined;
+let wvTarget: WriteTarget | undefined;
+
+function writeValueBody(): void {
+  writeValueInner(wvMem, wvKey, wvValue, wvCapacity, wvTarget);
+}
+
 function writeValue(
   mem: SharedMemory,
   key: string,
@@ -1748,13 +1787,26 @@ function writeValue(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the key's lock stripe (see `writeLock`).
-  writeLock(
-    mem,
-    key,
-    () => writeValueInner(mem, key, value, arrayCapacity, target),
-    target,
-  );
+  const sMem = wvMem;
+  const sKey = wvKey;
+  const sValue = wvValue;
+  const sCapacity = wvCapacity;
+  const sTarget = wvTarget;
+  wvMem = mem;
+  wvKey = key;
+  wvValue = value;
+  wvCapacity = arrayCapacity;
+  wvTarget = target;
+  try {
+    // Serialize the write under the key's lock stripe (see `writeLock`).
+    writeLock(mem, key, writeValueBody, target);
+  } finally {
+    wvMem = sMem;
+    wvKey = sKey;
+    wvValue = sValue;
+    wvCapacity = sCapacity;
+    wvTarget = sTarget;
+  }
 }
 
 function writeValueInner(

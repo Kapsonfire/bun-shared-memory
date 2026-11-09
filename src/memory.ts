@@ -1553,6 +1553,36 @@ export class SharedMemory {
     return this.updateInlineStringSlotUtf8(offset, value);
   }
 
+  /**
+   * The inline-string slot for `value` (at most 11 UTF-8 bytes), or `null` when
+   * it does not fit and must go to the heap. Used when a value is created, so
+   * short strings never touch the StringTable/ArrayTable and decode without a
+   * `TextDecoder` call.
+   */
+  inlineStringSlot(value: string): ValueSlot | null {
+    if (value.length > 11) return null;
+    if (packAsciiInline(value)) {
+      return {
+        type: TYPE_INLINE_STRING,
+        a: packed[0]!,
+        b: packed[1]!,
+        c: packed[2]!,
+      };
+    }
+    const bytes = this.encoder.encode(value);
+    if (bytes.byteLength > 11) return null;
+    let a = 0;
+    let b = 0;
+    let c = bytes.byteLength << 28;
+    for (let i = 0; i < bytes.byteLength; i++) {
+      const byte = bytes[i]!;
+      if (i < 4) a |= byte << (i * 8);
+      else if (i < 8) b |= byte << ((i - 4) * 8);
+      else c |= byte << ((i - 8) * 8);
+    }
+    return { type: TYPE_INLINE_STRING, a, b, c };
+  }
+
   /** Slow path of `updateInlineStringSlot`: non-ASCII text or a straddling slot. */
   private updateInlineStringSlotUtf8(offset: number, value: string): boolean {
     const bytes = this.encoder.encode(value);
