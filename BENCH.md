@@ -93,14 +93,18 @@ workers write one key. `spacing` is the number of filler keys between the
 benchmark keys (16 = hot keys on different cache lines, 0 = adjacent keys that
 share cache lines). Measured on macOS arm64 (14 cores), Bun 1.4.4.
 
-| Date       | Commit    | Change                                                      | Spacing | Scenario | 1 worker | 2 workers | 4 workers | 8 workers |
-| ---------- | --------- | ----------------------------------------------------------- | ------- | -------- | -------- | --------- | --------- | --------- |
-| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                            | 16      | own key  | 32.69    | 13.26     | 10.76     | 8.66      |
-| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                            | 16      | same key | 33.00    | 10.41     | 10.83     | 8.36      |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines | 16      | own key  | 38.26    | 74.91     | 161.22    | 305.29    |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines | 16      | same key | 38.31    | 13.57     | 12.33     | 9.93      |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines | 0       | own key  | 37.69    | 27.99     | 38.01     | 48.61     |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines | 0       | same key | 38.06    | 12.78     | 12.33     | 9.90      |
+| Date       | Commit    | Change                                                                              | Spacing | Scenario | 1 worker | 2 workers | 4 workers | 8 workers |
+| ---------- | --------- | ----------------------------------------------------------------------------------- | ------- | -------- | -------- | --------- | --------- | --------- |
+| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                    | 16      | own key  | 32.69    | 13.26     | 10.76     | 8.66      |
+| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                    | 16      | same key | 33.00    | 10.41     | 10.83     | 8.36      |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 16      | own key  | 38.26    | 74.91     | 161.22    | 305.29    |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 16      | same key | 38.31    | 13.57     | 12.33     | 9.93      |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 0       | own key  | 37.69    | 27.99     | 38.01     | 48.61     |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 0       | same key | 38.06    | 12.78     | 12.33     | 9.90      |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 16      | own key  | 54.96    | 113.63    | 225.33    | 441.03    |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 16      | same key | 55.42    | 15.91     | 16.37     | 13.33     |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | own key  | 56.24    | 37.77     | 46.02     | 60.62     |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | same key | 55.15    | 16.24     | 17.13     | 12.99     |
 
 Notes:
 
@@ -120,3 +124,12 @@ Notes:
   scaling.
 - Single-worker writes got ~15 % faster (32.7 → 38.3 M/s): the stripe mutex has
   no re-entrancy map and the two shared-line probes are gone.
+- Re-measured on release 1.1.0 (`88a1c63`) after the hot-path optimizations.
+  Every write got cheaper: a single worker rose by 44-49 % (38.3 → 55.0 M/s with
+  hot keys on separate cache lines), and independent writers on separate cache
+  lines by 40-52 % at every worker count (8 workers: 305 → 441 M/s), so scaling
+  stays near linear (8 workers = 8.0× one worker). The contended columns gained
+  less (+17 … +35 %) because they are limited by contention, not by the cost of
+  a single write: same-key writers are still serialized (~13-17 M/s in total)
+  and adjacent keys (spacing 0) still share cache lines and scale poorly
+  (8 workers: 60.6 M/s, 1.08× one worker).
