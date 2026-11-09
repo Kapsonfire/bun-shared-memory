@@ -12,7 +12,7 @@ import {
   nextPowerOfTwo,
 } from "./growable-buffer.ts";
 import { isMainThread } from "./env.ts";
-import { Mutex } from "./mutex.ts";
+import { Mutex, StripeLock } from "./mutex.ts";
 
 /**
  * The 4-buffer shared memory architecture.
@@ -602,7 +602,8 @@ export class SharedMemory {
       region.byteLength >= LOCK_REGION_BYTES
         ? Array.from(
             { length: LOCK_STRIPES },
-            (_, i) => new Mutex(region, { byteOffset: (i + 1) * LOCK_STRIDE }),
+            (_, i) =>
+              new StripeLock(region, { byteOffset: (i + 1) * LOCK_STRIDE }),
           )
         : new Array<Mutex>(LOCK_STRIPES).fill(this.lock);
     this.refCountBuffer = buffers?.refCount ?? null;

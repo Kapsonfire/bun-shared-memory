@@ -1110,6 +1110,23 @@ function writeObjectSlot(
  * Shared by the proxy `set` handler and the generated accessor setters. Uses
  * the cached layout to update only the affected slot.
  */
+// State of the `writeProp` in progress. The lock body is a module-level
+// function that reads it, so a write allocates no closure (the closure and its
+// captured variables were a measurable part of an array index write). A write
+// is synchronous; `writeProp` saves and restores the state so a write started
+// from inside a write (for example by a getter of the value being encoded)
+// cannot clobber the outer one.
+let wpMem: SharedMemory;
+let wpKey = "";
+let wpProp: string | symbol = "";
+let wpVal: unknown;
+let wpCapacity: number | undefined;
+let wpTarget: WriteTarget | undefined;
+
+function writePropBody(): void {
+  writePropInner(wpMem, wpKey, wpProp, wpVal, wpCapacity, wpTarget);
+}
+
 function writeProp(
   mem: SharedMemory,
   key: string,
@@ -1118,13 +1135,29 @@ function writeProp(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the key's lock stripe (see `writeLock`).
-  writeLock(
-    mem,
-    key,
-    () => writePropInner(mem, key, prop, val, arrayCapacity, target),
-    target,
-  );
+  const sMem = wpMem;
+  const sKey = wpKey;
+  const sProp = wpProp;
+  const sVal = wpVal;
+  const sCapacity = wpCapacity;
+  const sTarget = wpTarget;
+  wpMem = mem;
+  wpKey = key;
+  wpProp = prop;
+  wpVal = val;
+  wpCapacity = arrayCapacity;
+  wpTarget = target;
+  try {
+    // Serialize the write under the key's lock stripe (see `writeLock`).
+    writeLock(mem, key, writePropBody, target);
+  } finally {
+    wpMem = sMem;
+    wpKey = sKey;
+    wpProp = sProp;
+    wpVal = sVal;
+    wpCapacity = sCapacity;
+    wpTarget = sTarget;
+  }
 }
 
 function writePropInner(
@@ -1168,12 +1201,9 @@ function writePropInner(
   if (target !== undefined && target.__type === undefined) {
     target.__type = slotType;
   }
-  if (
-    slotType === TYPE_ARRAY_REF &&
-    typeof prop === "string" &&
-    /^\d+$/.test(prop)
-  ) {
-    const index = Number(prop);
+  const parsedIndex = slotType === TYPE_ARRAY_REF ? parseIndex(prop) : -1;
+  if (parsedIndex >= 0) {
+    const index = parsedIndex;
     // Use the cached ArrayRef when it is still valid (same layout version,
     // i.e. no defragmentation or array growth has moved it). Otherwise
     // re-read the 3 header Int32s and refresh the cache.
@@ -1448,6 +1478,38 @@ function createSharedRef<T>(
       // the object block).
       let slotOffset: number | undefined;
       let slotLayoutVersion = -1;
+      // Value of the write in progress; read by `writeBody`. A write is
+      // synchronous and re-entrancy on the same accessor cannot happen inside
+      // the body, so one slot per accessor is enough.
+      let pending: unknown;
+      const writeBody = (): void => {
+        // Write directly to the cached slot offset when still valid, skipping
+        // the getObjectLayout Map lookup + properties.get. The layout version
+        // cannot change while the key's stripe is held (defrag takes every
+        // stripe), but the check keeps the read cache resilient.
+        const lv = mem.layoutVersionInLock();
+        if (slotLayoutVersion !== lv) {
+          slotOffset = undefined;
+          slotLayoutVersion = lv;
+        }
+        if (slotOffset === undefined) {
+          const layout = getObjectLayout(mem, key);
+          if (layout === null) {
+            // Not an object (shouldn't happen for an object accessor).
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          const so = layout.properties.get(name);
+          if (so === undefined) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          slotOffset = so;
+        }
+        writeObjectSlot(mem, key, slotOffset, pending, arrayCapacity, target);
+      };
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
@@ -1484,40 +1546,14 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          writeLock(
-            mem,
-            key,
-            () => {
-              // Write directly to the cached slot offset when still valid,
-              // skipping the getObjectLayout Map lookup + properties.get. The
-              // layout version cannot change while the key's stripe is held
-              // (defrag takes every stripe), but the check keeps the read
-              // cache resilient.
-              const lv = mem.layoutVersionInLock();
-              if (slotLayoutVersion !== lv) {
-                slotOffset = undefined;
-                slotLayoutVersion = lv;
-              }
-              if (slotOffset === undefined) {
-                const layout = getObjectLayout(mem, key);
-                if (layout === null) {
-                  // Not an object (shouldn't happen for an object accessor).
-                  throw new TypeError(
-                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                  );
-                }
-                const so = layout.properties.get(name);
-                if (so === undefined) {
-                  throw new TypeError(
-                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                  );
-                }
-                slotOffset = so;
-              }
-              writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
-            },
-            target,
-          );
+          // `writeBody` is created once per accessor (see above); the value
+          // travels through `pending`, so a write allocates no closure.
+          pending = v;
+          try {
+            writeLock(mem, key, writeBody, target);
+          } finally {
+            pending = undefined;
+          }
         },
       });
     }
@@ -2032,6 +2068,26 @@ function readPathValue(
   return current;
 }
 
+/**
+ * Array index encoded in a property key, or -1 if `prop` is not a non-empty
+ * string of decimal digits (the same set the former `/^\d+$/` test accepted).
+ * A character loop instead of a regular expression plus `Number()`: array
+ * proxies parse the key of every element access and write.
+ */
+function parseIndex(prop: string | symbol): number {
+  if (typeof prop !== "string") return -1;
+  const length = prop.length;
+  if (length === 0) return -1;
+  if (length > 15) return /^\d+$/.test(prop) ? Number(prop) : -1;
+  let index = 0;
+  for (let i = 0; i < length; i++) {
+    const digit = prop.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return -1;
+    index = index * 10 + digit;
+  }
+  return index;
+}
+
 /** Get a member of a top-level array value, with read-modify-write for mutating methods. */
 function getTopLevelArrayMember(
   mem: SharedMemory,
@@ -2041,8 +2097,8 @@ function getTopLevelArrayMember(
   arrayCapacity?: number,
 ): unknown {
   if (prop === "length") return value.length;
-  if (typeof prop === "string" && /^\d+$/.test(prop)) {
-    const index = Number(prop);
+  const index = parseIndex(prop);
+  if (index >= 0) {
     const element = value[index];
     if (Array.isArray(element)) {
       return createArrayProxy(
@@ -2155,8 +2211,8 @@ function createArrayProxy(
    * every write.
    */
   function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
-    if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-      const index = Number(arrProp);
+    const index = parseIndex(arrProp);
+    if (index >= 0) {
       const ref = getRef(index + 1);
       if (index >= ref.count) {
         throw new RangeError(
@@ -2237,6 +2293,11 @@ function createArrayProxy(
     );
   }
 
+  // Pending array write (see the proxy's `set` handler).
+  let apProp: string | symbol = "";
+  let apVal: unknown;
+  const arraySetBody = (): boolean => writeArrayProp(apProp, apVal);
+
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
       // push/pop on the array: operate directly on the array ref without
@@ -2253,8 +2314,8 @@ function createArrayProxy(
         // grew the array is reflected (the version bump invalidates the cache).
         return readArrayValue(mem, locator).length;
       }
-      if (typeof arrProp === "string" && /^\d+$/.test(arrProp)) {
-        const index = Number(arrProp);
+      const index = parseIndex(arrProp);
+      if (index >= 0) {
         const element = readArrayValue(mem, locator)[index];
         if (Array.isArray(element)) {
           return createArrayProxy(
@@ -2310,9 +2371,20 @@ function createArrayProxy(
     },
     set(_target, arrProp, val) {
       // In-place update: write only the affected array slot instead of
-      // decoding and re-encoding the whole value. Serialize under the shared
-      // mutex (see `writeLock`).
-      return writeLock(mem, locator.key, () => writeArrayProp(arrProp, val));
+      // decoding and re-encoding the whole value. Serialize under the key's
+      // lock stripe (see `writeLock`). The pending property and value travel
+      // through `apProp`/`apVal` (saved and restored for re-entrancy) so the
+      // write allocates no closure.
+      const sProp = apProp;
+      const sVal = apVal;
+      apProp = arrProp;
+      apVal = val;
+      try {
+        return writeLock(mem, locator.key, arraySetBody);
+      } finally {
+        apProp = sProp;
+        apVal = sVal;
+      }
     },
   });
 }
