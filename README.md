@@ -58,7 +58,7 @@ slower than shared memory.
 
 - 🚀 **Zero-copy** shared memory between workers/threads via `SharedArrayBuffer`
 - 🧩 **4-buffer architecture** — Index Table, DataTable, append-only StringTable, ArrayTable
-- 🔒 **Atomics-based synchronization** — re-entrant `Mutex` + `Notifier`
+- 🔒 **Atomics-based synchronization** — per-key write locks (256 lock stripes, parallel writers on different keys), re-entrant `Mutex`, `Notifier`
 - ⚡ **Read & offset caches** — lock-free fast path, cross-worker invalidation via version cells
 - 🧹 **Reference counting & defragmentation** — automatic memory reclamation
 - 🪄 **Proxy-based API** — `Shared()` with direct getter/setter access
@@ -156,7 +156,39 @@ the main thread. See [Worker integration](#worker-integration) below.
 
 ## Synchronization
 
-All shared-memory reads and writes are protected by an `Atomics`-based mutex, so concurrent access from multiple workers is safe.
+Concurrent access from multiple workers is safe: writes are serialized **per
+key** with `Atomics`-based locks, and reads of unchanged values are lock-free
+(see below).
+
+### Write locking (per-key lock stripes)
+
+Every write holds the lock of its key: one of 256 re-entrant mutexes (a "stripe",
+chosen by the key's position in the Index Table), so
+
+- writers to **different keys run in parallel**,
+- writers to the **same key** wait for each other, which keeps read-modify-write
+  sequences (`update()`, `push`, property assignment) atomic,
+- key creation and defragmentation are the only operations that take the global
+  mutex (defragmentation takes every stripe, so it excludes all writers).
+
+> **Scalability.** With 8 workers each writing its own key the total throughput
+> is ~8× that of one worker (`bun run bench:contention`; with the former single
+> global write mutex it _dropped_ as writers were added). 8 workers hammering the
+> _same_ key stay at roughly single-writer speed. A single write costs ~25–40×
+> native. Reads of unchanged values are lock-free and fast (~3–5× native). After a
+> value changed, reading an **object property** is still lock-free (only that
+> property's slot is decoded), while reading a **whole value** (`read()`, a
+> top-level primitive, or an array element) takes that key's stripe once to
+> refill its cache.
+>
+> Keys created one after another sit next to each other in memory, so
+> simultaneously hot neighbours share cache lines (false sharing) and scale less
+> well than keys that are far apart.
+>
+> Code that holds a key's lock (an `update()` callback, `withWriteLock`) and
+> writes a _different_ key takes that key's lock too: two threads doing this in
+> opposite order can deadlock and fail with a `LockTimeoutError`. Keep such
+> callbacks to a single key or use a consistent key order.
 
 ### Read cache
 
@@ -435,26 +467,6 @@ overhead in Bun, where workers are auto-registered). If you prefer to build the
 > bounded busy-wait there, which works but blocks the UI while a lock is
 > contended. Do heavy or write-intensive work in Web Workers and keep main-thread
 > access to short, mostly read-only operations.
-
-> **Write scalability.** Writes are serialized **per key** (256 lock stripes),
-> not globally: writers to different keys run in parallel, writers to the same
-> key wait for each other. With 8 workers each writing its own key the total
-> throughput is ~8× that of one worker (`bun run bench:contention`); 8 workers
-> hammering the _same_ key stay at roughly single-writer speed. A single write
-> costs ~25–40× native. Reads of unchanged values are lock-free and fast
-> (~3–5× native). After a value changed, reading an **object property** is
-> still lock-free (only that property's slot is decoded), while reading a
-> **whole value** (`read()`, a top-level primitive, or an array element) takes
-> that key's stripe once to refill its cache.
->
-> Keys created one after another sit next to each other in memory, so
-> simultaneously hot neighbours share cache lines (false sharing) and scale
-> less well than keys that are far apart.
->
-> Code that holds a key's lock (an `update()` callback, `withWriteLock`) and
-> writes a _different_ key takes that key's lock too: two threads doing this in
-> opposite order can deadlock and fail with a `LockTimeoutError`. Keep such
-> callbacks to a single key or use a consistent key order.
 
 ## Memory budget
 

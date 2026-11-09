@@ -7,34 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Per-key write locking (lock stripes) instead of one global write mutex.**
-  Writes and whole-value cache-miss reads now hold only the lock stripe of
-  their key (256 stripes, `keyIndex & 255`), so writers to different keys run in
-  parallel and only writers of the same key are serialized. Key creation and
-  layout lookups still use the global mutex; defragmentation takes every stripe
-  (`SharedMemory.withAllLocks`). The stripes live in the same
-  `SharedArrayBuffer` as the global mutex (`lock.buffer`, now 16 KiB for a
-  default memory); a plain 12-byte `Mutex` passed as `lock` degrades to a single
-  global lock. Measured with `bun run bench:contention` (8 workers, own key
-  each): 8.7 M → 305 M writes/s in total. Same-key writers stay serialized.
-  `Mutex` gained a `byteOffset` option. The old write counter / defragmenting
-  flag methods (`beginWrite`, `endWrite`, `waitForWritesToFinish`, …) are gone.
-- The write path no longer does atomic loads of cache lines shared by all
-  writers (global-mutex ownership is tracked per thread, the layout version is
-  read plainly while a stripe is held): such loads do not scale across workers
-  in Bun.
-- `update()` / `withWriteLock` callbacks that write a _different_ key take that
-  key's stripe as well; opposite lock order in two threads can deadlock and
-  surfaces as a `LockTimeoutError`.
-- A dead worker's stripes are released together with the global mutex
-  (`SharedMemory.forceUnlockAll`).
-
-### Added
-
-- `bun run bench:contention`: multi-worker write throughput benchmark.
-
 ## [1.1.0] - 2026-11-09
 
 ### Added
@@ -92,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutex if that worker held it, and calls the new `onLockRecovered` option.
   Seqlock cells and the standalone `RWLock` still rely on timeouts only.
 
+- `bun run bench:contention`: multi-worker write throughput benchmark.
+
 ### Changed
 
 - **One `SharedMemory` per thread; created on the main thread only.**
@@ -114,6 +88,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docs: README/DESIGN now state precisely when a read takes the mutex (only
   whole-value reads after a change; object property reads stay lock-free).
   Test for the browser-main-thread busy-wait fallback.
+
+- **Per-key write locking (lock stripes) instead of one global write mutex.**
+  Writes and whole-value cache-miss reads now hold only the lock stripe of
+  their key (256 stripes, `keyIndex & 255`), so writers to different keys run in
+  parallel and only writers of the same key are serialized. Key creation and
+  layout lookups still use the global mutex; defragmentation takes every stripe
+  (`SharedMemory.withAllLocks`). The stripes live in the same
+  `SharedArrayBuffer` as the global mutex (`lock.buffer`, now 16 KiB for a
+  default memory); a plain 12-byte `Mutex` passed as `lock` degrades to a single
+  global lock. Measured with `bun run bench:contention` (8 workers, own key
+  each): 8.7 M → 305 M writes/s in total. Same-key writers stay serialized.
+  `Mutex` gained a `byteOffset` option. The old write counter / defragmenting
+  flag methods (`beginWrite`, `endWrite`, `waitForWritesToFinish`, …) are gone.
+- The write path no longer does atomic loads of cache lines shared by all
+  writers (global-mutex ownership is tracked per thread, the layout version is
+  read plainly while a stripe is held): such loads do not scale across workers
+  in Bun.
+- `update()` / `withWriteLock` callbacks that write a _different_ key take that
+  key's stripe as well; opposite lock order in two threads can deadlock and
+  surfaces as a `LockTimeoutError`.
+- A dead worker's stripes are released together with the global mutex
+  (`SharedMemory.forceUnlockAll`).
+
+- Docs: README, DESIGN, REFCOUNT and `llms.txt` describe the per-key locking model; `AGENTS.md` requires `bun run bench:contention` for locking changes.
 
 ### Fixed
 
