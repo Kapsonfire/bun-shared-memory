@@ -20,6 +20,8 @@ Key entry points:
 ## Required workflow before every commit
 
 1. **All tests must pass.** Run `bun test`. Do not commit if any test fails.
+   `bun run test:coverage` additionally writes `coverage/lcov.info`, which the
+   Sonar configuration (`sonar-project.properties`) reads.
 2. **Run the benchmark for every codebase change.** Run `bun run bench` (or
    `bun bench/bench.ts`). Record the results in the running table in
    `BENCH.md` (see below).

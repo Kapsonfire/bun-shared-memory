@@ -540,6 +540,7 @@ the array's length.
 bun install        # install dependencies
 bun run typecheck  # type check (bun check)
 bun test           # run tests
+bun run test:coverage  # tests + coverage report (coverage/lcov.info, used by Sonar)
 bun fmt            # format code
 bun run bench      # run benchmarks
 ```

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- SonarCloud quality gate: `init()` no longer creates the main-thread memory as
+  a bare `new SharedMemory(...)` statement (reported as a reliability bug); it
+  passes the instance to `setDefaultMemory`.
+
+### Changed
+
+- Removed unused imports (`memory.ts`, `shared.ts`, `worker.ts`), dead
+  assignments and the never-read `workerIdByWorker` map. No behavior change.
+- `bun run test:coverage` writes `coverage/lcov.info`; `sonar-project.properties`
+  now declares the test sources and the lcov report path so Sonar can show
+  coverage once the analysis runs after the tests (CI-based analysis).
+
 ## [1.1.0] - 2026-11-09
 
 ### Added
