@@ -75,9 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `bench/refspeed.ts`); in the benchmark suite writes are unchanged and
   single-key reads are 0…13 % slower (object property reads -5…-13 %). The
   methods (`read`, `write`, ...) are shared functions that use `this`, so
-  detaching one (`const { read } = ref`) no longer works. `read()` through a
+  detaching one (`const { write } = ref`) no longer works. `read()` through a
   Proxy (primitives, arrays) keeps one trap call by creating its function on
-  first use.
+  first use, so a detached `read` still works there.
 
 - **Unused wrappers are garbage collected.** The per-thread registry held every
   wrapper forever (1-2 KB each) and the caches kept an entry per key ever

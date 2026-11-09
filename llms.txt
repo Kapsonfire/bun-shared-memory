@@ -190,6 +190,8 @@ PERFORMANCE OPTIMIZATIONS
 - String value reuse: Overwriting with a shorter string reuses existing ArrayTable block
 - Array capacity padding: push writes into reserved slots (O(1) amortized); reallocates on overflow
 - Hard-baked accessors: Objects get plain JS objects with getters/setters (no Proxy overhead)
+- Shared prototype/methods/Proxy handler: all refs share them (methods use `this`; do not detach `const { write } = ref`); ~0.9 KB JS heap per primitive/array key, ~2 KB per 4-property object
+- Weak registry: wrappers are held by WeakRef and freed when unreferenced; a FinalizationRegistry drops their cache entries (~160 B/key remain)
 - Field cache: Each property getter has its own cache (avoids Map lookup per read)
 - Target cache: __cache, __offset, __arrayRef on proxy targets skip Map lookups on writes
 - Defragmentation: Auto-runs when free space < 20%, compacts all tables in-place
