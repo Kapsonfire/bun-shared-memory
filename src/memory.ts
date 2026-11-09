@@ -153,6 +153,33 @@ function versionCellIndex(index: number): number {
  */
 const slotView = new DataView(new ArrayBuffer(8));
 
+/**
+ * Pack an ASCII string of at most 11 characters into the three payload words of
+ * an inline-string slot (bytes 0-3 in `a`, 4-7 in `b`, 8-10 and the length in
+ * `c`). Writes the words to `packed` and returns true; returns false if the
+ * string contains a non-ASCII character (the caller then uses the UTF-8
+ * encoder). Avoids the `TextEncoder` call, and its allocation, on the write
+ * hot path.
+ */
+const packed = new Int32Array(3);
+function packAsciiInline(value: string): boolean {
+  const length = value.length;
+  let a = 0;
+  let b = 0;
+  let c = length << 28;
+  for (let i = 0; i < length; i++) {
+    const code = value.charCodeAt(i);
+    if (code > 127) return false;
+    if (i < 4) a |= code << (i << 3);
+    else if (i < 8) b |= code << ((i - 4) << 3);
+    else c |= code << ((i - 8) << 3);
+  }
+  packed[0] = a;
+  packed[1] = b;
+  packed[2] = c;
+  return true;
+}
+
 export interface StringRef {
   offset: number;
   length: number;
@@ -1042,6 +1069,21 @@ export class SharedMemory {
   /** Read a short string stored inline in a DataTable slot. */
   readInlineString(a: number, b: number, c: number): string {
     const length = c >>> 28;
+    // ASCII fast path: build the string from char codes, no byte array or
+    // TextDecoder; fall back to UTF-8 decoding at the first byte >= 128.
+    let text = "";
+    for (let i = 0; i < length; i++) {
+      const word = i < 4 ? a : i < 8 ? b : c;
+      const byte = (word >>> ((i & 3) << 3)) & 0xff;
+      if (byte > 127) return this.readInlineStringUtf8(a, b, c);
+      text += String.fromCharCode(byte);
+    }
+    return text;
+  }
+
+  /** UTF-8 slow path of `readInlineString`. */
+  private readInlineStringUtf8(a: number, b: number, c: number): string {
+    const length = c >>> 28;
     const bytes = new Uint8Array(length);
     for (let i = 0; i < length; i++) {
       const word = i < 4 ? a : i < 8 ? b : c;
@@ -1136,13 +1178,14 @@ export class SharedMemory {
    * the ValueSlot object allocation and the 4 separate Int32 writes.
    */
   updateArrayNumberSlot(ref: ArrayRef, index: number, value: number): void {
-    slotView.setFloat64(0, value, true);
     const buf = this.arrayTable;
     const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
-    buf.setInt32(off, TYPE_NUMBER);
-    buf.setInt32(off + 4, slotView.getInt32(0, true));
-    buf.setInt32(off + 8, slotView.getInt32(4, true));
-    buf.setInt32(off + 12, 0);
+    const o = buf.localOffset(off);
+    if (o > buf.slotLimit) return writeSlot(buf, off, numberSlot(value));
+    const v = buf.viewAt(off);
+    v.setInt32(o, TYPE_NUMBER, true);
+    v.setFloat64(o + 4, value, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1152,10 +1195,13 @@ export class SharedMemory {
   updateArrayBooleanSlot(ref: ArrayRef, index: number, value: boolean): void {
     const buf = this.arrayTable;
     const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
-    buf.setInt32(off, TYPE_BOOLEAN);
-    buf.setInt32(off + 4, value ? 1 : 0);
-    buf.setInt32(off + 8, 0);
-    buf.setInt32(off + 12, 0);
+    const o = buf.localOffset(off);
+    if (o > buf.slotLimit) return writeSlot(buf, off, booleanSlot(value));
+    const v = buf.viewAt(off);
+    v.setInt32(o, TYPE_BOOLEAN, true);
+    v.setInt32(o + 4, value ? 1 : 0, true);
+    v.setInt32(o + 8, 0, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1163,13 +1209,14 @@ export class SharedMemory {
    * the ValueSlot object allocation and the 4 separate Int32 writes.
    */
   updateArrayBigIntSlot(ref: ArrayRef, index: number, value: bigint): void {
-    slotView.setBigInt64(0, value, true);
     const buf = this.arrayTable;
     const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
-    buf.setInt32(off, TYPE_BIGINT);
-    buf.setInt32(off + 4, slotView.getInt32(0, true));
-    buf.setInt32(off + 8, slotView.getInt32(4, true));
-    buf.setInt32(off + 12, 0);
+    const o = buf.localOffset(off);
+    if (o > buf.slotLimit) return writeSlot(buf, off, bigintSlot(value));
+    const v = buf.viewAt(off);
+    v.setInt32(o, TYPE_BIGINT, true);
+    v.setBigInt64(o + 4, value, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1182,10 +1229,26 @@ export class SharedMemory {
     index: number,
     value: string,
   ): boolean {
+    if (value.length > 11) return false;
+    const buf = this.arrayTable;
+    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
+    const o = buf.localOffset(off);
+    if (packAsciiInline(value) && o <= buf.slotLimit) {
+      const v = buf.viewAt(off);
+      v.setInt32(o, TYPE_INLINE_STRING, true);
+      v.setInt32(o + 4, packed[0]!, true);
+      v.setInt32(o + 8, packed[1]!, true);
+      v.setInt32(o + 12, packed[2]!, true);
+      return true;
+    }
+    return this.updateArrayInlineStringSlotUtf8(off, value);
+  }
+
+  /** Slow path of `updateArrayInlineStringSlot`. */
+  private updateArrayInlineStringSlotUtf8(off: number, value: string): boolean {
     const bytes = this.encoder.encode(value);
     if (bytes.byteLength > 11) return false;
     const buf = this.arrayTable;
-    const off = ref.offset + ARRAY_HEADER + index * SLOT_SIZE;
     buf.setInt32(off, TYPE_INLINE_STRING);
     let a = 0;
     let b = 0;
@@ -1310,12 +1373,14 @@ export class SharedMemory {
    * writes of the generic path.
    */
   updateNumberSlot(offset: number, value: number): void {
-    slotView.setFloat64(0, value, true);
     const buf = this.dataTable;
-    buf.setInt32(offset, TYPE_NUMBER);
-    buf.setInt32(offset + 4, slotView.getInt32(0, true));
-    buf.setInt32(offset + 8, slotView.getInt32(4, true));
-    buf.setInt32(offset + 12, 0);
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return writeSlot(buf, offset, numberSlot(value));
+    const v = buf.viewAt(offset);
+    v.setInt32(o, TYPE_NUMBER, true);
+    // The two 32-bit payload halves a/b are exactly the little-endian float64.
+    v.setFloat64(o + 4, value, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1324,10 +1389,13 @@ export class SharedMemory {
    */
   updateBooleanSlot(offset: number, value: boolean): void {
     const buf = this.dataTable;
-    buf.setInt32(offset, TYPE_BOOLEAN);
-    buf.setInt32(offset + 4, value ? 1 : 0);
-    buf.setInt32(offset + 8, 0);
-    buf.setInt32(offset + 12, 0);
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return writeSlot(buf, offset, booleanSlot(value));
+    const v = buf.viewAt(offset);
+    v.setInt32(o, TYPE_BOOLEAN, true);
+    v.setInt32(o + 4, value ? 1 : 0, true);
+    v.setInt32(o + 8, 0, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1335,12 +1403,13 @@ export class SharedMemory {
    * avoiding the ValueSlot object allocation of the generic path.
    */
   updateBigIntSlot(offset: number, value: bigint): void {
-    slotView.setBigInt64(0, value, true);
     const buf = this.dataTable;
-    buf.setInt32(offset, TYPE_BIGINT);
-    buf.setInt32(offset + 4, slotView.getInt32(0, true));
-    buf.setInt32(offset + 8, slotView.getInt32(4, true));
-    buf.setInt32(offset + 12, 0);
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return writeSlot(buf, offset, bigintSlot(value));
+    const v = buf.viewAt(offset);
+    v.setInt32(o, TYPE_BIGINT, true);
+    v.setBigInt64(o + 4, value, true);
+    v.setInt32(o + 12, 0, true);
   }
 
   /**
@@ -1352,6 +1421,24 @@ export class SharedMemory {
    * Returns true if the string fit inline; false if it must go to the heap.
    */
   updateInlineStringSlot(offset: number, value: string): boolean {
+    // Every UTF-8 sequence is at least one byte per UTF-16 unit, so a string
+    // longer than 11 units can never fit.
+    if (value.length > 11) return false;
+    const buf = this.dataTable;
+    const o = buf.localOffset(offset);
+    if (packAsciiInline(value) && o <= buf.slotLimit) {
+      const v = buf.viewAt(offset);
+      v.setInt32(o, TYPE_INLINE_STRING, true);
+      v.setInt32(o + 4, packed[0]!, true);
+      v.setInt32(o + 8, packed[1]!, true);
+      v.setInt32(o + 12, packed[2]!, true);
+      return true;
+    }
+    return this.updateInlineStringSlotUtf8(offset, value);
+  }
+
+  /** Slow path of `updateInlineStringSlot`: non-ASCII text or a straddling slot. */
+  private updateInlineStringSlotUtf8(offset: number, value: string): boolean {
     const bytes = this.encoder.encode(value);
     if (bytes.byteLength > 11) return false;
     const buf = this.dataTable;
@@ -1871,18 +1958,39 @@ export class SharedMemory {
 }
 
 function writeSlot(buf: GrowableBuffer, offset: number, slot: ValueSlot): void {
-  buf.setInt32(offset, slot.type);
-  buf.setInt32(offset + 4, slot.a);
-  buf.setInt32(offset + 8, slot.b);
-  buf.setInt32(offset + 12, slot.c);
+  const o = buf.localOffset(offset);
+  if (o > buf.slotLimit) {
+    // The slot straddles a chunk boundary (defragmentation packs blocks back
+    // to back): write field by field, each resolving its own chunk.
+    buf.setInt32(offset, slot.type);
+    buf.setInt32(offset + 4, slot.a);
+    buf.setInt32(offset + 8, slot.b);
+    buf.setInt32(offset + 12, slot.c);
+    return;
+  }
+  const v = buf.viewAt(offset);
+  v.setInt32(o, slot.type, true);
+  v.setInt32(o + 4, slot.a, true);
+  v.setInt32(o + 8, slot.b, true);
+  v.setInt32(o + 12, slot.c, true);
 }
 
 function readSlot(buf: GrowableBuffer, offset: number): ValueSlot {
+  const o = buf.localOffset(offset);
+  if (o > buf.slotLimit) {
+    return {
+      type: buf.getInt32(offset),
+      a: buf.getInt32(offset + 4),
+      b: buf.getInt32(offset + 8),
+      c: buf.getInt32(offset + 12),
+    };
+  }
+  const v = buf.viewAt(offset);
   return {
-    type: buf.getInt32(offset),
-    a: buf.getInt32(offset + 4),
-    b: buf.getInt32(offset + 8),
-    c: buf.getInt32(offset + 12),
+    type: v.getInt32(o, true),
+    a: v.getInt32(o + 4, true),
+    b: v.getInt32(o + 8, true),
+    c: v.getInt32(o + 12, true),
   };
 }
 
