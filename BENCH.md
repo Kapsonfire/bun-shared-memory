@@ -13,7 +13,11 @@ bun run bench
 
 This compares shared-memory access against native JS access for every
 supported data type and its arrays (primitives, arrays, objects). Results are
-reported as ops/sec and relative slowdown.
+reported as ops/sec and relative slowdown. Every measurement runs for at least
+1 s (shared and native each; a full run takes about 1.5 minutes). Before
+`perf/per-key-heap` it was 5 s: 5 fresh processes per case gave the same mean and
+the same run-to-run spread (0.3–3 %) at 5 s, 1 s and 0.5 s, so rows before and
+after that commit stay comparable. Differences below 5 % are variance either way.
 
 ## Results
 
