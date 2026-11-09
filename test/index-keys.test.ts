@@ -25,6 +25,22 @@ describe("Index Table with many keys", () => {
     expect(createMs).toBeLessThan(4000);
   });
 
+  test("key creation scales linearly (index keys are not interned)", () => {
+    const mem = new SharedMemory();
+    const time = (from: number, to: number) => {
+      const t0 = performance.now();
+      for (let i = from; i < to; i++) {
+        Shared(`scale-${i}`, { v: i }, { memory: mem });
+      }
+      return performance.now() - t0;
+    };
+    time(0, 5_000); // warm up
+    const small = time(5_000, 15_000);
+    const large = time(15_000, 65_000); // 5x more keys
+    // Linear growth predicts ~5x; the old LRU-eviction cost made this ~50x.
+    expect(large).toBeLessThan(small * 5 * 6 + 200);
+  });
+
   test("lookups see keys appended after an earlier lookup", () => {
     const mem = new SharedMemory();
     Shared("first", { v: 1 }, { memory: mem });

@@ -428,6 +428,8 @@ export class SharedMemory {
   private internCapacity: number;
   private readonly internMax: number;
   /** Fast path: the most recently interned string and its ref. */
+  /** Layout version the intern cache was filled under. */
+  private internLayoutVersion = 0;
   private lastInterned: string | undefined;
   private lastInternedRef: StringRef | undefined;
 
@@ -576,13 +578,34 @@ export class SharedMemory {
   }
 
   /**
-   * Optional callback that compacts the tables to reclaim dead space. Set by
-   * the `RefCountCoordinator` (main thread), which also broadcasts the new
-   * chunk lists to workers. Left `null` where no safe owner of defragmentation
-   * exists (standalone memory, worker threads).
+   * Callback that reclaims dead space when a write exhausts the budget.
+   * Defaults to {@link reclaimInPlace}, which every thread (including workers)
+   * can run on its own. The `RefCountCoordinator` replaces it on the main
+   * thread with a full defragmentation that also releases unused chunks and
+   * broadcasts the new chunk lists to the workers.
    */
-  reclaimHook: (() => void) | null = null;
+  reclaimHook: (() => void) | null = () => this.reclaimInPlace();
   private reclaiming = false;
+
+  /**
+   * Compact the tables in place to reclaim dead space, from any thread.
+   *
+   * Live data is moved to the front of each table and the shared used length
+   * shrinks, so subsequent allocations reuse the freed space. Chunk buffers are
+   * kept (their budget stays reserved until the main thread's maintenance
+   * releases them), so no other thread needs a chunk-list update. Runs under
+   * the shared lock after in-flight lock-free writes have finished; every
+   * thread's caches are invalidated through the layout version.
+   */
+  reclaimInPlace(): void {
+    this.setDefragmenting();
+    try {
+      this.waitForWritesToFinish();
+      this.withLock(() => this.defragment({ releaseChunks: false }));
+    } finally {
+      this.clearDefragmenting();
+    }
+  }
 
   /**
    * Run a write under the shared lock. If the write fails because the memory
@@ -769,7 +792,14 @@ export class SharedMemory {
    * re-copying the bytes. The cache grows dynamically up to `internMax` and
    * evicts the least-recently-used entry once it exceeds `internCapacity`.
    */
-  storeString(value: string): StringRef {
+  storeString(value: string, intern = true): StringRef {
+    // Cached refs point into the StringTable, which a defragmentation by any
+    // thread may compact: drop the cache when the layout version has moved.
+    const layout = Atomics.load(this.layoutVersion, 0);
+    if (layout !== this.internLayoutVersion) {
+      this.internLayoutVersion = layout;
+      this.clearInternCache();
+    }
     // Fast path: the same string as the previous call reuses its ref without
     // touching the LRU map (avoids the expensive delete+set on every hit).
     if (value === this.lastInterned) {
@@ -791,6 +821,10 @@ export class SharedMemory {
     const offset = this.stringTable.reserve(bytes.byteLength);
     this.stringTable.writeBytes(offset, bytes);
     const ref: StringRef = { offset, length: bytes.byteLength };
+    // One-off strings (index keys) are not worth caching: they would only
+    // evict the property names that really repeat, and every eviction scans
+    // the Map's deleted-entry tombstones (quadratic with many keys).
+    if (!intern) return ref;
 
     // Insert into the cache, growing capacity up to `internMax` before evicting.
     if (this.internCache.size >= this.internCapacity) {
@@ -1440,7 +1474,7 @@ export class SharedMemory {
 
   /** Insert a key → dataOffset mapping into the Index Table. */
   insert(key: string, dataOffset: number): void {
-    const keyRef = this.storeString(key);
+    const keyRef = this.storeString(key, false);
     // Inserts are serialized by the shared mutex (registerInitial/writeValue),
     // so the entry is fully written *before* the count is published. Readers
     // scanning the Index Table without the mutex therefore never observe a
@@ -1546,7 +1580,7 @@ export class SharedMemory {
    *
    * Must be called under the shared lock (or on a single thread).
    */
-  defragment(): {
+  defragment(options?: { releaseChunks?: boolean }): {
     indexTable: SharedArrayBuffer[];
     dataTable: SharedArrayBuffer[];
     stringTable: SharedArrayBuffer[];
@@ -1737,6 +1771,17 @@ export class SharedMemory {
 
     // Phase 8: Reclaim memory from inactive chunks (beyond the compacted
     // region). The Index Table is a single growable SAB and is never replaced.
+    // With `releaseChunks: false` the chunk buffers are kept (only the used
+    // length shrinks), so no other thread needs a chunk-list update: this is
+    // the "in place" mode any thread can run on its own.
+    if (options?.releaseChunks === false) {
+      return {
+        indexTable: this.indexTable.buffers,
+        dataTable: this.dataTable.buffers,
+        stringTable: this.stringTable.buffers,
+        arrayTable: this.arrayTable.buffers,
+      };
+    }
     return {
       indexTable: this.indexTable.releaseInactiveChunks(),
       dataTable: this.dataTable.releaseInactiveChunks(),

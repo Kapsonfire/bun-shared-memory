@@ -50,6 +50,11 @@ const THREAD_ID: number = (() => {
   return a[0]! & 0x7fffffff || 1;
 })();
 
+/** This thread's lock-owner id (what `Mutex.owner` reports while it holds one). */
+export function getThreadId(): number {
+  return THREAD_ID;
+}
+
 export interface MutexOptions {
   /** Lock-wait timeout in ms (`Infinity` = wait forever). */
   timeoutMs?: number;

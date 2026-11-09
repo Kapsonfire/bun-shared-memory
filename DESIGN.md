@@ -183,7 +183,10 @@ thread id, cell 2 the re-entrancy depth.
   `waitForWritesToFinish`) times out (default 30 s, `setDefaultLockTimeout`)
   with a `LockTimeoutError`, so a crashed lock holder cannot hang other
   threads. The mutex records its owner, so `forceUnlock(ownerId)` can recover
-  a lock held by a dead thread. On the browser main thread, where
+  a lock held by a dead thread; the `RefCountCoordinator` does this
+  automatically for a worker it unregisters (workers announce their owner id
+  in the handshake). Seqlock cells and the standalone `RWLock` have no owner
+  and rely on the timeout. On the browser main thread, where
   `Atomics.wait` is forbidden, waits fall back to a bounded busy-wait
   (`src/wait.ts`).
 
@@ -302,9 +305,12 @@ const v = counter.withReadLock((c) => c.read());
   decoding every key once per thread.
 - **Dead space in append-only tables**: Overwritten values leave dead blocks
   (the `free*` functions are no-ops). They are reclaimed by defragmentation,
-  which the `RefCountCoordinator` runs when a table fills up (default 80 %) and
-  immediately when a main-thread write exhausts the budget (`reclaimHook`,
-  retry once). Writes in worker threads rely on the main thread for this.
+  which the `RefCountCoordinator` runs when a table fills up (default 80 %).
+  A write that exhausts the budget does not wait for that timer: it runs
+  `reclaimHook` and retries once. On the main thread the hook is the
+  coordinator's full defragmentation (releases unused chunks and broadcasts the
+  new chunk lists); on every other thread it is `reclaimInPlace()`, which
+  compacts without replacing chunks, so no broadcast is needed.
 - **Write scalability**: all writes share one mutex, and defragmentation runs
   entirely under it. Per-key locking or striping would be a larger redesign.
 - **Buffer sizing/growth**: DataTable, StringTable, and ArrayTable are backed
