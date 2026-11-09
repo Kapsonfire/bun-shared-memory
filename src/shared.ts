@@ -1103,39 +1103,38 @@ function readObjectProp(
  * (cached by the caller, e.g. the accessor setter). Avoids the
  * `getObjectLayout` Map lookup + `properties.get` per write on the hot path.
  */
-function writeObjectSlot(
+/**
+ * Write `val` into the object property slot at `slotOffset` (fast paths for
+ * numbers, booleans, int64 bigints and inline strings, the general encode
+ * otherwise) without bumping the version; callers bump once per write.
+ */
+function storeObjectSlot(
   mem: SharedMemory,
-  key: string,
   slotOffset: number,
   val: unknown,
   arrayCapacity?: number,
-  target?: WriteTarget,
 ): void {
   if (typeof val === "number") {
     // Fast path: numbers need no old-slot read (freeSlotRefs is a no-op)
     // and no in-place string reuse; write the float64 directly.
     mem.updateNumberSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "boolean") {
     // Fast path: booleans need no old-slot read (freeSlotRefs is a no-op)
     // and no in-place string reuse; write the 4 Int32s directly.
     mem.updateBooleanSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64) {
     // Fast path: int64 bigints are written directly, avoiding the ValueSlot
     // object allocation of the generic path.
     mem.updateBigIntSlot(slotOffset, val);
-    bumpTarget(mem, key, target);
     return;
   }
   if (typeof val === "string") {
     // Fast path: short strings are written inline into the slot itself.
     if (mem.updateInlineStringSlot(slotOffset, val)) {
-      bumpTarget(mem, key, target);
       return;
     }
   }
@@ -1145,6 +1144,17 @@ function writeObjectSlot(
     slotOffset,
     encodeValue(mem, val, arrayCapacity, oldSlot),
   );
+}
+
+function writeObjectSlot(
+  mem: SharedMemory,
+  key: string,
+  slotOffset: number,
+  val: unknown,
+  arrayCapacity?: number,
+  target?: WriteTarget,
+): void {
+  storeObjectSlot(mem, slotOffset, val, arrayCapacity);
   bumpTarget(mem, key, target);
 }
 
@@ -1831,8 +1841,36 @@ function writeValueInner(
     }
     if (type === 5) {
       // Update existing object's property slots in place.
-      const properties = mem.readObject(existing);
       const valueObj = value as Record<string, unknown>;
+      const layout = getObjectLayout(mem, key);
+      if (layout !== null && layout.totalOffset === existing) {
+        // The cached layout holds the property names and slot offsets (the
+        // shape is fixed), so nothing is read back from the StringTable and no
+        // temporary arrays/sets are built. Validate first so a rejected write
+        // leaves the object untouched.
+        let present = 0;
+        for (const name of layout.properties.keys()) {
+          if (!(name in valueObj)) {
+            throw new TypeError(
+              `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+            );
+          }
+          present++;
+        }
+        let total = 0;
+        for (const _name in valueObj) total++;
+        if (total !== present) {
+          throw new TypeError(
+            `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+          );
+        }
+        for (const [name, slotOffset] of layout.properties) {
+          storeObjectSlot(mem, slotOffset, valueObj[name], arrayCapacity);
+        }
+        bumpTarget(mem, key, target);
+        return;
+      }
+      const properties = mem.readObject(existing);
       for (let i = 0; i < properties.length; i++) {
         const [name] = properties[i]!;
         if (!(name in valueObj)) {
