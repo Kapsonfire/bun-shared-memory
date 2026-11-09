@@ -1,3 +1,5 @@
+import { deadlineFor, waitUntil } from "./wait.ts";
+
 /**
  * A cross-worker notification primitive built on Atomics.
  *
@@ -33,7 +35,12 @@ export class Notifier {
     // pulse and blocks again instead of returning immediately — making the
     // notifier reusable (not single-shot).
     const snapshot = Atomics.load(this.cell, 0);
-    const result = Atomics.wait(this.cell, 0, snapshot, timeoutMs);
+    const result = waitUntil(
+      this.cell,
+      0,
+      snapshot,
+      deadlineFor(timeoutMs ?? Infinity),
+    );
     if (result === "not-equal") {
       // The value changed between our snapshot and the wait, meaning a
       // notification already arrived — treat it as a successful wake.
