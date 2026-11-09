@@ -153,6 +153,60 @@ function versionCellIndex(index: number): number {
  */
 const slotView = new DataView(new ArrayBuffer(8));
 
+/** Returned by `readPrimitiveAt`/`readArrayPrimitiveAt` for slots that are not plain primitives. */
+export const NOT_PRIMITIVE: unique symbol = Symbol("not-primitive");
+
+/**
+ * Decode a number, boolean, bigint, null or inline-string slot straight from
+ * the chunk view, without allocating a `ValueSlot`. Anything else (references
+ * to strings, arrays, objects) and slots straddling a chunk boundary return
+ * `NOT_PRIMITIVE` and take the general path.
+ */
+function readPrimitiveIn(
+  mem: SharedMemory,
+  buf: GrowableBuffer,
+  offset: number,
+): unknown {
+  const o = buf.localOffset(offset);
+  if (o > buf.slotLimit) return NOT_PRIMITIVE;
+  const v = buf.viewAt(offset);
+  switch (v.getInt32(o, true)) {
+    case TYPE_NUMBER:
+      return v.getFloat64(o + 4, true);
+    case TYPE_BOOLEAN:
+      return v.getInt32(o + 4, true) === 1;
+    case TYPE_BIGINT:
+      return v.getBigInt64(o + 4, true);
+    case TYPE_NULL:
+      return null;
+    case TYPE_INLINE_STRING:
+      return mem.readInlineString(
+        v.getInt32(o + 4, true),
+        v.getInt32(o + 8, true),
+        v.getInt32(o + 12, true),
+      );
+    case TYPE_STRING_REF:
+      return mem.readString({
+        offset: v.getInt32(o + 4, true),
+        length: v.getInt32(o + 8, true),
+      });
+    case TYPE_STRING_VALUE_REF:
+      return mem.readStringValue({
+        offset: v.getInt32(o + 4, true),
+        length: v.getInt32(o + 8, true),
+      });
+    case TYPE_BIGINT_STR:
+      return BigInt(
+        mem.readString({
+          offset: v.getInt32(o + 4, true),
+          length: v.getInt32(o + 8, true),
+        }),
+      );
+    default:
+      return NOT_PRIMITIVE;
+  }
+}
+
 /**
  * Pack an ASCII string of at most 11 characters into the three payload words of
  * an inline-string slot (bytes 0-3 in `a`, 4-7 in `b`, 8-10 and the length in
@@ -723,6 +777,28 @@ export class SharedMemory {
       this.reclaiming = false;
     }
     return this.withKeyLock(index, fn);
+  }
+
+  /**
+   * Lock the stripe of the key at Index Table position `index` and return it
+   * (`null` when this thread holds the global mutex and needs no stripe). Pair
+   * with `unlockKey` in a `try/finally`; unlike `withKeyLock` it needs no
+   * closure, which matters for short hot paths (and it never reclaims).
+   */
+  lockKey(index: number): Mutex | null {
+    if (this.globalDepth > 0) return null;
+    const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
+    stripe.lock();
+    this.lockDepth++;
+    return stripe;
+  }
+
+  /** Release a stripe taken with `lockKey`. */
+  unlockKey(stripe: Mutex | null): void {
+    if (stripe !== null) {
+      this.lockDepth--;
+      stripe.unlock();
+    }
   }
 
   /**
@@ -1356,6 +1432,45 @@ export class SharedMemory {
     const offset = this.dataTable.reserve(SLOT_SIZE);
     writeSlot(this.dataTable, offset, slot);
     return offset;
+  }
+
+  /**
+   * The primitive stored in the DataTable slot at `offset` (number, boolean,
+   * bigint, null, inline string), or `NOT_PRIMITIVE`. Allocation-free fast
+   * path for reads that miss the cache.
+   */
+  readPrimitiveAt(offset: number): unknown {
+    return readPrimitiveIn(this, this.dataTable, offset);
+  }
+
+  /**
+   * Element `index` of the array whose reference slot lives at DataTable
+   * offset `refSlotOffset`, read straight from its slot without decoding the
+   * rest of the array. Returns `undefined` when `index` is out of bounds (as
+   * a JS array would) and `NOT_PRIMITIVE` when the slot there is not an array
+   * reference or the element is not a primitive (nested array/object).
+   */
+  readArrayElementAt(refSlotOffset: number, index: number): unknown {
+    const dt = this.dataTable;
+    const o = dt.localOffset(refSlotOffset);
+    if (o > dt.slotLimit) return NOT_PRIMITIVE;
+    const v = dt.viewAt(refSlotOffset);
+    if (v.getInt32(o, true) !== TYPE_ARRAY_REF) return NOT_PRIMITIVE;
+    if (index >= v.getInt32(o + 8, true)) return undefined;
+    return readPrimitiveIn(
+      this,
+      this.arrayTable,
+      v.getInt32(o + 4, true) + ARRAY_HEADER + index * SLOT_SIZE,
+    );
+  }
+
+  /** Like `readPrimitiveAt`, for the array slot `index` of `ref`. */
+  readArrayPrimitiveAt(ref: ArrayRef, index: number): unknown {
+    return readPrimitiveIn(
+      this,
+      this.arrayTable,
+      ref.offset + ARRAY_HEADER + index * SLOT_SIZE,
+    );
   }
 
   /** Read a single value slot from the DataTable. */

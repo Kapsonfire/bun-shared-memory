@@ -34,6 +34,7 @@ import {
   type ObjectLayout,
   type StringRef,
   type ValueSlot,
+  NOT_PRIMITIVE,
   onMemoryDisposed,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
@@ -300,7 +301,14 @@ export type SharedRef<T> = [T] extends [object]
  */
 const readCache = new Map<
   string,
-  { version: number; value: unknown; index: number; cell: number }
+  {
+    version: number;
+    value: unknown;
+    index: number;
+    cell: number;
+    /** Version at which a single array element was read without caching. */
+    ev: number;
+  }
 >();
 
 // ---------------------------------------------------------------------------
@@ -337,22 +345,24 @@ function dropCellDepth(map: Map<number, number>, cell: number): void {
  * case the version is read directly.
  */
 function waitForVersionCell(mem: SharedMemory, cell: number): number {
+  let raw = Atomics.load(mem.versionView, cell);
+  // Common case: no lock bits set, so nobody (this thread included) holds a
+  // lock on the object. Checked first so the hot cache-hit read does not pay
+  // for the depth-map lookups below.
+  if ((raw & VERSION_LOCK_MASK) === 0) return raw >> VERSION_LOCK_SHIFT_BITS;
   if (writeCellDepths.has(cell) || readCellDepths.has(cell)) {
     // This worker already holds a lock on this cell (reentrant read): read the
     // live version directly, don't wait on our own lock.
-    return Atomics.load(mem.versionView, cell) >> VERSION_LOCK_SHIFT_BITS;
+    return raw >> VERSION_LOCK_SHIFT_BITS;
   }
-  let raw = Atomics.load(mem.versionView, cell);
-  if ((raw & VERSION_LOCK_MASK) !== 0) {
-    const timeoutMs = getDefaultLockTimeout();
-    const deadline = deadlineFor(timeoutMs);
-    do {
-      if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
-        throw new LockTimeoutError("object lock", timeoutMs);
-      }
-      raw = Atomics.load(mem.versionView, cell);
-    } while ((raw & VERSION_LOCK_MASK) !== 0);
-  }
+  const timeoutMs = getDefaultLockTimeout();
+  const deadline = deadlineFor(timeoutMs);
+  do {
+    if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+      throw new LockTimeoutError("object lock", timeoutMs);
+    }
+    raw = Atomics.load(mem.versionView, cell);
+  } while ((raw & VERSION_LOCK_MASK) !== 0);
   return raw >> VERSION_LOCK_SHIFT_BITS;
 }
 
@@ -973,12 +983,23 @@ function readProp(
   const cached = readCache.get(key);
   const raw =
     cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
-  const value =
+  let value: unknown;
+  if (
     cached !== undefined &&
     (raw & VERSION_LOCK_MASK) === 0 &&
     cached.version === raw >> VERSION_LOCK_SHIFT_BITS
-      ? cached.value
-      : readValue(mem, key);
+  ) {
+    value = cached.value;
+  } else {
+    // Miss (typically right after a write). A single element of an array need
+    // not decode the whole array.
+    const index = parseIndex(prop);
+    if (index >= 0) {
+      const element = tryReadElement(mem, key, null, index);
+      if (element !== NOT_PRIMITIVE) return element;
+    }
+    value = readValue(mem, key);
+  }
   if (Array.isArray(value)) {
     return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
   }
@@ -1016,17 +1037,28 @@ function readObjectProp(
   fieldCache: { version: number; value: unknown },
   version: number,
   arrayCapacity?: number,
+  knownSlotOffset?: number,
 ): unknown {
-  const layout = getObjectLayout(mem, key);
-  if (layout === null) {
-    // Not an object (shouldn't happen for an object accessor); fall back.
-    return readProp(mem, key, prop, arrayCapacity);
-  }
-  const slotOffset = layout.properties.get(prop);
+  let slotOffset = knownSlotOffset;
   if (slotOffset === undefined) {
-    throw new TypeError(
-      `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-    );
+    const layout = getObjectLayout(mem, key);
+    if (layout === null) {
+      // Not an object (shouldn't happen for an object accessor); fall back.
+      return readProp(mem, key, prop, arrayCapacity);
+    }
+    slotOffset = layout.properties.get(prop);
+    if (slotOffset === undefined) {
+      throw new TypeError(
+        `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+      );
+    }
+  }
+  // Allocation-free path for the common primitive slots.
+  const primitive = mem.readPrimitiveAt(slotOffset);
+  if (primitive !== NOT_PRIMITIVE) {
+    fieldCache.version = version;
+    fieldCache.value = primitive;
+    return primitive;
   }
   const slot = mem.readValueSlot(slotOffset);
   if (slot.type === TYPE_OBJECT_REF || slot.type === TYPE_KEY_REF) {
@@ -1313,7 +1345,13 @@ function createSharedRef<T>(
     // on every local write/update; cross-worker invalidation is detected by
     // the version check in the get handler.
     __cache: undefined as
-      | { version: number; value: unknown; index: number; cell: number }
+      | {
+          version: number;
+          value: unknown;
+          index: number;
+          cell: number;
+          ev: number;
+        }
       | undefined,
     // Cached DataTable offset for this key, valid only while the global
     // layout version is unchanged (i.e. no defragmentation has moved it).
@@ -1482,12 +1520,12 @@ function createSharedRef<T>(
       // synchronous and re-entrancy on the same accessor cannot happen inside
       // the body, so one slot per accessor is enough.
       let pending: unknown;
-      const writeBody = (): void => {
-        // Write directly to the cached slot offset when still valid, skipping
-        // the getObjectLayout Map lookup + properties.get. The layout version
-        // cannot change while the key's stripe is held (defrag takes every
-        // stripe), but the check keeps the read cache resilient.
-        const lv = mem.layoutVersionInLock();
+      /**
+       * The property's slot offset, cached per accessor and re-resolved when
+       * the global layout version `lv` changed (defragmentation or array
+       * growth moved blocks). Shared by the getter's miss path and the setter.
+       */
+      const resolveSlot = (lv: number): number => {
         if (slotLayoutVersion !== lv) {
           slotOffset = undefined;
           slotLayoutVersion = lv;
@@ -1508,7 +1546,19 @@ function createSharedRef<T>(
           }
           slotOffset = so;
         }
-        writeObjectSlot(mem, key, slotOffset, pending, arrayCapacity, target);
+        return slotOffset;
+      };
+      const writeBody = (): void => {
+        // The layout version cannot change while the key's stripe is held
+        // (defrag takes every stripe), so the plain read is enough here.
+        writeObjectSlot(
+          mem,
+          key,
+          resolveSlot(mem.layoutVersionInLock()),
+          pending,
+          arrayCapacity,
+          target,
+        );
       };
       Object.defineProperty(ref, name, {
         enumerable: true,
@@ -1538,6 +1588,7 @@ function createSharedRef<T>(
             fieldCache,
             version,
             arrayCapacity,
+            resolveSlot(mem.getLayoutVersion()),
           );
           if (Array.isArray(value)) {
             arrayProxy = value;
@@ -1631,7 +1682,13 @@ function readValue(
   mem: SharedMemory,
   key: string,
   cacheTarget?: {
-    __cache?: { version: number; value: unknown; index: number; cell: number };
+    __cache?: {
+      version: number;
+      value: unknown;
+      index: number;
+      cell: number;
+      ev: number;
+    };
   },
 ): unknown {
   // Inline the read-cache fast path (see readProp) to avoid the polymorphic
@@ -1677,7 +1734,7 @@ function readValue(
     return decodeValue(mem, mem.readValueSlot(offset));
   });
 
-  const entry = { version, value, index, cell };
+  const entry = { version, value, index, cell, ev: -1 };
   readCache.set(key, entry);
   if (cacheTarget) cacheTarget.__cache = entry;
   return value;
@@ -2068,6 +2125,76 @@ function readPathValue(
   return current;
 }
 
+/** Returned by `peekCached` when the whole-value cache cannot serve a read. */
+const CACHE_MISS: unique symbol = Symbol("cache-miss");
+
+/**
+ * The cached whole value of `key` when its cache entry is current (lock bits
+ * clear, version matching), else `CACHE_MISS`. The single lookup of the hit
+ * path, shared by callers that want to try something cheaper than a full
+ * decode before falling back to `readValue`.
+ */
+function peekCached(mem: SharedMemory, key: string): unknown {
+  const cached = readCache.get(key);
+  if (cached === undefined) return CACHE_MISS;
+  const raw = Atomics.load(mem.versionView, cached.cell);
+  if (
+    (raw & VERSION_LOCK_MASK) === 0 &&
+    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
+  ) {
+    return cached.value;
+  }
+  return CACHE_MISS;
+}
+
+/**
+ * A read of one array element that missed the whole-value cache (it follows a
+ * write): read just that element's slot, without decoding the whole root value
+ * (a large array or object decoded for one element is what made such reads
+ * slow). `name` is `null` for a top-level array, or the array property of an
+ * object value. The first miss at a given version takes this path; a second
+ * miss at the same version returns `NOT_PRIMITIVE` so the caller decodes the
+ * value once and fills the cache, keeping read-heavy loops on the fast cached
+ * path. Also returns `NOT_PRIMITIVE` when the general path is needed (first
+ * access, a held object lock, nested array/object elements, other shapes);
+ * `undefined` means the index is out of bounds.
+ */
+function tryReadElement(
+  mem: SharedMemory,
+  key: string,
+  name: string | null,
+  index: number,
+): unknown {
+  const cached = readCache.get(key);
+  if (cached === undefined) return NOT_PRIMITIVE;
+  const raw = Atomics.load(mem.versionView, cached.cell);
+  if ((raw & VERSION_LOCK_MASK) !== 0) return NOT_PRIMITIVE;
+  const version = raw >> VERSION_LOCK_SHIFT_BITS;
+  if (cached.version === version || cached.ev === version) {
+    return NOT_PRIMITIVE;
+  }
+  cached.ev = version;
+  // Consistent against concurrent writers of this key, like the whole-value
+  // read, but without a closure.
+  const stripe = mem.lockKey(cached.index);
+  try {
+    let refSlotOffset: number;
+    if (name === null) {
+      const offset = mem.lookupByIndex(cached.index);
+      if (offset === null) return NOT_PRIMITIVE;
+      refSlotOffset = offset;
+    } else {
+      const layout = getObjectLayout(mem, key);
+      const so = layout === null ? undefined : layout.properties.get(name);
+      if (so === undefined) return NOT_PRIMITIVE;
+      refSlotOffset = so;
+    }
+    return mem.readArrayElementAt(refSlotOffset, index);
+  } finally {
+    mem.unlockKey(stripe);
+  }
+}
+
 /**
  * Array index encoded in a property key, or -1 if `prop` is not a non-empty
  * string of decimal digits (the same set the former `/^\d+$/` test accepted).
@@ -2316,7 +2443,25 @@ function createArrayProxy(
       }
       const index = parseIndex(arrProp);
       if (index >= 0) {
-        const element = readArrayValue(mem, locator)[index];
+        let root = peekCached(mem, key);
+        if (root === CACHE_MISS) {
+          // Miss (typically right after a write). For a one-step path to an
+          // array property, read just the element instead of decoding the
+          // whole root object.
+          if (locator.path.length === 1) {
+            const step = locator.path[0]!;
+            if (step.kind === "prop") {
+              const fast = tryReadElement(mem, key, step.name, index);
+              if (fast !== NOT_PRIMITIVE) return fast;
+            }
+          }
+          root = readValue(mem, key);
+        }
+        const rootArray = readPathValue(mem, locator, root);
+        if (!Array.isArray(rootArray)) {
+          throw new TypeError("Value is not an array");
+        }
+        const element = rootArray[index];
         if (Array.isArray(element)) {
           return createArrayProxy(
             mem,
