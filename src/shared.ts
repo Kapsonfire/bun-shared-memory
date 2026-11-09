@@ -10,7 +10,6 @@ import {
   TYPE_BIGINT_STR,
   TYPE_INLINE_STRING,
   TYPE_KEY_REF,
-  TYPE_NULL,
   TYPE_OBJECT_REF,
   TYPE_STRING_REF,
   TYPE_STRING_VALUE_REF,
@@ -28,11 +27,9 @@ import {
   nullSlot,
   numberSlot,
   objectRefSlot,
-  stringRefSlot,
   stringValueRefSlot,
   type ArrayRef,
   type ObjectLayout,
-  type StringRef,
   type ValueSlot,
   NOT_PRIMITIVE,
   onMemoryDisposed,
@@ -816,7 +813,7 @@ function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
       // (self/mutual references), so cycle tracking starts here. Plain decoded
       // values are trees, which keeps the common case (no references) free of
       // the tracking map and its allocations.
-      const map = (seen ??= new Map<object, unknown>());
+      const map = seen ?? new Map<object, unknown>();
       const cached = map.get(value);
       if (cached !== undefined) return cached;
       const copy = Object.assign({} as Record<string, unknown>, value);
