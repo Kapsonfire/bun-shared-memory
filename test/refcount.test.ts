@@ -633,3 +633,133 @@ describe("RefCount ring: a full ring does not wait for the timer", () => {
     expect(elapsed).toBeLessThan(5000);
   }, 20000);
 });
+
+describe("RefCount ring: producers that die mid-push", () => {
+  const SRC = new URL("../src/refcount.ts", import.meta.url).href;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  test("a slot reserved but never published is skipped, but only after a worker died", async () => {
+    const buf = new RefCountBuffer(undefined, { ringSize: 8, stallMs: 30 });
+    const view = new Int32Array(buf.sab);
+    Atomics.add(view, 0, 1); // a producer reserved position 0 and "died"
+    buf.pushEvent(3, 1, 5); // a live producer publishes position 1
+
+    // Without any worker death the slot is never skipped: its producer might
+    // just be slow, and skipping would corrupt the slot (see `popEvent`).
+    expect(buf.popEvent()).toBeNull();
+    await sleep(60);
+    expect(buf.popEvent()).toBeNull();
+    expect(buf.abandonedSlots).toBe(0);
+
+    // After a worker death the stuck slot is skipped once it stayed silent for
+    // `stallMs`, and the event behind it is delivered.
+    buf.noteWorkerDeath();
+    expect(buf.popEvent()).toBeNull(); // starts the stall timer
+    // The slot must not be skipped before `stallMs` has really passed: a live
+    // producer that was merely slow would lose its slot (regression: the
+    // second look used to skip it immediately).
+    expect(buf.popEvent()).toBeNull();
+    expect(buf.popEvent()).toBeNull();
+    expect(buf.abandonedSlots).toBe(0);
+    await sleep(60);
+    expect(buf.popEvent()).toEqual({ workerId: 3, op: 1, objectId: 5 });
+    expect(buf.abandonedSlots).toBe(1);
+  });
+
+  test("producers waiting on a full ring behind a dead slot lose no event", async () => {
+    // Ring of 8 slots: position 0 is dead, a live worker then pushes 40 events
+    // (the ring is full after 7 of them, the rest block until the consumer
+    // moves on). Skipping the dead slot must not also skip the slots of the
+    // producers that are still waiting to be re-armed.
+    const RING = 8;
+    const EVENTS = 40;
+    const buf = new RefCountBuffer(undefined, { ringSize: RING, stallMs: 50 });
+    const view = new Int32Array(buf.sab);
+    Atomics.add(view, 0, 1); // dead producer at position 0
+    const code = `
+      import { RefCountBuffer } from ${JSON.stringify(SRC)};
+      self.onmessage = (e) => {
+        const b = new RefCountBuffer(e.data.sab, { ringSize: ${RING} });
+        for (let i = 1; i <= ${EVENTS}; i++) b.pushEvent(1, 1, i);
+        self.postMessage("done");
+      };
+    `;
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+    worker.postMessage({ sab: buf.sab });
+    buf.noteWorkerDeath();
+    const seen: number[] = [];
+    const deadline = performance.now() + 10_000;
+    while (seen.length < EVENTS && performance.now() < deadline) {
+      let ev = buf.popEvent();
+      while (ev !== null) {
+        seen.push(ev.objectId);
+        ev = buf.popEvent();
+      }
+      await sleep(5);
+    }
+    worker.terminate();
+    expect(seen).toEqual(Array.from({ length: EVENTS }, (_, i) => i + 1));
+    expect(buf.abandonedSlots).toBe(1);
+  }, 20000);
+
+  test("workers killed in the middle of pushing never wedge the ring", async () => {
+    const mem = new SharedMemory();
+    const coordinator = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: true,
+      maintenanceInterval: 50,
+    });
+    const producer = (finite: boolean) => `
+      import { RefCountBuffer } from ${JSON.stringify(SRC)};
+      self.onmessage = (e) => {
+        const b = new RefCountBuffer(e.data.sab);
+        postMessage("go");
+        ${
+          finite
+            ? 'for (let i = 0; i < 20000; i++) { b.pushEvent(1, 1, 7); b.pushEvent(1, 0, 7); } postMessage("done");'
+            : "for (;;) { b.pushEvent(1, 1, 7); b.pushEvent(1, 0, 7); }"
+        }
+      };
+    `;
+    const spawn = (finite: boolean) =>
+      new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(producer(finite)),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+    // Kill endless producers at random moments; some die between reserving a
+    // slot and publishing it.
+    for (let round = 0; round < 6; round++) {
+      const w = spawn(false);
+      coordinator.registerWorker(w);
+      await new Promise<void>((resolve) => {
+        w.onmessage = () => resolve();
+        w.postMessage({ sab: coordinator.sab });
+      });
+      await sleep(3 + Math.random() * 10);
+      w.terminate();
+    }
+    // A fresh producer must still get all its events through.
+    const fresh = spawn(true);
+    coordinator.registerWorker(fresh);
+    const finished = await Promise.race([
+      new Promise<boolean>((resolve) => {
+        fresh.onmessage = (e) => {
+          if (e.data === "done") resolve(true);
+        };
+        fresh.postMessage({ sab: coordinator.sab });
+      }),
+      sleep(20_000).then(() => false),
+    ]);
+    fresh.terminate();
+    coordinator.stopAutoMaintenance();
+    expect(finished).toBe(true);
+  }, 40000);
+});
