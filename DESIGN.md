@@ -291,25 +291,48 @@ bits 2.. (0xFFFFFFFC) VERSION     logical version, bumped by 4 on each write
   leaves lock bits untouched.
 - `getVersion` returns `cell >>> 2`, stripping the lock bits transparently
   so existing callers and tests remain correct.
-- **Plain reads** (`readValue`, property accessors, `readProp`): a single
-  `Atomics.load`. If the result's lock bits are clear and the masked version
-  matches `fieldCache.version`, the cached value is returned. If a lock bit
-  is set the reader spins/`Atomics.wait`s until the cell is free, then
-  re-reads. The reader never sets a lock bit itself.
+- **Ordinary writes use the same cell as a seqlock writer.** While a write
+  holds its key's stripe it also sets the WRITER bit (`Atomics.or`), writes, and
+  ends with one `Atomics.add(cell, 3)` that bumps the version and clears the bit
+  (`SharedMemory.withKeyWrite`). Nested writes of the same key add no second
+  mark, and the version bumps inside the write are skipped (`bumpVersion`
+  recognises a cell this thread is writing). If the bit is already set by a
+  user-level lock held by another thread, the write waits for it (so ordinary
+  writes respect `withReadLock`/`withWriteLock`); if the lock is held by this
+  very thread, the write just proceeds.
+- **Cache hits** (`readProp`, `readValue`, property accessors): a **plain**
+  (non-atomic) read of the cell. If the lock bits are clear and the version
+  matches the cached one, the cached value is returned. An atomic load of a cache
+  line that many workers read does not scale (readers of one hot key got slower
+  with every worker), a plain load does; a stale read only delays seeing a
+  change. JavaScriptCore did not hoist the load out of a tight loop in our tests
+  (a change by another thread became visible after ~300 ms in a pure
+  `while (o.x === 0)` loop), but the language does not guarantee that.
+- **Lock-free decodes** (a property read that misses its cache): wait until the
+  lock bits are clear (spin, then 1 ms sleeps: an ordinary write does not call
+  `Atomics.notify`, a user-level lock does), remember the raw cell, decode the
+  slot, then re-read the cell with an atomic RMW (`Atomics.add(cell, 0)`, a full
+  barrier that keeps the data loads before it). If the cell changed, a write
+  overlapped the read: decode again, and after a few attempts read once under the
+  key's stripe. Without this a reader could return a string assembled from two
+  writes (offset of one value with the length of another). Whole-value reads
+  decode under the stripe instead and need no validation. Under a writer that
+  writes the same key without pause a lock-free read cannot complete between two
+  writes and ends up on the stripe path (a few µs).
 - **`withWriteLock` / `withRWLock`**: acquire the WRITER bit via CAS, run the
   callback, then release — a single `Atomics.add(cell, 3)` bumps the version
   **and** clears the WRITER bit atomically, so waiting readers immediately
-  observe the new version without a second atomic op.
+  observe the new version without a second atomic op. The callback receives the
+  shared reference itself, so `self.prop = x` inside it writes shared memory.
 - **`withReadLock`**: acquires the READLOCK bit via CAS, runs the callback,
   then releases with `Atomics.add(cell, -2)` (clears the bit, version
-  untouched). While held, plain reads on this object must wait.
-- **Re-entrancy** (same thread): tracked via module-level `writeCellDepths` /
-  `readCellDepths` maps keyed by cell index. `waitForVersionCell` returns the
-  live version immediately if the caller already holds the lock for this cell
-  (read-inside-write / read-inside-read).
-- **Wake-up**: both `acquireCellLock` and `waitForVersionCell` use
-  `Atomics.wait`; `releaseCellLock` calls `Atomics.notify` so sleepers wake
-  when the cell is released.
+  untouched). While held, readers that have to decode and ordinary writes on
+  this object wait.
+- **Re-entrancy** (same thread): tracked via the `writeCellDepths` /
+  `readCellDepths` maps (user-level locks) and the list of cells this thread is
+  writing, all keyed by cell index. A thread never waits for lock bits it set
+  itself (read-inside-write, a write inside its own lock, a lock requested from
+  inside `update()`).
 
 The old `SharedOptions.rwLock` field was removed because the cell-embedded
 Seqlock makes a separate lock buffer unnecessary for `with*` methods. The
@@ -322,8 +345,8 @@ const counter = Shared<number>("counter", 0);
 // Exclusive read-modify-write (atomic across workers):
 counter.withRWLock((c) => c.write(c.read() + 1));
 
-// Parallel readers — currently exclusive (one at a time), other plain reads
-// on the same object block until the lock is released.
+// Held read lock: other threads' ordinary writes (and reads that have to
+// decode) on this object wait until it is released.
 const v = counter.withReadLock((c) => c.read());
 ```
 

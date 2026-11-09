@@ -171,10 +171,16 @@ chosen by the key's position in the Index Table), so
 - key creation and defragmentation are the only operations that take the global
   mutex (defragmentation takes every stripe, so it excludes all writers).
 
+Reads never see half a write: a write marks the key's version cell while it runs
+and lock-free property reads validate it (a seqlock), so a string is never
+assembled from two writes. An ordinary write also waits for another thread's
+`withReadLock`/`withWriteLock` on the same key.
+
 > **Scalability.** With 8 workers each writing its own key the total throughput
 > is ~8× that of one worker (`bun run bench:contention`; with the former single
 > global write mutex it _dropped_ as writers were added). 8 workers hammering the
-> _same_ key stay at roughly single-writer speed. A single write costs ~25–40×
+> _same_ key stay at roughly single-writer speed. Reads of one hot key by many
+> workers scale linearly too (`bun run bench:readscale`). A single write costs ~25–40×
 > native. Reads of unchanged values are lock-free and fast (~3–5× native). After a
 > value changed, reading an **object property** is still lock-free (only that
 > property's slot is decoded), while reading a **whole value** (`read()`, a

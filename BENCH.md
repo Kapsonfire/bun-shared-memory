@@ -93,19 +93,22 @@ workers write one key. `spacing` is the number of filler keys between the
 benchmark keys (16 = hot keys on different cache lines, 0 = adjacent keys that
 share cache lines). Measured on macOS arm64 (14 cores), Bun 1.4.4.
 
-| Date       | Commit    | Change                                                                              | Spacing | Scenario | 1 worker | 2 workers | 4 workers | 8 workers |
-| ---------- | --------- | ----------------------------------------------------------------------------------- | ------- | -------- | -------- | --------- | --------- | --------- |
-| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                    | 16      | own key  | 32.69    | 13.26     | 10.76     | 8.66      |
-| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                    | 16      | same key | 33.00    | 10.41     | 10.83     | 8.36      |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 16      | own key  | 38.26    | 74.91     | 161.22    | 305.29    |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 16      | same key | 38.31    | 13.57     | 12.33     | 9.93      |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 0       | own key  | 37.69    | 27.99     | 38.01     | 48.61     |
-| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                         | 0       | same key | 38.06    | 12.78     | 12.33     | 9.90      |
-| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 16      | own key  | 54.96    | 113.63    | 225.33    | 441.03    |
-| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 16      | same key | 55.42    | 15.91     | 16.37     | 13.33     |
-| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | own key  | 56.24    | 37.77     | 46.02     | 60.62     |
-| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | same key | 55.15    | 16.24     | 17.13     | 12.99     |
-
+| Date       | Commit    | Change                                                                                  | Spacing | Scenario | 1 worker | 2 workers | 4 workers | 8 workers |
+| ---------- | --------- | --------------------------------------------------------------------------------------- | ------- | -------- | -------- | --------- | --------- | --------- |
+| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                        | 16      | own key  | 32.69    | 13.26     | 10.76     | 8.66      |
+| 2026-11-09 | `90f76e6` | Baseline: one global write mutex                                                        | 16      | same key | 33.00    | 10.41     | 10.83     | 8.36      |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                             | 16      | own key  | 38.26    | 74.91     | 161.22    | 305.29    |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                             | 16      | same key | 38.31    | 13.57     | 12.33     | 9.93      |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                             | 0       | own key  | 37.69    | 27.99     | 38.01     | 48.61     |
+| 2026-11-09 | `a75d092` | Per-key lock stripes, no atomic loads of shared cache lines                             | 0       | same key | 38.06    | 12.78     | 12.33     | 9.90      |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write     | 16      | own key  | 54.96    | 113.63    | 225.33    | 441.03    |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write     | 16      | same key | 55.42    | 15.91     | 16.37     | 13.33     |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write     | 0       | own key  | 56.24    | 37.77     | 46.02     | 60.62     |
+| 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write     | 0       | same key | 55.15    | 16.24     | 17.13     | 12.99     |
+| 2026-11-09 | `dc3a365` | Seqlock marker on ordinary writes (WRITER bit + validated reads), plain cache-hit reads | 16      | own key  | 46.80    | 94.64     | 185.96    | 360.05    |
+| 2026-11-09 | `dc3a365` | Seqlock marker on ordinary writes (WRITER bit + validated reads), plain cache-hit reads | 16      | same key | 47.26    | 12.73     | 14.63     | 11.18     |
+| 2026-11-09 | `dc3a365` | Seqlock marker on ordinary writes (WRITER bit + validated reads), plain cache-hit reads | 0       | own key  | 47.54    | 22.04     | 36.45     | 48.14     |
+| 2026-11-09 | `dc3a365` | Seqlock marker on ordinary writes (WRITER bit + validated reads), plain cache-hit reads | 0       | same key | 47.42    | 11.73     | 14.66     | 11.40     |
 
 Notes:
 
@@ -134,3 +137,39 @@ Notes:
   a single write: same-key writers are still serialized (~13-17 M/s in total)
   and adjacent keys (spacing 0) still share cache lines and scale poorly
   (8 workers: 60.6 M/s, 1.08× one worker).
+- Seqlock marker (`dc3a365`): every ordinary write now also sets and clears the
+  WRITER bit of the key's version cell (one more atomic operation), which is what
+  keeps lock-free readers from seeing half a write. Measured the same day against
+  `main` (`e27d4cd`): own key, spacing 16: 55.7 / 112.5 / 229.3 / 448.0 M/s with
+  1 / 2 / 4 / 8 workers on `main` against 46.8 / 94.6 / 186.0 / 360.1 M/s now
+  (−16 … −20 %); spacing 0: 54.7 / 31.4 / 46.0 / 62.3 → 47.5 / 22.0 / 36.5 /
+  48.1; same key: 55.0 / 12.5 / 16.8 / 12.6 → 47.3 / 12.7 / 14.6 / 11.2. Scaling
+  stays near linear (8 workers = 7.7× one worker).
+
+## Read scaling benchmark
+
+`bun run bench:readscale [workers]` (see `bench/readscale.ts`): several workers
+read one object property in a loop for 1.2 s each (cache hits), the table shows
+the **total** throughput in M reads/s. "own key" = every worker reads its own
+key, "same key" = all workers read one key (many workers reading one shared
+object). Measured on macOS arm64 (14 cores), Bun 1.4.4.
+
+| Date       | Commit    | Change                                                  | Scenario | 1 worker | 2 workers | 4 workers | 8 workers |
+| ---------- | --------- | ------------------------------------------------------- | -------- | -------- | --------- | --------- | --------- |
+| 2026-11-09 | `e27d4cd` | `main`: cache hit loads the version with `Atomics.load` | own key  | 222      | 434       | 883       | 1259      |
+| 2026-11-09 | `e27d4cd` | `main`: cache hit loads the version with `Atomics.load` | same key | 226      | 89        | 50        | 27        |
+| 2026-11-09 | `dc3a365` | Cache hit reads the version with a plain load           | own key  | 229      | 444       | 879       | 1722      |
+| 2026-11-09 | `dc3a365` | Cache hit reads the version with a plain load           | same key | 229      | 437       | 889       | 1751      |
+
+Notes:
+
+- On `main` readers of the **same** key got slower with every worker added (226 →
+  27 M/s at 8 workers, 8× below a single worker): an atomic load of a cache line
+  that several workers read does not scale in Bun/JavaScriptCore (the same effect
+  limited the write path before, see the contention section). A plain read of the
+  version cell scales linearly (8 workers = 7.6× one worker), and the
+  single-thread read hit became faster as well (property read 2.7 → 1.9 ns).
+- The plain read can be stale for a moment, and the language does not forbid an
+  engine from hoisting it out of a loop. JavaScriptCore did not in our test
+  (`test/seqlock.test.ts`: a change by another thread became visible to a tight
+  loop of cache hits within the timeout).
