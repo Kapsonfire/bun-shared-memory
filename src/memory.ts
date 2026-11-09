@@ -6,6 +6,12 @@ import {
   nextPowerOfTwo,
 } from "./growable-buffer.ts";
 import { isMainThread } from "./env.ts";
+import {
+  LockTimeoutError,
+  deadlineFor,
+  getDefaultLockTimeout,
+  waitSliceUntil,
+} from "./wait.ts";
 import { Mutex, StripeLock } from "./mutex.ts";
 
 /**
@@ -105,6 +111,15 @@ export function versionFromCell(raw: number): number {
 export function isVersionCellLocked(raw: number): boolean {
   return (raw & VERSION_LOCK_MASK) !== 0;
 }
+/**
+ * Re-entrancy depth, per version cell, of the user-level write locks
+ * (`withWriteLock`/`withRWLock`) this thread holds. Per thread: a lock is only
+ * held across a synchronous call stack.
+ */
+export const writeCellDepths = new Map<number, number>();
+/** Same for the user-level read locks (`withReadLock`) this thread holds. */
+export const readCellDepths = new Map<number, number>();
+
 const MAX_INDEX_TABLE_BYTES = 4 * 1024 * 1024 * 1024;
 
 /**
@@ -792,6 +807,132 @@ export class SharedMemory {
     if (stripe !== null) {
       this.lockDepth--;
       stripe.unlock();
+    }
+  }
+
+  /**
+   * Version cells this thread is currently writing with an ordinary write (it
+   * set their WRITER bit; see `withKeyWrite`), innermost last. `writingTop` is
+   * the innermost one (-1 = none), kept apart for a cheap comparison.
+   */
+  private readonly writingCells: number[] = [];
+  private writingTop = -1;
+
+  /** Whether this thread is in the middle of an ordinary write of `cell`'s object. */
+  isWritingCell(cell: number): boolean {
+    return (
+      this.writingTop === cell ||
+      (this.writingCells.length > 1 && this.writingCells.includes(cell))
+    );
+  }
+
+  /**
+   * Whether this thread itself holds the object behind version cell `cell`:
+   * it is in the middle of writing it, or holds a user-level lock on it.
+   * Waiting for the lock bits of such an object would wait for ourselves.
+   */
+  holdsCell(cell: number): boolean {
+    return (
+      this.writingTop === cell ||
+      (this.writingCells.length > 1 && this.writingCells.includes(cell)) ||
+      writeCellDepths.has(cell) ||
+      readCellDepths.has(cell)
+    );
+  }
+
+  /**
+   * Like `withKeyLock`, for a write: additionally marks the key's version cell
+   * as "being written" (WRITER bit) while `fn` runs and bumps the version when
+   * it is done (one atomic add that also clears the bit). That is the writer
+   * half of a seqlock: a lock-free reader that decodes the value while this
+   * runs sees either the lock bit or a changed version afterwards and decodes
+   * again, so it never returns a value assembled from two writes. Nested
+   * writes of the same key (an `update()` callback, a user-level lock held by
+   * this thread) add no second mark. Waits for a user-level lock held by
+   * another thread, which makes ordinary writes respect `withReadLock` /
+   * `withWriteLock`.
+   */
+  withKeyWrite<T>(index: number, fn: () => T): T {
+    if (this.globalDepth > 0) return fn();
+    const cell = versionCellIndex(index);
+    const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
+    stripe.lock();
+    this.lockDepth++;
+    let began = false;
+    try {
+      // Only an ordinary write of this same cell by this thread is checked up
+      // front (a cheap array test). A user-level lock held by this thread shows
+      // up as set lock bits in `beginCellWrite`, whose slow path recognises it:
+      // the common case pays for no map lookups.
+      if (!this.isWritingCell(cell)) {
+        began = this.beginCellWrite(cell);
+        if (began) {
+          this.writingCells.push(cell);
+          this.writingTop = cell;
+        }
+      }
+      return fn();
+    } catch (error) {
+      if (
+        !(error instanceof BudgetExceededError) ||
+        this.reclaimHook === null ||
+        this.reclaiming ||
+        this.lockDepth !== 1
+      ) {
+        throw error;
+      }
+      // Fall through to the reclaim below, after the stripe is released.
+    } finally {
+      if (began) {
+        this.writingCells.pop();
+        this.writingTop =
+          this.writingCells.length === 0
+            ? -1
+            : this.writingCells[this.writingCells.length - 1]!;
+        // Version + 1 and clear the WRITER bit in one add.
+        Atomics.add(this.versionView, cell, VERSION_STEP - WRITER_BIT);
+      }
+      this.lockDepth--;
+      stripe.unlock();
+    }
+    this.reclaiming = true;
+    try {
+      this.reclaimHook();
+    } finally {
+      this.reclaiming = false;
+    }
+    return this.withKeyWrite(index, fn);
+  }
+
+  /** Set the WRITER bit of `cell`; true if this call set it (and must clear it). */
+  private beginCellWrite(cell: number): boolean {
+    const old = Atomics.or(this.versionView, cell, WRITER_BIT);
+    if ((old & VERSION_LOCK_MASK) === 0) return true;
+    return this.beginCellWriteSlow(cell, old);
+  }
+
+  /**
+   * `beginCellWrite` found a lock bit already set (`old` is the cell before our
+   * `or`). Undo our bit if it was ours, then either recognise a lock this
+   * thread holds itself or wait for the other holder to release.
+   */
+  private beginCellWriteSlow(cell: number, old: number): boolean {
+    const view = this.versionView;
+    const timeoutMs = getDefaultLockTimeout();
+    const deadline = deadlineFor(timeoutMs);
+    for (;;) {
+      if ((old & WRITER_BIT) === 0) Atomics.and(view, cell, ~WRITER_BIT);
+      // A user-level lock held by this very thread: we are inside it.
+      if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return false;
+      let raw = Atomics.load(view, cell);
+      while ((raw & VERSION_LOCK_MASK) !== 0) {
+        if (waitSliceUntil(view, cell, raw, deadline) === "timed-out") {
+          throw new LockTimeoutError("object lock", timeoutMs);
+        }
+        raw = Atomics.load(view, cell);
+      }
+      old = Atomics.or(view, cell, WRITER_BIT);
+      if ((old & VERSION_LOCK_MASK) === 0) return true;
     }
   }
 
@@ -1815,7 +1956,16 @@ export class SharedMemory {
 
   /** Increment the version for a key index, invalidating read caches. */
   bumpVersion(index: number): void {
-    Atomics.add(this.versionView, versionCellIndex(index), VERSION_STEP);
+    const cell = versionCellIndex(index);
+    // A key this thread is writing (`withKeyWrite`) gets its version bump when
+    // that write ends; a second one now would only waste an atomic.
+    if (
+      cell === this.writingTop ||
+      (this.writingCells.length > 1 && this.writingCells.includes(cell))
+    ) {
+      return;
+    }
+    Atomics.add(this.versionView, cell, VERSION_STEP);
   }
 
   /** Insert a key → dataOffset mapping into the Index Table. */

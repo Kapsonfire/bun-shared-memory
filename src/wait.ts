@@ -86,3 +86,25 @@ export function waitUntil(
   }
   return "not-equal";
 }
+
+/**
+ * Like `waitUntil`, but sleeps at most `sliceMs` at a time and returns
+ * `"timed-out"` only when the overall `deadline` has passed. For waiting on a
+ * lock bit whose releaser may not call `Atomics.notify`: an object being
+ * written by an ordinary write only flips the version cell, so a sleeper has to
+ * look again after a short slice instead of relying on a wake-up.
+ */
+export function waitSliceUntil(
+  view: Int32Array,
+  index: number,
+  expected: number,
+  deadline: number,
+  sliceMs = 1,
+): "ok" | "not-equal" | "timed-out" {
+  const sliceEnd = Math.min(deadline, performance.now() + sliceMs);
+  const result = waitUntil(view, index, expected, sliceEnd);
+  if (result === "timed-out") {
+    return performance.now() >= deadline ? "timed-out" : "ok";
+  }
+  return result;
+}
