@@ -48,7 +48,7 @@ The `Δ vs prev` column compares each row against the previous version:
 - `+X%` = performance gain (faster)
 - `-X%` = performance loss (slower)
 - `0%` = no measurable change
-- `±<5% (Varianz)` = change under 5% is treated as test variance, not a real
+- `±<5% (variance)` = change under 5% is treated as test variance, not a real
   change. Document it as such rather than as a gain/loss.
 
 Always record the actual measured numbers, even when the delta is expected to

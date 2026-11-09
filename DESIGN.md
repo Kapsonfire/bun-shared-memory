@@ -27,9 +27,18 @@ The core idea: **SharedArrayBuffers are growable** (via `grow()`, when created w
 
 Maps a shared object's key to its location in the DataTable.
 
-- A fixed-size table of entries.
-- Each entry: `{ keyHash, dataOffset }` (or a hash map / open-addressing scheme).
-- Used by `Shared(key, ...)` to look up whether a value already exists and where its data lives.
+- A single growable `SharedArrayBuffer` (capped at 4 GiB). A 4-byte header
+  holds the entry count; entries follow, 16 bytes each (see layout below).
+- Keys are never removed or reordered, so a key's **index** (its position) is
+  stable for its lifetime. The index also addresses the key's **version cell**
+  (see Synchronization).
+- Lookup by key name: each `SharedMemory` keeps a per-instance
+  `Map<key, index>` that is filled incrementally from the entries added since
+  the last scan, so a lookup is O(1) amortized (every key string is decoded at
+  most once per thread).
+- An entry is written completely _before_ the entry count is published
+  (`Atomics.store`), so lock-free readers never see a half-initialized entry.
+  Inserts are serialized by the shared mutex.
 
 ### 2) DataTable
 
@@ -84,55 +93,99 @@ user.tags.push("b"); // appends to ArrayTable, updates DataTable ref
 
 ## Memory Layout Details
 
-### Index Table entry (fixed size)
+### Index Table entry (16 bytes)
 
 ```
-[0..3]   key hash (Int32)
-[4..7]   data offset (Int32) — into DataTable
+[0..3]   key string offset (Int32) — into StringTable
+[4..7]   key string length (Int32)
+[8..11]  data offset (Int32) — into DataTable (changes on defragmentation)
+[12..15] version cell (Int32) — version (bits 2..) + lock bits (bits 0..1)
 ```
 
-### DataTable value slot (fixed size)
+### DataTable value slot (16 bytes)
 
 ```
-[0..3]   type tag (Int32): 0=primitive, 1=string-ref, 2=array-ref, 3=object
-[4..7]   payload / reference
-[8..11]  payload / reference (for objects: property count; for strings/arrays: length)
+[0..3]   type tag (Int32)
+[4..7]   payload A
+[8..11]  payload B
+[12..15] payload C
 ```
 
-### StringTable entry
+| Tag | Type               | Payload                                                       |
+| --- | ------------------ | ------------------------------------------------------------- |
+| 0   | number             | float64 in A..B                                               |
+| 1   | boolean            | A = 0/1                                                       |
+| 2   | bigint             | int64 in A..B (values that fit in 64 bits)                    |
+| 3   | string ref         | A = offset, B = byte length (StringTable)                     |
+| 4   | array ref          | A = offset, B = count, C = capacity (ArrayTable)              |
+| 5   | object block       | see below (only at the start of an object block)              |
+| 6   | big bigint         | decimal string in the StringTable: A = offset, B = length     |
+| 8   | inline string      | up to 11 UTF-8 bytes in A..C, length in the top 4 bits of C   |
+| 9   | nested object      | A = DataTable offset of a nested object block                 |
+| 10  | live key reference | A = Index Table index of another shared key (nested `Shared`) |
+| 11  | null               | —                                                             |
+
+Short strings (up to 11 bytes) are stored **inline** in the slot, so writing
+them needs neither a heap allocation nor a StringTable write.
+
+### Object block (DataTable)
 
 ```
-[0..3]   byte offset (Int32) — into string byte region
-[4..7]   byte length (Int32)
+[0..3]   type = 5
+[4..7]   property count
+[8..11]  object id (for reference counting)
+[12..15] reserved
+then, per property: name ref (8 bytes: offset, length) + value slot (16 bytes)
 ```
 
-### ArrayTable entry
+The shape is fixed, so the offset of each property slot is stable (until
+defragmentation moves the block) and a single property is read or written
+without touching the others.
+
+### StringTable
+
+Raw UTF-8 bytes, append-only. A reference is `{ offset, byteLength }`. Strings
+are interned per thread (LRU), so repeated strings reuse one copy.
+
+### ArrayTable block
 
 ```
-[0..3]   element offset (Int32) — into element region
-[4..7]   element count (Int32)
+[0..3]   object id (for reference counting)
+then     capacity * 16-byte value slots (count of them are in use)
 ```
 
 ## Synchronization
 
-All shared-memory operations are protected by a re-entrant `Atomics`-based
-`Mutex` (`src/mutex.ts`). The mutex uses a single Int32 cell in a
-`SharedArrayBuffer` that encodes the lock state: **0** = free, **1** = held
-(no waiters), **2** = held (waiters present).
+**Writes** are serialized by one re-entrant, `Atomics`-based `Mutex`
+(`src/mutex.ts`), shared by all threads. **Reads are lock-free** as long as the
+value is unchanged: each key has a version cell, and a per-thread read cache
+is valid while the version matches (see V3 below). A read that misses its cache
+decodes the value under the mutex.
 
-- `lock()` claims the cell with `Atomics.compareExchange` (0 → 1). On failure
-  it marks the cell as "has waiters" (1 → 2) and falls back to `Atomics.wait`
-  so the thread sleeps instead of busy-spinning while the lock is held
-  elsewhere. The waiter re-checks the cell after marking it 2, so a release
-  between the failed acquire and the `wait` is not lost (the `wait` returns
-  immediately with "not-equal" and the loop retries).
-- `unlock()` releases the cell with `Atomics.exchange` (→ 0). It only calls
-  `Atomics.notify` when the previous value was 2 (waiters present), waking all
-  of them; in the uncontended case (cell was 1) the expensive `notify` is
-  skipped entirely.
-- Re-entrancy is tracked per-thread via a module-level depth map, so a locked
-  operation may safely call another locked operation (e.g. `updateValue`
-  calling `readValue`/`writeValue`).
+The mutex lives in a 12-byte `SharedArrayBuffer`: cell 0 is the state
+(**0** = free, **1** = held, **2** = held with waiters), cell 1 the owner
+thread id, cell 2 the re-entrancy depth.
+
+- `lock()` claims cell 0 with `Atomics.compareExchange` (0 → 1). On failure it
+  marks the cell as "has waiters" (1 → 2) and falls back to a bounded
+  `Atomics.wait`, so the thread sleeps instead of busy-spinning. The waiter
+  re-checks the cell after marking it 2, so a release between the failed
+  acquire and the `wait` is not lost.
+- `unlock()` clears owner and depth, then releases the cell with
+  `Atomics.exchange` (→ 0). It only calls `Atomics.notify` when the previous
+  value was 2 (waiters present).
+- **Re-entrancy** is recorded in the shared buffer itself (owner id + depth).
+  The owner id is cleared before every release, so it equals the calling
+  thread's id only while that thread really holds the lock. This also works
+  when several `Mutex` instances wrap the same buffer in one thread. Legacy
+  4-byte buffers fall back to per-instance depth tracking.
+- **Bounded waits.** Every lock wait (`Mutex`, `RWLock`, the object seqlock,
+  `waitForWritesToFinish`) times out (default 30 s, `setDefaultLockTimeout`)
+  with a `LockTimeoutError`, so a crashed lock holder cannot hang other
+  threads. The mutex records its owner, so `forceUnlock(ownerId)` can recover
+  a lock held by a dead thread. On the browser main thread, where
+  `Atomics.wait` is forbidden, waits fall back to a bounded busy-wait
+  (`src/wait.ts`).
 
 Logical operations (`readValue`, `writeValue`, `updateValue`, `mutateValue`)
 each acquire the lock once, so read-modify-write sequences (array `push`,
@@ -140,6 +193,15 @@ property assignment, `update`) are atomic across workers.
 
 `Notifier` (`src/notifier.ts`) wraps `Atomics.wait`/`Atomics.notify` for
 user-facing worker-to-worker signaling.
+
+### One SharedMemory per thread
+
+A thread holds exactly one `SharedMemory`. The per-thread caches (read, offset,
+layout, key index) are keyed by key name only, which is only sound with a single
+memory. A second instance throws until the first is `dispose()`d (which also
+clears the caches). A fresh memory (no `buffers`) can only be created on the
+**main thread**; workers rebuild it from the main thread's buffers via `init()`
+or `SharedMemory.fromBuffers()`.
 
 ### V2: Read/write lock (`RWLock`)
 
@@ -179,7 +241,7 @@ fall back to the shared `Mutex`, so they remain correct (if less parallel).
 
 ### V3: Seqlock embedded in the version cell
 
-From v1.0.1 onward the read/write lock lives in **each object's version cell**
+Since v1.1.0 the read/write lock lives in **each object's version cell**
 (`INDEX_VERSION_OFFSET` in the Index Table) instead of a separate `RWLock`
 buffer. A single `Atomics.load` yields both the version (high bits) and the
 lock state (low bits), so plain reads can check consistency without a mutex.
@@ -234,8 +296,17 @@ const v = counter.withReadLock((c) => c.read());
 
 ## Open Questions
 
-- **Index Table keying**: Currently a linear scan comparing stored key strings directly (O(n) lookup). A hash table could improve lookup for many keys — future optimization.
-- **Dead space in append-only tables**: Left as-is (no GC). Reclaiming dead space is a future optimization.
+- **Index Table keying**: Entries are stored in insertion order; name lookup
+  uses a per-instance `Map` filled incrementally from the table (O(1)
+  amortized). A hash table in shared memory would only be needed to avoid
+  decoding every key once per thread.
+- **Dead space in append-only tables**: Overwritten values leave dead blocks
+  (the `free*` functions are no-ops). They are reclaimed by defragmentation,
+  which the `RefCountCoordinator` runs when a table fills up (default 80 %) and
+  immediately when a main-thread write exhausts the budget (`reclaimHook`,
+  retry once). Writes in worker threads rely on the main thread for this.
+- **Write scalability**: all writes share one mutex, and defragmentation runs
+  entirely under it. Per-key locking or striping would be a larger redesign.
 - **Buffer sizing/growth**: DataTable, StringTable, and ArrayTable are backed
   by a chunked `GrowableBuffer`: all chunks are pre-allocated at construction
   (4 bytes each, `maxByteLength = chunkSize`, 32 MiB default) and activated on
