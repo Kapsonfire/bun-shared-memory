@@ -23,8 +23,11 @@ Key entry points:
 2. **Run the benchmark for every codebase change.** Run `bun run bench` (or
    `bun bench/bench.ts`). Record the results in the running table in
    `BENCH.md` (see below).
-3. **Typecheck.** Run `bun run typecheck` (`bun check`). Keep it clean.
-4. **Format.** Run `bun fmt` if formatting is expected.
+3. **Locking changes also need the contention benchmark.** If you touch locks,
+   the write path or defragmentation, additionally run
+   `bun run bench:contention` and record the numbers in `BENCH.md`.
+4. **Typecheck.** Run `bun run typecheck` (`bun check`). Keep it clean.
+5. **Format.** Run `bun fmt` if formatting is expected.
 
 ## Benchmark documentation (BENCH.md)
 

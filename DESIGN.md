@@ -156,15 +156,43 @@ then     capacity * 16-byte value slots (count of them are in use)
 
 ## Synchronization
 
-**Writes** are serialized by one re-entrant, `Atomics`-based `Mutex`
-(`src/mutex.ts`), shared by all threads. **Reads are lock-free** as long as the
-value is unchanged: each key has a version cell, and a per-thread read cache
-is valid while the version matches (see V3 below). A miss on an **object
-property** is still lock-free: only that property's slot is decoded and cached
-per property. A miss on a **whole value** (`read()`, a top-level primitive, or
-an array element) decodes it under the mutex.
+**Writes** to a key hold that key's **lock stripe**: one of 256 re-entrant
+`Atomics`-based `Mutex`es (`src/mutex.ts`), selected by `keyIndex & 255`.
+Writers to different keys run in parallel; writers to the same key (or to two
+keys that share a stripe) are serialized, so read-modify-write sequences on one
+value stay atomic. A cache miss on a **whole value** takes the same stripe.
+**Reads are lock-free** as long as the value is unchanged: each key has a
+version cell, and a per-thread read cache is valid while the version matches
+(see V3 below). A miss on an **object property** is lock-free as well: only that
+property's slot is decoded and cached per property.
 
-The mutex lives in a 12-byte `SharedArrayBuffer`: cell 0 is the state
+The **global mutex** (`memory.lock`) remains for the rare structural work: key
+creation (Index Table insert) and layout lookups. **Defragmentation** takes
+every stripe and then the global mutex (`withAllLocks`), so it excludes all
+writers. Lock order: stripes by ascending index, then the global mutex; code
+holding a stripe may take the global mutex, never the reverse. A thread that
+already holds the global mutex skips the stripe. Stripes and the global mutex
+live in one `SharedArrayBuffer` (`lock.buffer`, one 64-byte cache line per
+mutex), so sharing that buffer shares them all. A lock buffer that is too small
+(a plain 12-byte `Mutex`) degrades to a single global lock.
+
+A write that exhausts the memory budget releases its stripe, reclaims dead space
+(which takes every stripe) and retries once; only the outermost lock level does
+this.
+
+#### Scaling on shared cache lines
+
+In Bun/JavaScriptCore an `Atomics` access to a cache line that several workers
+touch does not scale, even a plain `Atomics.load` (measured: one worker 600 M
+loads/s, four workers 160 M/s in total), while atomics on a worker's own lines
+and plain reads scale linearly. The write path therefore avoids atomics on
+shared lines: "does this thread hold the global mutex?" is tracked per thread
+instead of reading the lock word, and the layout version is read with a plain
+load while a stripe is held (taking the lock is a full barrier). What remains
+shared is the per-key version cell and stripe, which only the writers of that
+key touch.
+
+Each mutex occupies 12 bytes: cell 0 is the state
 (**0** = free, **1** = held, **2** = held with waiters), cell 1 the owner
 thread id, cell 2 the re-entrancy depth.
 
@@ -313,8 +341,11 @@ const v = counter.withReadLock((c) => c.read());
   coordinator's full defragmentation (releases unused chunks and broadcasts the
   new chunk lists); on every other thread it is `reclaimInPlace()`, which
   compacts without replacing chunks, so no broadcast is needed.
-- **Write scalability**: all writes share one mutex, and defragmentation runs
-  entirely under it. Per-key locking or striping would be a larger redesign.
+- **Write scalability**: writes are striped per key, so independent writers
+  scale; writers of the same key are serialized. Defragmentation still stops
+  all writers (it takes every stripe). Neighbouring keys share cache lines
+  (16-byte Index Table entries, adjacent object blocks); padding them would
+  trade memory for less false sharing.
 - **Buffer sizing/growth**: DataTable, StringTable, and ArrayTable are backed
   by a chunked `GrowableBuffer`: all chunks are pre-allocated at construction
   (4 bytes each, `maxByteLength = chunkSize`, 32 MiB default) and activated on
