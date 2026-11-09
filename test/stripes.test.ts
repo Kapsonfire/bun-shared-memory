@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   Mutex,
-  RefCountCoordinator,
+  MaintenanceCoordinator,
   Shared,
   SharedMemory,
   getThreadId,
@@ -138,7 +138,7 @@ describe("per-key lock stripes", () => {
     const o = Shared("stripe-key", { n: 0 }, { memory: mem });
     const index = mem.lookupIndex("stripe-key")!;
     let recovered = false;
-    const coordinator = new RefCountCoordinator(mem, undefined, {
+    const coordinator = new MaintenanceCoordinator(mem, {
       autoMaintenance: false,
       onLockRecovered: () => {
         recovered = true;

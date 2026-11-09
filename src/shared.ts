@@ -36,8 +36,7 @@ import {
   readCellDepths,
   writeCellDepths,
 } from "./memory.ts";
-import type { RefCountTracker } from "./refcount.ts";
-import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
+import { getDefaultMemory } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -106,6 +105,22 @@ function writeLock<T>(
   return mem.withKeyWrite(index, fn);
 }
 
+/**
+ * Reject objects that are not plain data (Date, Map, Set, RegExp, typed
+ * arrays, Error, Promise, ...). Their state lives in internal slots, so
+ * `Object.entries` would see `{}` and the value would be stored as an empty
+ * object, silently losing its contents. Class instances with own data
+ * properties are still accepted and stored as plain objects.
+ */
+function assertPlainObject(value: object): void {
+  const tag = Object.prototype.toString.call(value);
+  if (tag !== "[object Object]") {
+    throw new TypeError(
+      `Cannot store ${tag.slice(8, -1)}: only primitives, bigints, arrays and plain objects are allowed (convert it first, e.g. Date -> number, Map -> Object.fromEntries)`,
+    );
+  }
+}
+
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
 const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = 2n ** 63n - 1n;
@@ -165,9 +180,23 @@ function encodeValue(
         // Nested arrays are stored as array-refs in the parent array's slots
         // (recursively). Elements may be any encodable value (primitives,
         // nested arrays, nested objects, or live shared references).
-        const slots = value.map((v) =>
-          encodeValue(mem, v, arrayCapacity, undefined, visited),
-        );
+        // A plain loop (not `map`) so holes in a sparse array are visited and
+        // rejected with a clear error instead of corrupting the slot list.
+        const slots: ValueSlot[] = new Array(value.length);
+        for (let i = 0; i < value.length; i++) {
+          if (!(i in value)) {
+            throw new TypeError(
+              `Cannot store sparse array: index ${i} is a hole (use null or a value)`,
+            );
+          }
+          slots[i] = encodeValue(
+            mem,
+            value[i],
+            arrayCapacity,
+            undefined,
+            visited,
+          );
+        }
         return arrayRefSlot(mem.storeArray(slots, arrayCapacity));
       }
       if (value !== null && typeof value === "object") {
@@ -179,6 +208,7 @@ function encodeValue(
           return keyRefSlot(index);
         }
         // A plain nested object: store it as a nested object block.
+        assertPlainObject(value as object);
         if (visited === undefined) visited = new Set<object>();
         if (visited.has(value as object)) {
           throw new TypeError(
@@ -553,29 +583,6 @@ function getCachedOffset(
   return offset;
 }
 
-/** Whether a decoded value is a reference-countable object/array. */
-function isTrackable(value: unknown): boolean {
-  return value !== null && typeof value === "object";
-}
-
-/**
- * Get the stable objectId of a key's top-level value, or null if it is a
- * primitive (which is stored inline and not reference-counted).
- */
-function getTopLevelObjectId(mem: SharedMemory, key: string): number | null {
-  const offset = getOffset(mem, key);
-  if (offset === null) return null;
-  const type = mem.dataTable.getInt32(offset);
-  if (type === 5) {
-    return mem.getObjectId(offset);
-  }
-  const slot = mem.readValueSlot(offset);
-  if (slot.type === TYPE_ARRAY_REF) {
-    return mem.getArrayObjectId(slot.a);
-  }
-  return null;
-}
-
 /**
  * Per-worker cache of object layouts: key -> stable property slot offsets.
  *
@@ -858,11 +865,6 @@ export interface SharedOptions {
    */
   memory?: SharedMemory;
   /**
-   * A worker-side reference-count tracker. When provided, `read()` acquires a
-   * reference to the returned object/array, released when it is GC'd.
-   */
-  refCount?: RefCountTracker;
-  /**
    * Initial capacity (in elements) reserved for arrays when they are first
    * stored. Arrays are created with this many slots, so subsequent `push`
    * calls can append in place without growing/moving the array until the
@@ -898,6 +900,7 @@ onMemoryDisposed(() => {
   offsetCache.clear();
   layoutCache.clear();
   registry.clear();
+  pendingLoads.clear();
 });
 
 /**
@@ -925,27 +928,62 @@ export function Shared<T>(
   initialOrLoader: T | Loader<T>,
   options: SharedOptions = {},
 ): SharedRef<T> | Promise<SharedRef<T>> {
+  const isLoader = typeof initialOrLoader === "function";
   const existing = registry.get(key);
-  if (existing) return existing as SharedRef<T>;
+  if (existing) {
+    // A loader overload promises a Promise, even when the wrapper is cached.
+    return isLoader
+      ? Promise.resolve(existing as SharedRef<T>)
+      : (existing as SharedRef<T>);
+  }
 
   const mem = options.memory ?? getDefaultMemory();
+
+  if (isLoader) {
+    // Concurrent calls in this thread share one load (the loader runs once).
+    const pending = pendingLoads.get(key);
+    if (pending) return pending as Promise<SharedRef<T>>;
+    const load = loadShared<T>(
+      mem,
+      key,
+      initialOrLoader as Loader<T>,
+      options.arrayCapacity,
+    ).finally(() => pendingLoads.delete(key));
+    pendingLoads.set(key, load as Promise<SharedRef<unknown>>);
+    return load;
+  }
+
   const ref = createSharedRef<T>(
     mem,
     key,
-    typeof initialOrLoader === "function" ? undefined : (initialOrLoader as T),
-    options.refCount ?? getDefaultTracker() ?? undefined,
+    initialOrLoader as T,
     options.arrayCapacity,
   );
   registry.set(key, ref as SharedRef<unknown>);
-
-  if (typeof initialOrLoader === "function") {
-    return Promise.resolve((initialOrLoader as Loader<T>)()).then((value) => {
-      registerInitial(mem, key, ref, value);
-      return ref;
-    });
-  }
-
   registerInitial(mem, key, ref, initialOrLoader as T);
+  return ref;
+}
+
+/** In-flight `Shared(key, loader)` calls of this thread, by key. */
+const pendingLoads = new Map<string, Promise<SharedRef<unknown>>>();
+
+/**
+ * Create a key from a loader. The loader only runs when the key does not exist
+ * in shared memory yet. The wrapper is registered only after the value is
+ * stored, so a failing loader leaves no half-created key behind and a later
+ * call can retry.
+ */
+async function loadShared<T>(
+  mem: SharedMemory,
+  key: string,
+  loader: Loader<T>,
+  arrayCapacity: number | undefined,
+): Promise<SharedRef<T>> {
+  const exists = mem.withLock(() => getOffset(mem, key) !== null);
+  const value = exists ? undefined : await loader();
+  const ref = createSharedRef<T>(mem, key, value, arrayCapacity);
+  if (!exists) registerInitial(mem, key, ref, value);
+  registry.set(key, ref as SharedRef<unknown>);
   return ref;
 }
 
@@ -1365,7 +1403,6 @@ function createSharedRef<T>(
   mem: SharedMemory,
   key: string,
   initialValue: T | undefined,
-  tracker?: RefCountTracker,
   arrayCapacity?: number,
 ): SharedRef<T> {
   // The reference handed back to the caller (accessor object or proxy), set
@@ -1409,12 +1446,7 @@ function createSharedRef<T>(
     // the version cell without a Map lookup. Stable for the key's lifetime.
     __index: undefined as number | undefined,
     read: () => {
-      const value = copyValue(readValue(mem, key, target)) as T;
-      if (tracker && isTrackable(value)) {
-        const objectId = getTopLevelObjectId(mem, key);
-        if (objectId !== null) tracker.track(value as object, objectId);
-      }
-      return value;
+      return copyValue(readValue(mem, key, target)) as T;
     },
     write: (value: T) => {
       target.__cache = undefined;
@@ -2022,6 +2054,7 @@ function writeValueInner(
 
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     // Create a new object.
+    assertPlainObject(value);
     const valueObj = value as Record<string, unknown>;
     const props: Array<[string, ValueSlot]> = Object.entries(valueObj).map(
       ([name, v]) => [name, encodeValue(mem, v, arrayCapacity)],
