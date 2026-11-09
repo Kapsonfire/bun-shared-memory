@@ -36,8 +36,7 @@ import {
   readCellDepths,
   writeCellDepths,
 } from "./memory.ts";
-import type { RefCountTracker } from "./refcount.ts";
-import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
+import { getDefaultMemory } from "./worker.ts";
 
 /** Array methods that mutate the array in place. */
 const MUTATING_METHODS = new Set([
@@ -190,7 +189,13 @@ function encodeValue(
               `Cannot store sparse array: index ${i} is a hole (use null or a value)`,
             );
           }
-          slots[i] = encodeValue(mem, value[i], arrayCapacity, undefined, visited);
+          slots[i] = encodeValue(
+            mem,
+            value[i],
+            arrayCapacity,
+            undefined,
+            visited,
+          );
         }
         return arrayRefSlot(mem.storeArray(slots, arrayCapacity));
       }
@@ -578,29 +583,6 @@ function getCachedOffset(
   return offset;
 }
 
-/** Whether a decoded value is a reference-countable object/array. */
-function isTrackable(value: unknown): boolean {
-  return value !== null && typeof value === "object";
-}
-
-/**
- * Get the stable objectId of a key's top-level value, or null if it is a
- * primitive (which is stored inline and not reference-counted).
- */
-function getTopLevelObjectId(mem: SharedMemory, key: string): number | null {
-  const offset = getOffset(mem, key);
-  if (offset === null) return null;
-  const type = mem.dataTable.getInt32(offset);
-  if (type === 5) {
-    return mem.getObjectId(offset);
-  }
-  const slot = mem.readValueSlot(offset);
-  if (slot.type === TYPE_ARRAY_REF) {
-    return mem.getArrayObjectId(slot.a);
-  }
-  return null;
-}
-
 /**
  * Per-worker cache of object layouts: key -> stable property slot offsets.
  *
@@ -883,11 +865,6 @@ export interface SharedOptions {
    */
   memory?: SharedMemory;
   /**
-   * A worker-side reference-count tracker. When provided, `read()` acquires a
-   * reference to the returned object/array, released when it is GC'd.
-   */
-  refCount?: RefCountTracker;
-  /**
    * Initial capacity (in elements) reserved for arrays when they are first
    * stored. Arrays are created with this many slots, so subsequent `push`
    * calls can append in place without growing/moving the array until the
@@ -961,7 +938,6 @@ export function Shared<T>(
   }
 
   const mem = options.memory ?? getDefaultMemory();
-  const tracker = options.refCount ?? getDefaultTracker() ?? undefined;
 
   if (isLoader) {
     // Concurrent calls in this thread share one load (the loader runs once).
@@ -971,7 +947,6 @@ export function Shared<T>(
       mem,
       key,
       initialOrLoader as Loader<T>,
-      tracker,
       options.arrayCapacity,
     ).finally(() => pendingLoads.delete(key));
     pendingLoads.set(key, load as Promise<SharedRef<unknown>>);
@@ -982,7 +957,6 @@ export function Shared<T>(
     mem,
     key,
     initialOrLoader as T,
-    tracker,
     options.arrayCapacity,
   );
   registry.set(key, ref as SharedRef<unknown>);
@@ -1003,12 +977,11 @@ async function loadShared<T>(
   mem: SharedMemory,
   key: string,
   loader: Loader<T>,
-  tracker: RefCountTracker | undefined,
   arrayCapacity: number | undefined,
 ): Promise<SharedRef<T>> {
   const exists = mem.withLock(() => getOffset(mem, key) !== null);
   const value = exists ? undefined : await loader();
-  const ref = createSharedRef<T>(mem, key, value, tracker, arrayCapacity);
+  const ref = createSharedRef<T>(mem, key, value, arrayCapacity);
   if (!exists) registerInitial(mem, key, ref, value);
   registry.set(key, ref as SharedRef<unknown>);
   return ref;
@@ -1430,7 +1403,6 @@ function createSharedRef<T>(
   mem: SharedMemory,
   key: string,
   initialValue: T | undefined,
-  tracker?: RefCountTracker,
   arrayCapacity?: number,
 ): SharedRef<T> {
   // The reference handed back to the caller (accessor object or proxy), set
@@ -1474,12 +1446,7 @@ function createSharedRef<T>(
     // the version cell without a Map lookup. Stable for the key's lifetime.
     __index: undefined as number | undefined,
     read: () => {
-      const value = copyValue(readValue(mem, key, target)) as T;
-      if (tracker && isTrackable(value)) {
-        const objectId = getTopLevelObjectId(mem, key);
-        if (objectId !== null) tracker.track(value as object, objectId);
-      }
-      return value;
+      return copyValue(readValue(mem, key, target)) as T;
     },
     write: (value: T) => {
       target.__cache = undefined;

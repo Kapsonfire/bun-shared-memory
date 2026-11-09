@@ -133,8 +133,7 @@ them needs neither a heap allocation nor a StringTable write.
 ```
 [0..3]   type = 5
 [4..7]   property count
-[8..11]  object id (for reference counting)
-[12..15] reserved
+[8..15]  reserved
 then, per property: name ref (8 bytes: offset, length) + value slot (16 bytes)
 ```
 
@@ -150,7 +149,7 @@ are interned per thread (LRU), so repeated strings reuse one copy.
 ### ArrayTable block
 
 ```
-[0..3]   object id (for reference counting)
+[0..3]   reserved
 then     capacity * 16-byte value slots (count of them are in use)
 ```
 
@@ -213,7 +212,7 @@ thread id, cell 2 the re-entrancy depth.
   `waitForWritesToFinish`) times out (default 30 s, `setDefaultLockTimeout`)
   with a `LockTimeoutError`, so a crashed lock holder cannot hang other
   threads. The mutex records its owner, so `forceUnlock(ownerId)` can recover
-  a lock held by a dead thread; the `RefCountCoordinator` does this
+  a lock held by a dead thread; the `MaintenanceCoordinator` does this
   automatically for a worker it unregisters (workers announce their owner id
   in the handshake). Seqlock cells and the standalone `RWLock` have no owner
   and rely on the timeout. On the browser main thread, where
@@ -386,7 +385,7 @@ write.
   decoding every key once per thread.
 - **Dead space in append-only tables**: Overwritten values leave dead blocks
   (the `free*` functions are no-ops). They are reclaimed by defragmentation,
-  which the `RefCountCoordinator` runs when a table fills up (default 80 %).
+  which the `MaintenanceCoordinator` runs when a table fills up (default 80 %).
   A write that exhausts the budget does not wait for that timer: it runs
   `reclaimHook` and retries once. On the main thread the hook is the
   coordinator's full defragmentation (releases unused chunks and broadcasts the

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Shared(key, loader)`.** Concurrent calls for one key now share a single
+  load (the loader ran once per call and a second call returned the wrapper
+  before the value existed); a cached wrapper is returned as a Promise like the
+  overload promises; the loader is skipped when the key already exists in shared
+  memory; and a rejecting loader no longer leaves a registered wrapper for a key
+  that was never written, so a later call can retry.
+- **Silent data loss for unsupported objects.** `Date`, `Map`, `Set`, `RegExp`,
+  typed arrays, `Error`, ... were stored as an empty object `{}`. They now throw
+  a `TypeError` naming the type (class instances with data properties are still
+  accepted). Sparse arrays throw a clear message instead of a cryptic error.
 - **Torn reads of object properties.** A lock-free property read that overlapped
   a write could return a value assembled from two writes: strings (inline and
   heap) were seen with the offset of one value and the length of another, with
@@ -21,8 +31,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the callback silently wrote a local property. The callback now gets the
   reference.
 
+### Removed
+
+- **Reference counting.** The counters were never read for any decision (nothing
+  was freed based on them) while every `read()` of an object/array pushed an
+  event into a ring buffer, and the ring needed stall-skip logic for killed
+  workers. Removed: `RefCountBuffer`, `RefCountCoordinator`, `RefCountTracker`,
+  `getDefaultTracker`, `SharedOptions.refCount`, `SharedMemory.refCountBuffer` /
+  `attachRefCountBuffer`, the `refCount` entry of `exportBuffers()`, the
+  heartbeat, and `REFCOUNT.md`. Object and array blocks keep a reserved header
+  word, so the memory layout is unchanged.
+- Worker ids are no longer allocated from a shared buffer; the dead-worker
+  detection by heartbeat (for browsers without a `close` event) is gone. Use
+  `unregisterWorker(worker)` for terminated workers, otherwise waiters time out
+  (`LockTimeoutError`, 30 s by default).
+
 ### Changed
 
+- **Breaking:** `RefCountCoordinator` is now `MaintenanceCoordinator`
+  (`new MaintenanceCoordinator(mem, options)`): defragmentation (timer and
+  `reclaimHook`), the chunk broadcast and force-releasing the locks of a closed
+  worker are unchanged; `minFreeBlocks`, `heartbeatTicks`, `drainEvents` and the
+  refcount methods are gone.
 - Ordinary writes now wait for another thread's `withReadLock` /
   `withWriteLock` on the same key (before, they ignored it), and a thread never
   waits for lock bits it holds itself.

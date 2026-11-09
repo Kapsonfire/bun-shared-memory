@@ -3,7 +3,7 @@ import {
   LockTimeoutError,
   Mutex,
   RWLock,
-  RefCountCoordinator,
+  MaintenanceCoordinator,
   Shared,
   SharedMemory,
   StripeLock,
@@ -262,7 +262,7 @@ describe("budget exhaustion", () => {
 
   test("a coordinator reclaims dead space on demand and the write succeeds", () => {
     const mem = smallMemory();
-    const coordinator = new RefCountCoordinator(mem, undefined, {
+    const coordinator = new MaintenanceCoordinator(mem, {
       autoMaintenance: false,
     });
     const o = Shared("budget-reclaim", { list: big(), n: 0 }, { memory: mem });
@@ -325,7 +325,7 @@ describe("automatic lock recovery", () => {
   test("the coordinator releases the mutex of a worker that died holding it", async () => {
     const mem = new SharedMemory();
     let recovered = null as { workerId: number; threadId: number } | null;
-    const coordinator = new RefCountCoordinator(mem, undefined, {
+    const coordinator = new MaintenanceCoordinator(mem, {
       autoMaintenance: false,
       onLockRecovered: (workerId, threadId) => {
         recovered = { workerId, threadId };

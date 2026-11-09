@@ -13,17 +13,12 @@ export {
 } from "./wait.ts";
 export { RWLock } from "./rwlock.ts";
 export { Notifier } from "./notifier.ts";
-export {
-  RefCountBuffer,
-  RefCountCoordinator,
-  RefCountTracker,
-} from "./refcount.ts";
-export type { ObjectId, RefEvent } from "./refcount.ts";
+export { MaintenanceCoordinator } from "./coordinator.ts";
+export type { CoordinatorOptions, ChunkLists } from "./coordinator.ts";
 export {
   getDefaultMemory,
   setDefaultMemory,
   hasDefaultMemory,
-  getDefaultTracker,
   init,
   stopInit,
   onMessage,

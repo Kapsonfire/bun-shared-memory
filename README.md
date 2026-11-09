@@ -36,23 +36,22 @@ by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
 is benchmarked sequentially with 4 workers. See
 [`bench/real-world/README.md`](bench/real-world/README.md) for setup.
 
-Measured on Linux (Bun 1.4.4, 100,000 requests per methodology, sorted by
-speed; MySQL/Redis benchmarked over both TCP and Unix socket; each methodology
-is the minimum over 5 runs × 15 samples to filter CPU-contention noise):
+Measured on macOS (arm64, Bun 1.4.4, 100,000 requests per methodology, sorted
+by speed; MySQL/Redis ran in Docker over TCP; each methodology is the minimum
+over several runs × samples to filter CPU-contention noise; the full log is
+`benchlogs/1794219946-0e4a234-real.md`):
 
-| Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared    |
-| ----------- | --------- | -------- | ------------ | --------- | ------------- |
-| `shared`    | —         | 100,000  | 19           | 5,154,977 | —             |
-| `sqlite`    | —         | 100,000  | 192          | 520,329   | 9.9× slower   |
-| `redis`     | socket    | 100,000  | 1,484        | 67,385    | 76.5× slower  |
-| `mysql`     | socket    | 100,000  | 1,591        | 62,865    | 82.0× slower  |
-| `redis`     | tcp       | 100,000  | 2,617        | 38,205    | 134.9× slower |
-| `mysql`     | tcp       | 100,000  | 3,133        | 31,922    | 161.5× slower |
+| Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared  |
+| ----------- | --------- | -------- | ------------ | --------- | ----------- |
+| `shared`    | —         | 100,000  | 21           | 4,675,965 | —           |
+| `sqlite`    | —         | 100,000  | 185          | 539,807   | 8.7× slower |
+| `redis`     | tcp       | 100,000  | 6,296        | 15,883    | 294× slower |
+| `mysql`     | tcp       | 100,000  | 7,464        | 13,398    | 349× slower |
 
-Shared memory is the fastest by a wide margin: ~9.9× faster than a live SQLite
-read and ~61–161× faster than live MySQL/Redis reads. Unix sockets are
-significantly faster than TCP for MySQL/Redis (~1.7–1.8×), but both remain far
-slower than shared memory.
+Shared memory is the fastest by a wide margin: ~9× faster than a live SQLite
+read and ~300× faster than live MySQL/Redis reads over TCP. The database numbers
+depend heavily on the machine and on how the containers are networked; treat
+them as an order of magnitude, not a constant.
 
 ## ✨ Features
 
@@ -60,7 +59,7 @@ slower than shared memory.
 - 🧩 **4-buffer architecture** — Index Table, DataTable, append-only StringTable, ArrayTable
 - 🔒 **Atomics-based synchronization** — per-key write locks (256 lock stripes, parallel writers on different keys), re-entrant `Mutex`, `Notifier`
 - ⚡ **Read & offset caches** — lock-free fast path, cross-worker invalidation via version cells
-- 🧹 **Reference counting & defragmentation** — automatic memory reclamation
+- 🧹 **Defragmentation** — automatic reclamation of dead space
 - 🪄 **Proxy-based API** — `Shared()` with direct getter/setter access
 - 🧵 **Automatic worker integration** — no manual buffer serialization
 
@@ -93,7 +92,7 @@ See [SPEC.md](./SPEC.md) for the full specification.
 - **Nested objects and arrays** are supported: an object or array can contain other plain objects and arrays (read lazily, mutated in place).
 - **Nested `Shared` references**: a `Shared` object can be stored inside another object or array as a _live reference_ — both stay in sync (mutating either updates the same shared value). Self-references and mutual references are supported as long as the property exists in the object's initial fixed shape.
 - **`null` is allowed** as a value (top-level, object property, or array element).
-- **Not allowed**: `undefined`.
+- **Not allowed** (a `TypeError` is thrown, nothing is stored): `undefined`, functions, symbols, sparse arrays, and objects that are not plain data — `Date`, `Map`, `Set`, `RegExp`, typed arrays, `Error`, ... Convert them first (`date.getTime()`, `Object.fromEntries(map)`, `[...set]`).
 
 ## Usage
 
@@ -148,6 +147,8 @@ counter.update((n) => n + 1);
 const user2 = await Shared<User>("user-2", async () => {
   return await fetchUser();
 });
+// The loader runs only if the key does not exist yet (once per thread, even for
+// concurrent calls); if it throws, nothing is registered and you can retry.
 ```
 
 In a worker, `await init()` requests the shared buffers from the main thread
@@ -180,8 +181,9 @@ assembled from two writes. An ordinary write also waits for another thread's
 > is ~8× that of one worker (`bun run bench:contention`; with the former single
 > global write mutex it _dropped_ as writers were added). 8 workers hammering the
 > _same_ key stay at roughly single-writer speed. Reads of one hot key by many
-> workers scale linearly too (`bun run bench:readscale`). A single write costs ~25–40×
-> native. Reads of unchanged values are lock-free and fast (~3–5× native). After a
+> workers scale linearly too (`bun run bench:readscale`). A single write costs ~20–40×
+> native. Reads of unchanged values are lock-free and fast (~3–7× native for
+> primitives and object properties, ~8–11× for array elements). After a
 > value changed, reading an **object property** is still lock-free (only that
 > property's slot is decoded), while reading a **whole value** (`read()`, a
 > top-level primitive, or an array element) takes that key's stripe once to
@@ -285,57 +287,44 @@ notifier.wait(); // block until notified
 notifier.notify(1); // wake one waiting worker
 ```
 
-## Reference counting & memory reclamation
+## Memory reclamation
 
 The shared buffers are append-only, so dead space (overwritten strings,
-abandoned array blocks, replaced objects) is never reclaimed on its own. A
-reference-counting system tracks which workers hold references to which
-objects/arrays, and a **defragmentation** pass reclaims memory when free space
-runs low.
+abandoned array blocks, replaced objects) is not reused on its own. A
+**defragmentation** pass compacts all tables when they fill up.
 
-When you use the worker integration (`init()`), this is wired up automatically:
-`init()` starts a `RefCountCoordinator` on the main thread (auto-maintenance +
-auto-registration of workers) and a `RefCountTracker` in each worker, so
-`read()` acquires references that are released on GC and dead space is
-defragmented — no manual setup needed.
+With the worker integration (`init()`) this is automatic: `init()` starts a
+`MaintenanceCoordinator` on the main thread. It checks every 100 ms whether a
+table is nearly full (80 % by default), defragments if so, and broadcasts the
+new chunk lists to the workers. It also force-releases the locks of a worker
+that closes while holding them.
 
 ```ts
 import { Shared, init } from "bun-shared-memory";
 
-// Main thread: init() starts the coordinator automatically.
-await init();
+await init(); // main thread: starts the coordinator
 const user = Shared("user-1", { name: "Alice" });
-const copy = user.read(); // acquires a ref; released when `copy` is GC'd
 ```
 
 You can also wire it up manually (e.g. when not using `init()`):
 
 ```ts
-import {
-  SharedMemory,
-  RefCountCoordinator,
-  RefCountTracker,
-  RefCountBuffer,
-} from "bun-shared-memory";
+import { SharedMemory, MaintenanceCoordinator } from "bun-shared-memory";
 
-// Main thread: coordinate refcounts and auto-register workers.
 const mem = new SharedMemory();
-const coord = new RefCountCoordinator(mem); // auto-maintenance starts automatically
-coord.autoRegister(); // track workers via process.on("worker")
-// The coordinator periodically drains acquire/release events and defragments
-// when free space runs low — no manual calls needed.
-
-// Worker: track references acquired by read().
-const tracker = new RefCountTracker(new RefCountBuffer(refBuf), workerId);
-const user = Shared(
-  "user-1",
-  { name: "Alice" },
-  { memory: mem, refCount: tracker },
-);
-const copy = user.read(); // acquires a ref; released when `copy` is GC'd
+const coord = new MaintenanceCoordinator(mem, {
+  defragThreshold: 0.8, // fraction of a table's capacity
+  onDefragment: (chunks) => {
+    /* send `chunks` to your workers, they call mem.applyChunkUpdate(chunks) */
+  },
+});
+coord.autoRegister(); // release locks of workers that close (Bun)
+// coord.runDefrag() compacts immediately; coord.stopAutoMaintenance() stops the timer.
 ```
 
-See [REFCOUNT.md](./REFCOUNT.md) for the full design.
+A write that runs out of budget also reclaims dead space immediately
+(`memory.reclaimHook`), without waiting for the timer. See
+[DESIGN.md](./DESIGN.md) for the details.
 
 ## One SharedMemory per thread
 
@@ -386,13 +375,11 @@ onMessage((e) => {
 ```
 
 `init()` is safe to call on both sides: in the main thread it registers the
-buffer-request listener and starts the refcount coordinator (auto-maintenance
-
-- worker auto-registration), and in a worker it performs the request/response
-  handshake, reconstructs the shared buffers, and creates a refcount tracker —
-  so reference counting works automatically. `Shared()` never overwrites a value
-  that already exists in shared memory, so a worker reading a key created by the
-  main thread gets the existing value rather than its own initial value.
+buffer-request listener and starts the maintenance coordinator (auto-defrag and
+worker auto-registration), and in a worker it performs the request/response
+handshake and reconstructs the shared buffers. `Shared()` never overwrites a value
+that already exists in shared memory, so a worker reading a key created by the
+main thread gets the existing value rather than its own initial value.
 
 > **Note:** a worker must call `await init()` before using `Shared()`. Calling
 > `Shared()` in a worker without `init()` throws an error rather than silently
@@ -452,21 +439,14 @@ automatically calls `acceptWorker()` on the browser main thread (and is a no-op
 overhead in Bun, where workers are auto-registered). If you prefer to build the
 `Worker` yourself, call `acceptWorker(worker)` after constructing it.
 
-> **Note on worker lifecycle & reference counting.** In Bun, the coordinator
-> learns about new workers via `process.on("worker", ...)` and detects a dead
-> worker via its `close` event. Browsers expose neither, so:
->
-> - `acceptWorker(worker)`/`spawnWorker()` register each Web Worker with the
->   coordinator explicitly.
-> - The worker's `init()` starts a periodic **heartbeat** (`setInterval`), and
->   the coordinator's automatic maintenance reaps a worker whose heartbeat
->   stalls (releases its references), so dead/terminated workers are detected
->   without a `close` event.
-> - `coordinator.unregisterWorker(worker)` is the explicit backstop if you
->   terminate a worker and want its references freed immediately.
->
-> This means reference counting and automatic defragmentation work in the
-> browser exactly as they do in Bun.
+> **Note on worker lifecycle.** In Bun, the coordinator learns about new
+> workers via `process.on("worker", ...)` and detects a dead worker via its
+> `close` event. Browsers expose neither, so `acceptWorker(worker)` /
+> `spawnWorker()` register each Web Worker explicitly. Neither Bun
+> (`worker.terminate()`) nor browsers report a terminated worker reliably, so
+> call `coordinator.unregisterWorker(worker)` to release its locks right away;
+> otherwise other threads wait for their lock timeout (30 s by default,
+> `LockTimeoutError`). Automatic defragmentation works the same everywhere.
 
 > **Blocking on the browser main thread.** `Atomics.wait` is forbidden on the
 > browser main thread. Locks, `Notifier` and the object seqlock fall back to a
@@ -563,7 +543,7 @@ every supported data type and its arrays:
 Each benchmark reports ops/sec for the native and shared paths, plus the
 relative slowdown. Results are in `bench/`.
 
-With the read cache and offset cache, **reads** are typically 5–12× slower than
+With the read cache and offset cache, **reads** are typically 3–11× slower than
 native (the remaining cost is the proxy dispatch). **Writes** are slower because
 they must serialize, write, and bump the version cell. Object property and array
 index writes are O(1) in-place updates (only the affected slot is written).
