@@ -210,7 +210,11 @@ Every lock wait (`Mutex`, `RWLock`, the per-object `withReadLock` /
 waiters throw a `LockTimeoutError` after 30 s instead of hanging forever.
 
 ```ts
-import { Mutex, setDefaultLockTimeout, LockTimeoutError } from "bun-shared-memory";
+import {
+  Mutex,
+  setDefaultLockTimeout,
+  LockTimeoutError,
+} from "bun-shared-memory";
 
 setDefaultLockTimeout(5_000); // per thread; Infinity = wait forever
 const mutex = new Mutex(buffer, { timeoutMs: 1_000 }); // per lock
