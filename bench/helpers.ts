@@ -30,10 +30,29 @@ function classify(name: string): BenchResult["kind"] {
 }
 
 /**
+ * How benchPair behaves, chosen by the environment:
+ *
+ * - `BENCH_LIST=1`: only print the case names (as `BENCHCASES <json>`).
+ * - `BENCH_CASE=<name>`: run just that case and print `BENCHRESULT <json>`.
+ *   `bench.ts` starts one such process per case, so no case sees the JIT type
+ *   feedback of an earlier one (a single process made results depend on the
+ *   order of the cases).
+ * - neither: run every case in this process (`bun benc./index.ts`).
+ */
+const listOnly = process.env.BENCH_LIST === "1";
+const onlyCase = process.env.BENCH_CASE;
+const listed: string[] = [];
+
+/** Print the collected case names when listing (called by benc./index.ts). */
+export function finishListing(): void {
+  if (listOnly) console.log(`BENCHCASES ${JSON.stringify(listed)}`);
+}
+
+/**
  * Run a shared-vs-native benchmark for a single operation.
  *
  * `native` and `shared` are the two functions to compare. Each is invoked
- * `iterations` times per sample. Results are reported as ops/sec.
+ * `iterations` times per batch. Results are reported as ops/sec.
  */
 export function benchPair(
   name: string,
@@ -41,18 +60,21 @@ export function benchPair(
   shared: () => unknown,
   iterations = 1_000_000,
 ): void {
-  // On the very first benchmark, run a couple of full measurement passes so
-  // the JIT's one-time warmup boost (constant folding) is consumed before the
-  // first real test. Without this, the first test (number · read) is a large
-  // outlier (~11.5 Mrd ops/s instead of ~7 Mrd) because the very first
-  // measure() loop after process start gets an aggressive JIT optimization
-  // that later runs don't. A plain CPU busy-loop does NOT trigger this, so we
-  // run real measure() passes with a constant-folding closure.
+  if (listOnly) {
+    listed.push(name);
+    return;
+  }
+  if (onlyCase !== undefined && name !== onlyCase) return;
+
+  // The first measure() loop after process start gets a one-time JIT
+  // constant-folding boost (~11 Mrd ops/s instead of ~7 Mrd for a native
+  // read). Consume it with real measure() passes on a constant closure, so the
+  // measured case does not get it. A plain CPU busy-loop does NOT trigger it.
   if (!warmedUp) {
     warmedUp = true;
     const warmConst = 0;
-    measure(() => warmConst, 1_000_000, 2_000);
-    measure(() => warmConst, 1_000_000, 2_000);
+    measure(() => warmConst, 1_000_000, 300);
+    measure(() => warmConst, 1_000_000, 300);
   }
 
   // Warm up both paths so JIT compilation doesn't skew the comparison.
@@ -64,17 +86,29 @@ export function benchPair(
     shared();
   }
 
-  // Run a short measurement pass with the native function itself before the
-  // real measurement. The JIT gives the very first measure() loop of a given
-  // closure a one-time constant-folding boost (~10 Mrd ops/s), while later
-  // runs of the same closure are much slower (~500 Mio). Warming up the exact
-  // native closure consumes that boost so the real measurement is consistent
-  // across tests (otherwise the first read test is a large outlier).
-  measure(native, iterations, 2_000);
+  // Warm up the exact native closure (it also gets a one-time boost on its
+  // first measure() loop) and let the shared path reach its optimized tier.
+  measure(native, iterations, 500);
+  measure(shared, iterations, 300);
 
   const sharedOps = measure(shared, iterations);
   const nativeOps = measure(native, iterations);
 
+  if (onlyCase !== undefined) {
+    console.log(
+      `BENCHRESULT ${JSON.stringify({ name, nativeOps, sharedOps })}`,
+    );
+    return;
+  }
+  recordResult(name, nativeOps, sharedOps);
+}
+
+/** Store and print one result (the orchestrator calls this per case). */
+export function recordResult(
+  name: string,
+  nativeOps: number,
+  sharedOps: number,
+): void {
   const ratio = nativeOps / sharedOps;
   const slower =
     ratio >= 1
