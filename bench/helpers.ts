@@ -184,13 +184,15 @@ function currentCommit(): { commit: string; timestamp: number } {
 function measure(
   fn: () => unknown,
   iterations: number,
-  minDurationMs = 5_000,
+  minDurationMs = 1_000,
 ): number {
-  // Measure a fixed wall-clock duration (5s) rather than a fixed iteration
+  // Measure a fixed wall-clock duration (1s) rather than a fixed iteration
   // count. A fixed count is unreliable for very fast ops (e.g. native reads
   // at hundreds of millions of ops/s finish in a few ms), which makes the
   // measurement dominated by background noise. Running for a fixed duration
-  // averages out that noise. `iterations` is used only to size the batch.
+  // averages out that noise. 1 s is enough: 5 fresh processes per case showed the
+  // same spread at 5 s, 1 s and 0.5 s (the run-to-run noise of the process, about
+  // 3 %, does not shrink with a longer measurement). `iterations` is used only to size the batch.
   const batch = Math.max(1, Math.floor(iterations / 10));
   let total = 0;
   const start = performance.now();
