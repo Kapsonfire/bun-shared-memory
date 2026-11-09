@@ -58,6 +58,11 @@ export function getThreadId(): number {
 export interface MutexOptions {
   /** Lock-wait timeout in ms (`Infinity` = wait forever). */
   timeoutMs?: number;
+  /**
+   * Byte offset of this mutex inside `buffer` (multiple of 4). Lets many
+   * mutexes live in one `SharedArrayBuffer` (see `SharedMemory` lock stripes).
+   */
+  byteOffset?: number;
 }
 
 export class Mutex {
@@ -68,8 +73,9 @@ export class Mutex {
 
   constructor(buffer?: SharedArrayBuffer, options?: MutexOptions) {
     const sab = buffer ?? new SharedArrayBuffer(FULL_BYTES);
-    this.full = sab.byteLength >= FULL_BYTES;
-    this.cell = new Int32Array(sab, 0, this.full ? 3 : 1);
+    const byteOffset = options?.byteOffset ?? 0;
+    this.full = sab.byteLength - byteOffset >= FULL_BYTES;
+    this.cell = new Int32Array(sab, byteOffset, this.full ? 3 : 1);
     this.timeoutMs = options?.timeoutMs;
   }
 

@@ -436,13 +436,25 @@ overhead in Bun, where workers are auto-registered). If you prefer to build the
 > contended. Do heavy or write-intensive work in Web Workers and keep main-thread
 > access to short, mostly read-only operations.
 
-> **Write scalability.** All writes are serialized by one global mutex, so
-> writes cost ~25–40× native and do not scale with the number of writer
-> threads. Reads of unchanged values are lock-free and fast (~3–5× native). After
-> a value changed, reading an **object property** is still lock-free (only that
-> property's slot is decoded), while reading a **whole value** (`read()`, a
-> top-level primitive, or an array element) takes the mutex once to refill its
-> cache.
+> **Write scalability.** Writes are serialized **per key** (256 lock stripes),
+> not globally: writers to different keys run in parallel, writers to the same
+> key wait for each other. With 8 workers each writing its own key the total
+> throughput is ~8× that of one worker (`bun run bench:contention`); 8 workers
+> hammering the _same_ key stay at roughly single-writer speed. A single write
+> costs ~25–40× native. Reads of unchanged values are lock-free and fast
+> (~3–5× native). After a value changed, reading an **object property** is
+> still lock-free (only that property's slot is decoded), while reading a
+> **whole value** (`read()`, a top-level primitive, or an array element) takes
+> that key's stripe once to refill its cache.
+>
+> Keys created one after another sit next to each other in memory, so
+> simultaneously hot neighbours share cache lines (false sharing) and scale
+> less well than keys that are far apart.
+>
+> Code that holds a key's lock (an `update()` callback, `withWriteLock`) and
+> writes a _different_ key takes that key's lock too: two threads doing this in
+> opposite order can deadlock and fail with a `LockTimeoutError`. Keep such
+> callbacks to a single key or use a consistent key order.
 
 ## Memory budget
 

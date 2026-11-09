@@ -537,7 +537,7 @@ export class RefCountCoordinator {
     const threadId = this.threadIdByWorker.get(id);
     this.threadIdByWorker.delete(id);
     if (threadId === undefined) return;
-    if (this.mem.lock.forceUnlock(threadId)) {
+    if (this.mem.forceUnlockAll(threadId)) {
       this.onLockRecovered?.(id, threadId);
     }
   }
@@ -637,16 +637,10 @@ export class RefCountCoordinator {
    * budget reclaims dead space immediately instead of waiting for the timer.
    */
   runDefrag(): void {
-    // Set the defrag flag so lock-free writes fall back to the mutex, then
-    // wait for any in-flight lock-free writes to finish before compacting.
-    this.mem.setDefragmenting();
-    try {
-      this.mem.waitForWritesToFinish();
-      const buffers = this.mem.withLock(() => this.mem.defragment());
-      this.onDefragment?.(buffers);
-    } finally {
-      this.mem.clearDefragmenting();
-    }
+    // Takes every key stripe and the global mutex: waits for in-flight writes
+    // and blocks new ones while the tables are compacted.
+    const buffers = this.mem.withAllLocks(() => this.mem.defragment());
+    this.onDefragment?.(buffers);
   }
 
   /** Stop the periodic maintenance timer, if running. */

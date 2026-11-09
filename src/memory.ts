@@ -112,6 +112,19 @@ export function isVersionCellLocked(raw: number): boolean {
   return (raw & VERSION_LOCK_MASK) !== 0;
 }
 const MAX_INDEX_TABLE_BYTES = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Number of lock stripes. A write (or a cache-miss read of a whole value) holds
+ * only the stripe of its key (`keyIndex & (LOCK_STRIPES - 1)`), so writers to
+ * different keys run in parallel; only writers hitting the same stripe wait for
+ * each other. Maintenance (defragmentation) and key creation take every stripe
+ * or the global mutex.
+ */
+export const LOCK_STRIPES = 256;
+/** Bytes per mutex in the lock region: one cache line, avoiding false sharing. */
+const LOCK_STRIDE = 64;
+/** Size of the lock region: the global mutex at offset 0, then the stripes. */
+export const LOCK_REGION_BYTES = (LOCK_STRIPES + 1) * LOCK_STRIDE;
 /** Size of the objectId header at the start of each array block. */
 const ARRAY_HEADER = 4;
 
@@ -402,6 +415,10 @@ export class SharedMemory {
   readonly layoutVersion: Int32Array;
   /** Cross-worker mutex protecting all read/write operations. */
   readonly lock: Mutex;
+  /** Per-key lock stripes (see {@link LOCK_STRIPES}). */
+  private readonly stripes: Mutex[];
+  /** Number of key stripes the calling thread currently holds (nesting). */
+  private lockDepth = 0;
   /**
    * The 5th shared buffer: reference-counting ring buffer + heartbeat +
    * global refcount table. Shared with workers so they can report acquire/
@@ -547,7 +564,20 @@ export class SharedMemory {
       buffers?.layoutVersion ??
         new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3),
     );
-    this.lock = options?.lock ?? new Mutex();
+    this.lock =
+      options?.lock ?? new Mutex(new SharedArrayBuffer(LOCK_REGION_BYTES));
+    // The stripes live in the same SharedArrayBuffer as the global mutex, so
+    // sharing `lock.buffer` with a worker shares all of them. A lock buffer
+    // that is too small (e.g. a plain 12-byte Mutex) degrades gracefully to a
+    // single global lock: every stripe is the global mutex itself.
+    const region = this.lock.buffer;
+    this.stripes =
+      region.byteLength >= LOCK_REGION_BYTES
+        ? Array.from(
+            { length: LOCK_STRIPES },
+            (_, i) => new Mutex(region, { byteOffset: (i + 1) * LOCK_STRIDE }),
+          )
+        : new Array<Mutex>(LOCK_STRIPES).fill(this.lock);
     this.refCountBuffer = buffers?.refCount ?? null;
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
     this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
@@ -574,7 +604,27 @@ export class SharedMemory {
 
   /** Run `fn` while holding the shared lock. */
   withLock<T>(fn: () => T): T {
-    return this.lock.withLock(fn);
+    this.lock.lock();
+    this.globalDepth++;
+    try {
+      return fn();
+    } finally {
+      this.globalDepth--;
+      this.lock.unlock();
+    }
+  }
+
+  /**
+   * Number of nested global-mutex sections the calling thread is in. Tracked
+   * per thread, not in shared memory: asking the shared lock word "do I hold
+   * it?" on every write is an atomic load of a cache line that every writer
+   * reads, which does not scale across threads.
+   */
+  private globalDepth = 0;
+
+  /** Whether the calling thread holds the global mutex (via `withLock`). */
+  get holdsGlobalLock(): boolean {
+    return this.globalDepth > 0;
   }
 
   /**
@@ -598,44 +648,113 @@ export class SharedMemory {
    * thread's caches are invalidated through the layout version.
    */
   reclaimInPlace(): void {
-    this.setDefragmenting();
+    this.withAllLocks(() => this.defragment({ releaseChunks: false }));
+  }
+
+  /**
+   * Run `fn` holding the lock stripe of the key at Index Table position
+   * `index`. This is the write path (and the cache-miss read path for whole
+   * values): writers to *different* keys do not wait for each other, while
+   * writers to the same key are serialized, so read-modify-write sequences on
+   * one value stay atomic. Re-entrant per thread.
+   *
+   * A thread that already holds the global mutex (key creation, maintenance)
+   * needs no stripe. If `fn` fails because the memory budget is exhausted and
+   * a `reclaimHook` is installed, the stripe is released first, dead space is
+   * reclaimed (which takes every stripe), and `fn` is retried once: only at the
+   * outermost level, so a nested call never reclaims while holding a stripe.
+   *
+   * Lock order: stripes by ascending index, then the global mutex. Code holding
+   * a stripe may take the global mutex (layout lookups), never the reverse.
+   */
+  withKeyLock<T>(index: number, fn: () => T): T {
+    if (this.globalDepth > 0) return fn();
+    const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
+    stripe.lock();
+    this.lockDepth++;
     try {
-      this.waitForWritesToFinish();
-      this.withLock(() => this.defragment({ releaseChunks: false }));
+      return fn();
+    } catch (error) {
+      if (
+        !(error instanceof BudgetExceededError) ||
+        this.reclaimHook === null ||
+        this.reclaiming ||
+        this.lockDepth !== 1
+      ) {
+        throw error;
+      }
+      // Fall through to the reclaim below, after the stripe is released.
     } finally {
-      this.clearDefragmenting();
+      this.lockDepth--;
+      stripe.unlock();
+    }
+    this.reclaiming = true;
+    try {
+      this.reclaimHook();
+    } finally {
+      this.reclaiming = false;
+    }
+    return this.withKeyLock(index, fn);
+  }
+
+  /**
+   * Run `attempt`; if it fails because the memory budget is exhausted and this
+   * thread holds no lock, reclaim dead space (`reclaimHook`) and retry once.
+   * For callers that run under the global mutex (key creation), where
+   * `withKeyLock` cannot reclaim on its own.
+   */
+  withReclaim<T>(attempt: () => T): T {
+    try {
+      return attempt();
+    } catch (error) {
+      if (
+        !(error instanceof BudgetExceededError) ||
+        this.reclaimHook === null ||
+        this.reclaiming ||
+        this.lockDepth !== 0 ||
+        this.globalDepth > 0
+      ) {
+        throw error;
+      }
+      this.reclaiming = true;
+      try {
+        this.reclaimHook();
+      } finally {
+        this.reclaiming = false;
+      }
+      return attempt();
     }
   }
 
   /**
-   * Run a write under the shared lock. If the write fails because the memory
-   * budget is exhausted and a `reclaimHook` is installed, the dead space left
-   * behind by overwritten values is reclaimed and the write is retried once,
-   * instead of failing until the next periodic maintenance tick (which a busy
-   * main thread may never get to run).
+   * Run `fn` holding every key stripe and the global mutex: no write, key
+   * creation or whole-value read can run concurrently. Used by
+   * defragmentation. Must not be called while holding a stripe.
    */
-  withWriteLock<T>(fn: () => T): T {
-    return this.lock.withLock(() => {
-      try {
-        return fn();
-      } catch (error) {
-        const hook = this.reclaimHook;
-        if (
-          !(error instanceof BudgetExceededError) ||
-          hook === null ||
-          this.reclaiming
-        ) {
-          throw error;
-        }
-        this.reclaiming = true;
-        try {
-          hook();
-        } finally {
-          this.reclaiming = false;
-        }
-        return fn();
+  withAllLocks<T>(fn: () => T): T {
+    // With a degraded lock region every stripe is the global mutex itself.
+    const stripes = this.stripes[0] === this.lock ? [] : this.stripes;
+    let taken = 0;
+    try {
+      for (; taken < stripes.length; taken++) stripes[taken]!.lock();
+      return this.withLock(fn);
+    } finally {
+      while (taken-- > 0) stripes[taken]!.unlock();
+    }
+  }
+
+  /**
+   * Release every lock (stripes and global) held by the thread with lock-owner
+   * id `ownerId`, e.g. after it died. Returns whether anything was released.
+   */
+  forceUnlockAll(ownerId: number): boolean {
+    let released = this.lock.forceUnlock(ownerId);
+    if (this.stripes[0] !== this.lock) {
+      for (const stripe of this.stripes) {
+        if (stripe.forceUnlock(ownerId)) released = true;
       }
-    });
+    }
+    return released;
   }
 
   /**
@@ -1505,60 +1624,20 @@ export class SharedMemory {
     return Atomics.load(this.layoutVersion, 0);
   }
 
+  /**
+   * Layout version read with a plain (non-atomic) load. Only valid while
+   * holding a key stripe or the global mutex: acquiring the lock is a full
+   * barrier, so the load sees the latest value, and defragmentation (the only
+   * writer of the version besides `moveArray`, itself under a stripe) cannot
+   * run concurrently. Avoids an atomic load of a cache line all writers share.
+   */
+  layoutVersionInLock(): number {
+    return this.layoutVersion[0]!;
+  }
+
   /** Bump the global layout version, invalidating all per-worker caches. */
   bumpLayoutVersion(): void {
     Atomics.add(this.layoutVersion, 0, 1);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Lock-free write coordination (write counter + defrag flag)
-  // ---------------------------------------------------------------------------
-  // Cell 0 of `layoutVersion` is the global layout version. Cells 1 and 2 are
-  // used to coordinate lock-free writes against the (rare) defragmentation
-  // pass: cell 1 is a count of in-flight lock-free writes, cell 2 is a flag
-  // set while a defragmentation pass is running. A write increments the
-  // counter, checks the flag, and if the flag is set it falls back to the
-  // mutex. The defrag sets the flag, waits for the counter to reach zero, then
-  // runs under the mutex.
-
-  /** Enter a lock-free write: increment the in-flight write counter. */
-  beginWrite(): void {
-    Atomics.add(this.layoutVersion, 1, 1);
-  }
-
-  /** Leave a lock-free write: decrement the in-flight write counter. */
-  endWrite(): void {
-    Atomics.sub(this.layoutVersion, 1, 1);
-  }
-
-  /** Whether a defragmentation pass is currently running. */
-  isDefragmenting(): boolean {
-    return Atomics.load(this.layoutVersion, 2) !== 0;
-  }
-
-  /** Set the defragmentation-in-progress flag. */
-  setDefragmenting(): void {
-    Atomics.store(this.layoutVersion, 2, 1);
-  }
-
-  /** Clear the defragmentation-in-progress flag. */
-  clearDefragmenting(): void {
-    Atomics.store(this.layoutVersion, 2, 0);
-  }
-
-  /** Wait until no lock-free writes are in flight. */
-  waitForWritesToFinish(): void {
-    const timeoutMs = getDefaultLockTimeout();
-    const deadline = deadlineFor(timeoutMs);
-    for (;;) {
-      const inFlight = Atomics.load(this.layoutVersion, 1);
-      if (inFlight === 0) return;
-      if (
-        waitUntil(this.layoutVersion, 1, inFlight, deadline) === "timed-out"
-      ) {
-        throw new LockTimeoutError("waitForWritesToFinish", timeoutMs);
-      }
-    }
   }
 
   // ---------------------------------------------------------------------------

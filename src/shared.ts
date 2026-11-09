@@ -74,15 +74,36 @@ interface ArrayLocator {
 }
 
 /**
- * Run a write operation. Writes are serialized under the shared mutex so that
- * concurrent writers to the same value cannot lose updates or interleave a
- * multi-step write. The mutex is re-entrant, so a write that internally calls
- * another write (e.g. `updateValue`) does not deadlock. It also protects
- * writers against racing a defragmentation pass, which runs under the same
- * lock.
+ * Run a write operation under the lock stripe of `key`. Writers to the same
+ * value are serialized, so concurrent writers cannot lose updates or
+ * interleave a multi-step write, while writers to different keys run in
+ * parallel. The lock is re-entrant, so a write that internally calls another
+ * write (e.g. `updateValue`) does not deadlock. Holding the stripe also
+ * protects the write from a defragmentation pass, which takes every stripe.
+ *
+ * `target` (the proxy target) supplies the cached key index when available,
+ * avoiding a Map lookup on the write hot path.
+ *
+ * Note: code holding a stripe (an `update()` callback, for example) that
+ * writes to a *different* key takes that key's stripe too; two threads doing
+ * so in opposite order can deadlock and fail with a `LockTimeoutError`.
  */
-function writeLock<T>(mem: SharedMemory, fn: () => T): T {
-  return mem.withWriteLock(fn);
+function writeLock<T>(
+  mem: SharedMemory,
+  key: string,
+  fn: () => T,
+  target?: WriteTarget,
+): T {
+  // Key creation (and other global-mutex sections) writes a key that has no
+  // Index Table entry yet: nothing else can touch it, and the global mutex
+  // already excludes maintenance.
+  if (mem.holdsGlobalLock) return fn();
+  let index = target?.__index;
+  if (index === undefined) {
+    index = getIndex(mem, key);
+    if (target !== undefined) target.__index = index;
+  }
+  return mem.withKeyLock(index, fn);
 }
 
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
@@ -915,14 +936,18 @@ function registerInitial(
   ref: { write(value: unknown): void },
   value: unknown,
 ): void {
-  mem.withLock(() => {
-    // If the key already exists in shared memory (e.g. it was created by the
-    // main thread or a racing worker), don't overwrite it with the initial
-    // value.
-    if (getOffset(mem, key) === null) {
-      ref.write(value);
-    }
-  });
+  // The budget may run out while creating the key; reclaim dead space (with no
+  // lock held) and retry once rather than failing.
+  mem.withReclaim(() =>
+    mem.withLock(() => {
+      // If the key already exists in shared memory (e.g. it was created by the
+      // main thread or a racing worker), don't overwrite it with the initial
+      // value.
+      if (getOffset(mem, key) === null) {
+        ref.write(value);
+      }
+    }),
+  );
 }
 
 /**
@@ -1093,9 +1118,12 @@ function writeProp(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the shared mutex (see `writeLock`).
-  mem.withWriteLock(() =>
-    writePropInner(mem, key, prop, val, arrayCapacity, target),
+  // Serialize the write under the key's lock stripe (see `writeLock`).
+  writeLock(
+    mem,
+    key,
+    () => writePropInner(mem, key, prop, val, arrayCapacity, target),
+    target,
   );
 }
 
@@ -1126,9 +1154,9 @@ function writePropInner(
   }
 
   // Top-level array index write: update only that array slot.
-  // Within a lock-free write the layout version is stable, so we read it
-  // once and reuse it for all checks below, saving 2 Atomics.load ops.
-  const cachedLv = mem.getLayoutVersion();
+  // While we hold the key's stripe the layout version is stable, so we read it
+  // once and reuse it for all checks below.
+  const cachedLv = mem.layoutVersionInLock();
   const offset = getCachedOffset(mem, key, target, cachedLv);
   if (offset === null) {
     throw new Error(`No shared value found for key "${key}"`);
@@ -1456,34 +1484,40 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          mem.withWriteLock(() => {
-            // Write directly to the cached slot offset when still valid,
-            // skipping the getObjectLayout Map lookup + properties.get. The
-            // layout version cannot change while the mutex is held (defrag
-            // runs under the same lock), but the check keeps the read cache
-            // resilient.
-            if (slotLayoutVersion !== mem.getLayoutVersion()) {
-              slotOffset = undefined;
-              slotLayoutVersion = mem.getLayoutVersion();
-            }
-            if (slotOffset === undefined) {
-              const layout = getObjectLayout(mem, key);
-              if (layout === null) {
-                // Not an object (shouldn't happen for an object accessor).
-                throw new TypeError(
-                  `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                );
+          writeLock(
+            mem,
+            key,
+            () => {
+              // Write directly to the cached slot offset when still valid,
+              // skipping the getObjectLayout Map lookup + properties.get. The
+              // layout version cannot change while the key's stripe is held
+              // (defrag takes every stripe), but the check keeps the read
+              // cache resilient.
+              const lv = mem.layoutVersionInLock();
+              if (slotLayoutVersion !== lv) {
+                slotOffset = undefined;
+                slotLayoutVersion = lv;
               }
-              const so = layout.properties.get(name);
-              if (so === undefined) {
-                throw new TypeError(
-                  `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
-                );
+              if (slotOffset === undefined) {
+                const layout = getObjectLayout(mem, key);
+                if (layout === null) {
+                  // Not an object (shouldn't happen for an object accessor).
+                  throw new TypeError(
+                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+                  );
+                }
+                const so = layout.properties.get(name);
+                if (so === undefined) {
+                  throw new TypeError(
+                    `Value for key "${key}" has a fixed shape: properties may not be added or removed`,
+                  );
+                }
+                slotOffset = so;
               }
-              slotOffset = so;
-            }
-            writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
-          });
+              writeObjectSlot(mem, key, slotOffset, v, arrayCapacity, target);
+            },
+            target,
+          );
         },
       });
     }
@@ -1586,8 +1620,9 @@ function readValue(
   // decode a half-written object, then read the version in the same loop.
   const version = waitForVersionCell(mem, cell);
 
-  // Cache miss: decode under the lock and cache with the observed version.
-  const value = mem.withLock(() => {
+  // Cache miss: decode under the key's lock stripe (consistent against a
+  // concurrent write to this key) and cache with the observed version.
+  const value = mem.withKeyLock(index, () => {
     const offset = getOffset(mem, key);
     if (offset === null) {
       throw new Error(`No shared value found for key "${key}"`);
@@ -1620,9 +1655,12 @@ function writeValue(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Serialize the write under the shared mutex (see `writeLock`).
-  mem.withWriteLock(() =>
-    writeValueInner(mem, key, value, arrayCapacity, target),
+  // Serialize the write under the key's lock stripe (see `writeLock`).
+  writeLock(
+    mem,
+    key,
+    () => writeValueInner(mem, key, value, arrayCapacity, target),
+    target,
   );
 }
 
@@ -1633,10 +1671,10 @@ function writeValueInner(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
-  // Within a lock-free write the layout version is stable (defragmentation
-  // can only start when the write counter reaches 0), so we read it once
-  // and reuse it for all checks below.
-  const cachedLv = mem.getLayoutVersion();
+  // While we hold the key's stripe the layout version is stable
+  // (defragmentation takes every stripe), so we read it once and reuse it for
+  // all checks below.
+  const cachedLv = mem.layoutVersionInLock();
   const existing = getCachedOffset(mem, key, target, cachedLv);
   if (existing !== null) {
     // Skip the DataTable type read when the slot type is known to be stable
@@ -1798,7 +1836,7 @@ function updateValue<T>(
   fn: (current: T) => T,
   arrayCapacity?: number,
 ): T {
-  return writeLock(mem, () => {
+  return writeLock(mem, key, () => {
     const current = readValue(mem, key) as T;
     const next = fn(current);
     writeValue(mem, key, next, arrayCapacity);
@@ -1817,7 +1855,7 @@ function mutateValue<T, R>(
   fn: (current: T) => R,
   arrayCapacity?: number,
 ): R {
-  return writeLock(mem, () => {
+  return writeLock(mem, key, () => {
     const current = readValue(mem, key) as T;
     const result = fn(current);
     writeValue(mem, key, current, arrayCapacity);
@@ -1913,7 +1951,7 @@ function mutateArrayRef(
   method: "push" | "pop",
   args: unknown[],
 ): unknown {
-  return writeLock(mem, () => {
+  return writeLock(mem, locator.key, () => {
     const resolved = resolveArrayRef(mem, locator);
     if (resolved === null) {
       throw new TypeError("Value is not an array");
@@ -2274,7 +2312,7 @@ function createArrayProxy(
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole value. Serialize under the shared
       // mutex (see `writeLock`).
-      return mem.withWriteLock(() => writeArrayProp(arrProp, val));
+      return writeLock(mem, locator.key, () => writeArrayProp(arrProp, val));
     },
   });
 }
