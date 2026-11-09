@@ -264,6 +264,10 @@ export class RefCountCoordinator {
   private readonly mem: SharedMemory;
   /** workerId -> Set of objectIds that worker holds. */
   private readonly workerRefs = new Map<number, Map<number, number>>();
+  /** Lock-owner thread id of each worker (see `setWorkerThreadId`). */
+  private readonly threadIdByWorker = new Map<number, number>();
+  private readonly onLockRecovered:
+    ((workerId: number, threadId: number) => void) | undefined;
   /** objectId -> Set of workerIds holding it. */
   private readonly objectWorkers = new Map<number, Set<number>>();
   /** workerId -> the worker object it belongs to (for reverse/explicit reaping). */
@@ -301,6 +305,12 @@ export class RefCountCoordinator {
       maintenanceInterval?: number;
       /** Consecutive ticks without a heartbeat before a worker is reaped. */
       heartbeatTicks?: number;
+      /**
+       * Called when the coordinator force-released the mutex because the worker
+       * that held it died (see `setWorkerThreadId`). The data that worker was
+       * modifying may be inconsistent.
+       */
+      onLockRecovered?: (workerId: number, threadId: number) => void;
       onDefragment?: (buffers: {
         indexTable: SharedArrayBuffer[];
         dataTable: SharedArrayBuffer[];
@@ -311,6 +321,7 @@ export class RefCountCoordinator {
   ) {
     this.mem = mem;
     this.onDefragment = opts.onDefragment;
+    this.onLockRecovered = opts.onLockRecovered;
     this.heartbeatTicks = opts.heartbeatTicks ?? 0;
     // Reuse the memory's shared refCount buffer if present, so the same SAB is
     // exported to workers; otherwise create a fresh one and attach it to the
@@ -521,6 +532,27 @@ export class RefCountCoordinator {
    * This is the explicit backstop to heartbeat reaping — call it when you know
    * a worker has terminated and want its refs freed immediately.
    */
+  /** Release the shared mutex if the dead worker `id` was holding it. */
+  private recoverLockOf(id: number): void {
+    const threadId = this.threadIdByWorker.get(id);
+    this.threadIdByWorker.delete(id);
+    if (threadId === undefined) return;
+    if (this.mem.lock.forceUnlock(threadId)) {
+      this.onLockRecovered?.(id, threadId);
+    }
+  }
+
+  /**
+   * Record the lock-owner thread id (`getThreadId()`) of a worker, so that if
+   * the worker dies while holding the shared mutex the coordinator can release
+   * it (`Mutex.forceUnlock`) instead of leaving every other thread to time out.
+   */
+  setWorkerThreadId(workerId: number, threadId: number): void {
+    if (typeof threadId === "number" && threadId !== 0) {
+      this.threadIdByWorker.set(workerId, threadId);
+    }
+  }
+
   unregisterWorker(worker: unknown | number): void {
     const id = typeof worker === "number" ? worker : this.idForWorker(worker);
     if (id === undefined) return;
@@ -529,6 +561,7 @@ export class RefCountCoordinator {
       return;
     }
     this.releaseWorker(id);
+    this.recoverLockOf(id);
     this.workerRefs.delete(id);
     this.workerById.delete(id);
     this.heartbeatSeen.delete(id);

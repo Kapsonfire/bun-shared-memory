@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reclaim in worker threads.** A write that exhausts the budget now triggers
+  dead-space reclamation on _any_ thread, not just the main thread:
+  `SharedMemory.reclaimInPlace()` compacts the tables in place (no chunk
+  replacement, so no broadcast is needed) and the write is retried once. The
+  `RefCountCoordinator` still installs its full defragmentation (which also
+  releases unused chunks) as the main thread's `reclaimHook`.
+  `defragment({ releaseChunks: false })` exposes the in-place mode.
+- **Automatic lock recovery.** Workers announce their lock-owner id
+  (`getThreadId()`) in the init handshake. When the coordinator unregisters a
+  dead worker (close event or heartbeat reap) it force-releases the shared
+  mutex if that worker held it, and calls the new `onLockRecovered` option.
+  Seqlock cells and the standalone `RWLock` still rely on timeouts only.
+
+### Fixed
+
+- **Superlinear key creation.** Index keys were interned in the LRU string
+  cache, evicting repeating property names and making every eviction scan the
+  Map's tombstones (88 % of the time at 64 000 keys). Keys are no longer
+  interned: creating 64 000 keys takes ~0.13 s instead of ~1.2 s and the
+  per-key cost is constant.
+- The string intern cache is now dropped when the layout version changes, so a
+  defragmentation by another thread cannot leave stale string refs behind.
+
 ### Changed
 
 - Docs: `DESIGN.md` rewritten to match the code (16-byte slots, slot types,
