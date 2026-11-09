@@ -132,36 +132,39 @@ describe("lock timeouts", () => {
 
 describe("budget exhaustion", () => {
   const big = () => new Array(1000).fill(1) as number[];
-
-  test("without a coordinator the budget error surfaces", () => {
-    const mem = new SharedMemory({
+  const smallMemory = () =>
+    new SharedMemory({
       maxTotalBytes: 32 * 1024 * 1024,
       chunkSize: 4 * 1024 * 1024,
     });
-    const o = Shared("budget-plain", { list: big() }, { memory: mem }) as {
-      list: number[];
-    };
+
+  test("a standalone memory reclaims dead space in place and the write succeeds", () => {
+    const mem = smallMemory();
+    const o = Shared("budget-plain", { list: big(), n: 0 }, { memory: mem });
+    // ~320 MB of overwritten arrays against a 32 MiB budget.
+    for (let i = 0; i < 20000; i++) {
+      o.list = big();
+      o.n = i;
+    }
+    expect(o.n).toBe(19999);
+    expect(o.list.length).toBe(1000);
+  });
+
+  test("the budget error still surfaces when live data really fills it", () => {
+    const mem = smallMemory();
     expect(() => {
-      for (let i = 0; i < 20000; i++) o.list = big();
+      for (let i = 0; i < 20000; i++) {
+        Shared(`budget-live-${i}`, { list: big() }, { memory: mem });
+      }
     }).toThrow(BudgetExceededError);
   });
 
   test("a coordinator reclaims dead space on demand and the write succeeds", () => {
-    const mem = new SharedMemory({
-      maxTotalBytes: 32 * 1024 * 1024,
-      chunkSize: 4 * 1024 * 1024,
-    });
+    const mem = smallMemory();
     const coordinator = new RefCountCoordinator(mem, undefined, {
       autoMaintenance: false,
     });
-    const o = Shared(
-      "budget-reclaim",
-      { list: big(), n: 0 },
-      { memory: mem },
-    ) as {
-      list: number[];
-      n: number;
-    };
+    const o = Shared("budget-reclaim", { list: big(), n: 0 }, { memory: mem });
     for (let i = 0; i < 20000; i++) {
       o.list = big();
       o.n = i;
@@ -171,4 +174,96 @@ describe("budget exhaustion", () => {
     expect(o.list[999]).toBe(1);
     coordinator.stopAutoMaintenance();
   });
+
+  test("a worker thread reclaims dead space on its own", async () => {
+    const mem = smallMemory();
+    const o = Shared("budget-worker", { list: big(), n: 0 }, { memory: mem });
+    const buffers = mem.exportBuffers();
+    const code = `
+      import { SharedMemory, Shared } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const mem = SharedMemory.fromBuffers(e.data);
+        const o = Shared("budget-worker", { list: [], n: -1 }, { memory: mem });
+        try {
+          for (let i = 0; i < 20000; i++) {
+            o.list = new Array(1000).fill(2);
+            o.n = i;
+          }
+          self.postMessage({ ok: true });
+        } catch (err) {
+          self.postMessage({ ok: false, error: String(err) });
+        }
+      };
+    `;
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+    const reply = await new Promise<{ ok: boolean; error?: string }>(
+      (resolve, reject) => {
+        worker.onerror = (e) => reject(e);
+        worker.onmessage = (e) => resolve(e.data);
+        worker.postMessage(buffers);
+      },
+    );
+    worker.terminate();
+    expect(reply).toEqual({ ok: true });
+    // The main thread sees the worker's last write after its compaction.
+    expect(o.n).toBe(19999);
+    expect(o.list.length).toBe(1000);
+    expect(o.list[0]).toBe(2);
+  }, 30000);
+});
+
+describe("automatic lock recovery", () => {
+  test("the coordinator releases the mutex of a worker that died holding it", async () => {
+    const mem = new SharedMemory();
+    let recovered = null as { workerId: number; threadId: number } | null;
+    const coordinator = new RefCountCoordinator(mem, undefined, {
+      autoMaintenance: false,
+      onLockRecovered: (workerId, threadId) => {
+        recovered = { workerId, threadId };
+      },
+    });
+    const code = `
+      import { SharedMemory, getThreadId } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const mem = SharedMemory.fromBuffers(e.data);
+        mem.lock.lock(); // never released: the worker is terminated below
+        self.postMessage({ threadId: getThreadId() });
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+      };
+    `;
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+    const workerId = coordinator.registerWorker(worker);
+    const threadId = await new Promise<number>((resolve, reject) => {
+      worker.onerror = (e) => reject(e);
+      worker.onmessage = (e) => resolve(e.data.threadId);
+      worker.postMessage(mem.exportBuffers());
+    });
+    coordinator.setWorkerThreadId(workerId, threadId);
+    expect(mem.lock.owner).toBe(threadId);
+
+    worker.terminate();
+    for (let i = 0; i < 200 && recovered === null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(recovered).toEqual({ workerId, threadId });
+    expect(mem.lock.owner).toBe(0);
+    expect(mem.withLock(() => "free again")).toBe("free again");
+    coordinator.stopAutoMaintenance();
+  }, 15000);
 });

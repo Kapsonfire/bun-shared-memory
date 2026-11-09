@@ -1,5 +1,6 @@
 import { isBun, isMainThread, supportsWorkerEvents } from "./env.ts";
 import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
+import { getThreadId } from "./mutex.ts";
 import {
   RefCountBuffer,
   RefCountCoordinator,
@@ -196,12 +197,16 @@ function initMain(): void {
     const workerId = coordinator?.registerWorker(worker);
     if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
     worker.addEventListener("message", (e) => {
-      const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
+      const msg = e.data as
+        { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
       if (
         msg !== null &&
         typeof msg === "object" &&
         "__sharedMemoryRequest" in msg
       ) {
+        if (workerId !== undefined && msg.threadId !== undefined) {
+          coordinator?.setWorkerThreadId(workerId, msg.threadId);
+        }
         const mem = getDefaultMemory();
         worker.postMessage({
           __sharedMemoryInit: true,
@@ -274,12 +279,16 @@ export function acceptWorker<
   const workerId = coordinator?.registerWorker(worker);
   if (workerId !== undefined) workerIdByWorker.set(worker, workerId);
   const listener = (e: { data: unknown }) => {
-    const msg = e.data as { __sharedMemoryRequest?: boolean } | undefined;
+    const msg = e.data as
+      { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
     if (
       msg !== null &&
       typeof msg === "object" &&
       "__sharedMemoryRequest" in msg
     ) {
+      if (workerId !== undefined && msg.threadId !== undefined) {
+        coordinator?.setWorkerThreadId(workerId, msg.threadId);
+      }
       const mem = getDefaultMemory();
       worker.postMessage({
         __sharedMemoryInit: true,
@@ -367,7 +376,7 @@ async function initWorker(): Promise<void> {
   const scope = globalThis as unknown as {
     postMessage: (msg: unknown) => void;
   };
-  scope.postMessage({ __sharedMemoryRequest: true });
+  scope.postMessage({ __sharedMemoryRequest: true, threadId: getThreadId() });
 
   await reply;
   waitingForInit = false;

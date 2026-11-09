@@ -4,6 +4,7 @@ export { SharedMemory } from "./memory.ts";
 export type { SharedMemoryOptions } from "./memory.ts";
 export { Mutex } from "./mutex.ts";
 export type { MutexOptions } from "./mutex.ts";
+export { getThreadId } from "./mutex.ts";
 export {
   LockTimeoutError,
   setDefaultLockTimeout,
