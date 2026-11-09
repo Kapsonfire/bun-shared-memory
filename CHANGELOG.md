@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+Measured with a micro benchmark, each case in its own process, against
+`release/1.1.0` (ns per operation):
+
+| Operation                                  | before      | after       | change        |
+| ------------------------------------------ | ----------- | ----------- | ------------- |
+| `read()` of an object right after a write  | 1017        | 219         | −78 %         |
+| array element read right after a write     | 202         | 61          | −70 %         |
+| `update()` (read-modify-write)             | 325         | 98          | −70 %         |
+| object property write (number)             | 31.8        | 17.8        | −44 %         |
+| object property write (short string)       | 44.5        | 20.5        | −54 %         |
+| object property write (boolean / bigint)   | 29.8 / 35.5 | 19.6 / 21.0 | −34 % / −41 % |
+| top-level `write()` (number / string)      | 34.7 / 54.8 | 23.5 / 31.4 | −32 % / −43 % |
+| array element write / array property write | 41.5 / 42.3 | 31.4 / 28.7 | −24 % / −32 % |
+| property read, cache hit                   | 3.1–3.7     | 2.7–3.0     | −10 … −27 %   |
+
+Reads of unchanged values (cache hits) were already close to the floor and
+barely move; array element access is dominated by the engine's `Proxy` call.
+
+- **One chunk resolution per value slot.** `GrowableBuffer.viewAt`/
+  `localOffset` resolve the chunk once for the four fields of a 16-byte slot
+  (it was once per field; `activate()` alone was a third of a number write).
+  Slots straddling a chunk boundary (defragmentation packs blocks back to
+  back) fall back to per-field access (`slotLimit`).
+- **Fixed-length chunk views.** A chunk grows exactly once, so the view created
+  after that growth is fixed-length, which JavaScriptCore accesses 7–15 %
+  faster than a length-tracking view; every other view stays length-tracking
+  and keeps seeing growth by other threads.
+- **`StripeLock`.** The per-key stripes keep their re-entrancy depth in a plain
+  field (4 instead of 8 atomic operations per uncontended lock/unlock); the
+  owner id is still published for crash recovery.
+- **No closure per write.** Object property, array element, `writeProp` and
+  `writeValue` writes create their lock body once and pass the value through
+  saved/restored variables.
+- **Inline strings without `TextEncoder`/`TextDecoder`.** ASCII strings of up to
+  11 characters are packed from char codes; values are stored inline already
+  when they are created (not only on in-place writes), so short strings never
+  touch the heap.
+- **Allocation-free reads on a cache miss.** Primitive slots are decoded from
+  the chunk view without a `ValueSlot` object; an object is decoded with the
+  property names and slot offsets of its cached layout instead of reading every
+  name from the StringTable (a `TextDecoder` call each); a single array
+  element after a write is read from its own slot instead of decoding the whole
+  array or root object (the second miss at the same version still decodes and
+  fills the cache).
+- **Whole-object writes** (`write(obj)`, `update()`) use the cached layout too,
+  and validate before writing: a write with a missing or extra property is
+  rejected without having overwritten any property (previously earlier
+  properties were already written).
+- `waitForVersionCell` loads the version first and only consults the
+  lock-depth maps when lock bits are set; `copyValue` allocates its cycle map
+  only when it meets a live `Shared` reference; array keys are parsed with a
+  character loop instead of a regular expression (`parseInt`/`isNaN` would
+  accept keys like `"12abc"`).
+
 ## [1.1.0] - 2026-11-09
 
 ### Added

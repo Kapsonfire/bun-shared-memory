@@ -327,6 +327,34 @@ counter.withRWLock((c) => c.write(c.read() + 1));
 const v = counter.withReadLock((c) => c.read());
 ```
 
+## Hot-path notes (JIT)
+
+Measured on Bun/JavaScriptCore; each point removed a visible share of a read or
+write.
+
+- **Resolve a chunk once.** A 16-byte slot is read or written through one
+  `GrowableBuffer.viewAt(offset)`/`localOffset(offset)` pair, not four
+  `getInt32`/`setInt32` calls that each re-resolve (and re-activate) the chunk.
+  Slots that straddle a chunk boundary (defragmentation packs blocks back to
+  back, ignoring chunk limits) use the per-field path (`slotLimit`).
+- **Fixed-length chunk views** (created after the one-time growth of a chunk)
+  are faster than length-tracking ones; everything that can still grow by
+  another thread keeps a length-tracking view.
+- **No allocation per operation.** No closure per write (the lock body is
+  created once; the value travels through saved/restored variables), no
+  `ValueSlot`/`Uint8Array`/`Map` on common reads, no `TextEncoder` or
+  `TextDecoder` for short ASCII strings, no regular expression for array keys.
+- **Few atomics.** A per-key lock is 4 atomic operations when uncontended
+  (`StripeLock`); atomics on cache lines shared by many workers do not scale,
+  so the write path avoids them (see Synchronization).
+- **Cache-miss reads read what they need.** Property names come from the cached
+  layout, a primitive is decoded straight from its slot, and the first miss for
+  an array element reads only that element.
+- **Type feedback is shared.** The JIT specializes on the types it has seen at a
+  site. A process that reads and writes many value types through the same
+  functions (the micro benchmarks do) runs slower per operation than one that
+  uses a single type; compare numbers only between runs of the same shape.
+
 ## Open Questions
 
 - **Index Table keying**: Entries are stored in insertion order; name lookup
