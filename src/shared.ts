@@ -1442,6 +1442,14 @@ class RefTarget<T = unknown> {
   /** Cached version-cell index (stable for the key's lifetime). */
   __index: number | undefined = undefined;
   /**
+   * `read` as seen through a Proxy, created on first use. A shared method has
+   * to find its target through a second trap call (`this[TARGET]`), which made
+   * `ref.read()` on a primitive 2.5× slower; this one answers in a single
+   * call. Only keys that are read through `read()` pay for the closure. (A
+   * field each for `write`/`update` gained nothing and cost 128 B per key.)
+   */
+  __readFn: ((...args: never[]) => unknown) | undefined = undefined;
+  /**
    * The reference handed back to the caller (accessor object or proxy). Lock
    * callbacks receive it, not this target, so `self.prop = x` inside
    * `withWriteLock` writes to shared memory.
@@ -1693,7 +1701,7 @@ function readPropMiss(st: PropState): unknown {
  */
 const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
   get(t, prop) {
-    if (prop === "read") return REF_METHODS.read;
+    if (prop === "read") return (t.__readFn ??= () => t.read());
     if (prop === "write") return REF_METHODS.write;
     if (prop === "update") return REF_METHODS.update;
     if (prop === "withRWLock") return REF_METHODS.withRWLock;
