@@ -7,116 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **`Shared(key, loader)`.** Concurrent calls for one key now share a single
-  load (the loader ran once per call and a second call returned the wrapper
-  before the value existed); a cached wrapper is returned as a Promise like the
-  overload promises; the loader is skipped when the key already exists in shared
-  memory; and a rejecting loader no longer leaves a registered wrapper for a key
-  that was never written, so a later call can retry.
-- **Silent data loss for unsupported objects.** `Date`, `Map`, `Set`, `RegExp`,
-  typed arrays, `Error`, ... were stored as an empty object `{}`. They now throw
-  a `TypeError` naming the type (class instances with data properties are still
-  accepted). Sparse arrays throw a clear message instead of a cryptic error.
-- **Torn reads of object properties.** A lock-free property read that overlapped
-  a write could return a value assembled from two writes: strings (inline and
-  heap) were seen with the offset of one value and the length of another, with
-  no error (measured: 205 000 wrong values in 52 M reads against a writer that
-  alternates two strings). Ordinary writes now mark the key's version cell while
-  they write (WRITER bit) and bump the version when done; lock-free reads
-  validate the cell after decoding and decode again if it changed (a seqlock).
-- `withWriteLock` / `withReadLock` / `withRWLock` passed an internal helper
-  object to the callback instead of the shared reference, so `self.prop = x`
-  inside the callback silently wrote a local property. The callback now gets the
-  reference.
-
-### Removed
-
-- **Reference counting.** The counters were never read for any decision (nothing
-  was freed based on them) while every `read()` of an object/array pushed an
-  event into a ring buffer, and the ring needed stall-skip logic for killed
-  workers. Removed: `RefCountBuffer`, `RefCountCoordinator`, `RefCountTracker`,
-  `getDefaultTracker`, `SharedOptions.refCount`, `SharedMemory.refCountBuffer` /
-  `attachRefCountBuffer`, the `refCount` entry of `exportBuffers()`, the
-  heartbeat, and `REFCOUNT.md`. Object and array blocks keep a reserved header
-  word, so the memory layout is unchanged.
-- Worker ids are no longer allocated from a shared buffer; the dead-worker
-  detection by heartbeat (for browsers without a `close` event) is gone. Use
-  `unregisterWorker(worker)` for terminated workers, otherwise waiters time out
-  (`LockTimeoutError`, 30 s by default).
-
-### Changed
-
-- **Breaking:** `RefCountCoordinator` is now `MaintenanceCoordinator`
-  (`new MaintenanceCoordinator(mem, options)`): defragmentation (timer and
-  `reclaimHook`), the chunk broadcast and force-releasing the locks of a closed
-  worker are unchanged; `minFreeBlocks`, `heartbeatTicks`, `drainEvents` and the
-  refcount methods are gone.
-- Ordinary writes now wait for another thread's `withReadLock` /
-  `withWriteLock` on the same key (before, they ignored it), and a thread never
-  waits for lock bits it holds itself.
-- A lock-free read under a writer that writes the same key without pause ends on
-  the stripe path (a few µs per read instead of a wrong value).
-- Each write performs one more atomic operation (the WRITER mark): own-key
-  write micro benchmark +8…+18 %, 8-worker write throughput −16…−20 %.
-
-### Performance
-
-- **Memory per key (JS heap).** Every key used to own a prototype object, 6+
-  closures and a Proxy handler, which also gave each key its own set of
-  hidden classes (Structures) with property tables. The public methods, the
-  prototype and the Proxy handler are now shared by all keys, and the
-  per-property state is a plain object, created lazily where possible. Measured
-  with `bun bench/heap.ts` (20 000 keys, after a warm-up): object with 4
-  properties 3.8 → 2.0 KB, number/string/array 1.4 → 0.9 KB. Reads over many
-  keys got faster as well, because objects of one shape now share their
-  Structure (2000 different keys: 47.7 → 16.5 ns per property read, measured
-  with `bench/refspeed.ts`); in the benchmark suite writes are unchanged and
-  single-key reads are 0…13 % slower (object property reads -5…-13 %). The
-  methods (`read`, `write`, ...) are shared functions that use `this`, so
-  detaching one (`const { write } = ref`) no longer works. `read()` through a
-  Proxy (primitives, arrays) keeps one trap call by creating its function on
-  first use, so a detached `read` still works there.
-
-- **Unused wrappers are garbage collected.** The per-thread registry held every
-  wrapper forever (1-2 KB each) and the caches kept an entry per key ever
-  touched, including the last decoded value. Wrappers are now held through
-  `WeakRef`; when one is collected a `FinalizationRegistry` callback drops the
-  key's read, index, offset and layout cache entries. While a reference is
-  alive, `Shared(key)` still returns the same object. Measured with
-  `bun bench/gcheap.ts` (100 000 object keys used once and dropped): 2387 B
-  per key stayed in the heap before, 159 B afterwards. Cost: a repeated
-  `Shared(key)` for a held key takes 6.4 instead of 4.0 ns. What remains per
-  key is the per-thread key → index map of the memory itself (every key of the
-  shared memory a thread has looked up).
-
-### Changed (benchmark)
-
-- `bun run bench` runs every case in its own process, with its own measuring
-  loop, and each measurement lasts 1 s instead of 5 s (a run takes about 1.5
-  minutes). Results are stable run to run but **not comparable** with earlier
-  rows, see `BENCH.md`.
-- **Readers of one hot key scale.** Cache hits read the version cell with a plain
-  load instead of `Atomics.load`: 8 workers reading the same key went from 27 to
-  1751 M reads/s (they used to get slower with every worker added); the
-  single-thread property read hit also got faster (2.7 → 1.9 ns). New
-  `bun run bench:readscale`.
-
-### Fixed
-
-- SonarCloud quality gate: `init()` no longer creates the main-thread memory as
-  a bare `new SharedMemory(...)` statement (reported as a reliability bug); it
-  passes the instance to `setDefaultMemory`.
-
-### Changed
-
-- Removed unused imports (`memory.ts`, `shared.ts`, `worker.ts`), dead
-  assignments and the never-read `workerIdByWorker` map. No behavior change.
-- `bun run test:coverage` writes `coverage/lcov.info`; `sonar-project.properties`
-  now declares the test sources and the lcov report path so Sonar can show
-  coverage once the analysis runs after the tests (CI-based analysis).
-
 ## [1.1.0] - 2026-11-09
 
 ### Added
@@ -224,6 +114,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Real-world benchmark tooling: `docker-compose.yml` is TCP-only and sets up the MySQL 8.4 native-password auth itself (Unix sockets moved to the Linux-only `docker-compose.sockets.yml`; the containers used to exit immediately on Docker Desktop); MySQL/Redis use fewer samples/runs and the runner prints progress, so the run no longer looks hung (6-7 min per methodology before).
 - Docs: README, DESIGN, REFCOUNT and `llms.txt` describe the per-key locking model; `AGENTS.md` requires `bun run bench:contention` for locking changes.
 
+- **Breaking:** `RefCountCoordinator` is now `MaintenanceCoordinator`
+  (`new MaintenanceCoordinator(mem, options)`): defragmentation (timer and
+  `reclaimHook`), the chunk broadcast and force-releasing the locks of a closed
+  worker are unchanged; `minFreeBlocks`, `heartbeatTicks`, `drainEvents` and the
+  refcount methods are gone.
+- Ordinary writes now wait for another thread's `withReadLock` /
+  `withWriteLock` on the same key (before, they ignored it), and a thread never
+  waits for lock bits it holds itself.
+- A lock-free read under a writer that writes the same key without pause ends on
+  the stripe path (a few µs per read instead of a wrong value).
+- Each write performs one more atomic operation (the WRITER mark): own-key
+  write micro benchmark +8…+18 %, 8-worker write throughput −16…−20 %.
+- `bun run bench` runs every case in its own process, with its own measuring
+  loop, and each measurement lasts 1 s instead of 5 s (a run takes about 1.5
+  minutes). Results are stable run to run but **not comparable** with earlier
+  rows, see `BENCH.md`.
+- Removed unused imports (`memory.ts`, `shared.ts`, `worker.ts`), dead
+  assignments and the never-read `workerIdByWorker` map. No behavior change.
+- `bun run test:coverage` writes `coverage/lcov.info`; `sonar-project.properties`
+  now declares the test sources and the lcov report path so Sonar can show
+  coverage once the analysis runs after the tests (CI-based analysis).
+
+### Removed
+
+- **Reference counting.** The counters were never read for any decision (nothing
+  was freed based on them) while every `read()` of an object/array pushed an
+  event into a ring buffer, and the ring needed stall-skip logic for killed
+  workers. Removed: `RefCountBuffer`, `RefCountCoordinator`, `RefCountTracker`,
+  `getDefaultTracker`, `SharedOptions.refCount`, `SharedMemory.refCountBuffer` /
+  `attachRefCountBuffer`, the `refCount` entry of `exportBuffers()`, the
+  heartbeat, and `REFCOUNT.md`. Object and array blocks keep a reserved header
+  word, so the memory layout is unchanged. The ring fixes listed under
+  Fixed below were made before the ring was removed and no longer apply.
+- Worker ids are no longer allocated from a shared buffer; the dead-worker
+  detection by heartbeat (for browsers without a `close` event) is gone. Use
+  `unregisterWorker(worker)` for terminated workers, otherwise waiters time out
+  (`LockTimeoutError`, 30 s by default).
+
 ### Fixed
 
 - **Refcount ring wedged by a killed worker; `drainEvents` starving the event
@@ -273,6 +201,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-key cost is constant.
 - The string intern cache is now dropped when the layout version changes, so a
   defragmentation by another thread cannot leave stale string refs behind.
+
+- **`Shared(key, loader)`.** Concurrent calls for one key now share a single
+  load (the loader ran once per call and a second call returned the wrapper
+  before the value existed); a cached wrapper is returned as a Promise like the
+  overload promises; the loader is skipped when the key already exists in shared
+  memory; and a rejecting loader no longer leaves a registered wrapper for a key
+  that was never written, so a later call can retry.
+- **Silent data loss for unsupported objects.** `Date`, `Map`, `Set`, `RegExp`,
+  typed arrays, `Error`, ... were stored as an empty object `{}`. They now throw
+  a `TypeError` naming the type (class instances with data properties are still
+  accepted). Sparse arrays throw a clear message instead of a cryptic error.
+- **Torn reads of object properties.** A lock-free property read that overlapped
+  a write could return a value assembled from two writes: strings (inline and
+  heap) were seen with the offset of one value and the length of another, with
+  no error (measured: 205 000 wrong values in 52 M reads against a writer that
+  alternates two strings). Ordinary writes now mark the key's version cell while
+  they write (WRITER bit) and bump the version when done; lock-free reads
+  validate the cell after decoding and decode again if it changed (a seqlock).
+- `withWriteLock` / `withReadLock` / `withRWLock` passed an internal helper
+  object to the callback instead of the shared reference, so `self.prop = x`
+  inside the callback silently wrote a local property. The callback now gets the
+  reference.
+- SonarCloud quality gate: `init()` no longer creates the main-thread memory as
+  a bare `new SharedMemory(...)` statement (reported as a reliability bug); it
+  passes the instance to `setDefaultMemory`.
 
 ### Performance
 
@@ -329,6 +282,38 @@ barely move; array element access is dominated by the engine's `Proxy` call.
   only when it meets a live `Shared` reference; array keys are parsed with a
   character loop instead of a regular expression (`parseInt`/`isNaN` would
   accept keys like `"12abc"`).
+
+- **Memory per key (JS heap).** Every key used to own a prototype object, 6+
+  closures and a Proxy handler, which also gave each key its own set of
+  hidden classes (Structures) with property tables. The public methods, the
+  prototype and the Proxy handler are now shared by all keys, and the
+  per-property state is a plain object, created lazily where possible. Measured
+  with `bun bench/heap.ts` (20 000 keys, after a warm-up): object with 4
+  properties 3.8 → 2.0 KB, number/string/array 1.4 → 0.9 KB. Reads over many
+  keys got faster as well, because objects of one shape now share their
+  Structure (2000 different keys: 47.7 → 16.5 ns per property read, measured
+  with `bench/refspeed.ts`); in the benchmark suite writes are unchanged and
+  single-key reads are 0…13 % slower (object property reads -5…-13 %). The
+  methods (`read`, `write`, ...) are shared functions that use `this`, so
+  detaching one (`const { write } = ref`) no longer works. `read()` through a
+  Proxy (primitives, arrays) keeps one trap call by creating its function on
+  first use, so a detached `read` still works there.
+- **Unused wrappers are garbage collected.** The per-thread registry held every
+  wrapper forever (1-2 KB each) and the caches kept an entry per key ever
+  touched, including the last decoded value. Wrappers are now held through
+  `WeakRef`; when one is collected a `FinalizationRegistry` callback drops the
+  key's read, index, offset and layout cache entries. While a reference is
+  alive, `Shared(key)` still returns the same object. Measured with
+  `bun bench/gcheap.ts` (100 000 object keys used once and dropped): 2387 B
+  per key stayed in the heap before, 159 B afterwards. Cost: a repeated
+  `Shared(key)` for a held key takes 6.4 instead of 4.0 ns. What remains per
+  key is the per-thread key → index map of the memory itself (every key of the
+  shared memory a thread has looked up).
+- **Readers of one hot key scale.** Cache hits read the version cell with a plain
+  load instead of `Atomics.load`: 8 workers reading the same key went from 27 to
+  1751 M reads/s (they used to get slower with every worker added); the
+  single-thread property read hit also got faster (2.7 → 1.9 ns). New
+  `bun run bench:readscale`.
 
 ## [1.0.1] - 2026-11-07
 
