@@ -1,11 +1,7 @@
 import { isBun, isMainThread } from "./env.ts";
 import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
 import { getThreadId } from "./mutex.ts";
-import {
-  RefCountBuffer,
-  RefCountCoordinator,
-  RefCountTracker,
-} from "./refcount.ts";
+import { MaintenanceCoordinator } from "./coordinator.ts";
 
 /**
  * Worker integration (M4).
@@ -121,26 +117,15 @@ export function stopInit(): void {
   }
 }
 
-/** The main-thread RefCountCoordinator, started by `init()`. */
-let coordinator: RefCountCoordinator | null = null;
-
-/** The worker-side RefCountTracker, created from the shared refcount buffer. */
-let workerTracker: RefCountTracker | null = null;
-
-/** Get the worker's default RefCountTracker, or null if not available. */
-export function getDefaultTracker(): RefCountTracker | null {
-  return workerTracker;
-}
+/** The main-thread MaintenanceCoordinator, started by `init()`. */
+let coordinator: MaintenanceCoordinator | null = null;
 
 /**
- * Start the reference-counting coordinator on the main thread.
+ * Start the maintenance coordinator on the main thread.
  *
- * Creates a `RefCountCoordinator` over the default memory (attaching the 5th
- * refcount buffer so it is shared with workers) and starts automatic
- * maintenance: refcount events are drained and dead space is defragmented
- * when free space is low. Heartbeat reaping is enabled so workers that stop
- * heartbeating (terminated/crashed without a `close` event, as can happen in
- * the browser) are detected and their references released.
+ * Creates a `MaintenanceCoordinator` over the default memory: dead space is
+ * defragmented when the tables fill up (new chunk lists are broadcast to the
+ * workers), and the locks of a worker that closes are force-released.
  *
  * Workers are registered per-handshake in `initMain()` (Bun) and
  * `acceptWorker()` (browser).
@@ -148,9 +133,8 @@ export function getDefaultTracker(): RefCountTracker | null {
 function startCoordinator(): void {
   if (coordinator !== null) return;
   const mem = getDefaultMemory();
-  coordinator = new RefCountCoordinator(mem, undefined, {
+  coordinator = new MaintenanceCoordinator(mem, {
     onDefragment: (buffers) => broadcastChunkUpdate(buffers),
-    heartbeatTicks: 3,
   });
 }
 
@@ -191,8 +175,8 @@ function initMain(): void {
     ) => void;
   }) => {
     liveWorkers.add(worker);
-    // Register with the refcount coordinator and remember the assigned id so
-    // the handshake reply can pass it back to the worker.
+    // Register with the coordinator so it can release the locks of a worker
+    // that dies.
     const workerId = coordinator?.registerWorker(worker);
     worker.addEventListener("message", (e) => {
       const msg = e.data as
@@ -209,7 +193,6 @@ function initMain(): void {
         worker.postMessage({
           __sharedMemoryInit: true,
           buffers: mem.exportBuffers(),
-          workerId,
         });
       }
     });
@@ -271,8 +254,8 @@ export function acceptWorker<
     return worker;
   }
   liveWorkers.add(worker);
-  // Register with the refcount coordinator and remember the assigned id so the
-  // handshake reply can pass it back to the worker.
+  // Register with the coordinator so it can release the locks of a worker that
+  // dies.
   const workerId = coordinator?.registerWorker(worker);
   const listener = (e: { data: unknown }) => {
     const msg = e.data as
@@ -289,7 +272,6 @@ export function acceptWorker<
       worker.postMessage({
         __sharedMemoryInit: true,
         buffers: mem.exportBuffers(),
-        workerId,
       });
     }
   };
@@ -405,7 +387,6 @@ function installMessageWrapper(): void {
       | {
           __sharedMemoryInit?: boolean;
           buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
-          workerId?: number;
         }
       | {
           __chunkUpdate?: boolean;
@@ -425,22 +406,6 @@ function installMessageWrapper(): void {
     ) {
       const mem = SharedMemory.fromBuffers(msg.buffers);
       setDefaultMemory(mem);
-      // Create the worker-side refcount tracker from the shared refcount
-      // buffer, so read() acquires references that the main thread's
-      // coordinator can reclaim. The workerId is assigned by the coordinator
-      // (same shared counter the main thread tracks) so the two sides agree
-      // on which worker holds which refs. Fall back to allocating one only if
-      // a coordinator did not supply it.
-      if (msg.buffers.refCount) {
-        const rcBuffer = new RefCountBuffer(msg.buffers.refCount);
-        workerTracker = new RefCountTracker(
-          rcBuffer,
-          msg.workerId ?? rcBuffer.allocateWorkerId(),
-        );
-        // Keep the main-thread coordinator aware this worker is alive even
-        // without a close event (needed in the browser).
-        workerTracker.startHeartbeat();
-      }
       pendingInitResolve?.();
       pendingInitResolve = null;
       // Forward any messages that arrived before the init reply.

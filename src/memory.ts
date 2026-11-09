@@ -57,7 +57,7 @@ export const TYPE_STRING_REF = 3;
 export const TYPE_ARRAY_REF = 4;
 export const TYPE_OBJECT = 5;
 export const TYPE_BIGINT_STR = 6;
-/** A string value stored in the ArrayTable (slab-allocated, refcounted). */
+/** A string value stored in the ArrayTable. */
 export const TYPE_STRING_VALUE_REF = 7;
 /**
  * A short string stored inline in the slot itself (up to 12 UTF-8 bytes in
@@ -134,7 +134,7 @@ export const LOCK_STRIPES = 256;
 const LOCK_STRIDE = 64;
 /** Size of the lock region: the global mutex at offset 0, then the stripes. */
 export const LOCK_REGION_BYTES = (LOCK_STRIPES + 1) * LOCK_STRIDE;
-/** Size of the objectId header at the start of each array block. */
+/** Size of the reserved header word at the start of each array block. */
 const ARRAY_HEADER = 4;
 
 const DEFAULT_INITIAL = 1024;
@@ -257,7 +257,7 @@ export interface StringRef {
 export interface ArrayRef {
   /**
    * Byte offset of the array block in the ArrayTable, pointing at the 4-byte
-   * objectId header. The value slots start at `offset + ARRAY_HEADER`.
+   * reserved header word. The value slots start at `offset + ARRAY_HEADER`.
    */
   offset: number;
   count: number;
@@ -406,7 +406,6 @@ export interface SharedMemoryOptions {
     stringTable?: SharedArrayBuffer | SharedArrayBuffer[];
     arrayTable?: SharedArrayBuffer | SharedArrayBuffer[];
     layoutVersion?: SharedArrayBuffer;
-    refCount?: SharedArrayBuffer;
     budget?: SharedArrayBuffer;
     cursors?: {
       indexTable?: SharedArrayBuffer;
@@ -509,14 +508,6 @@ export class SharedMemory {
   private readonly stripes: Mutex[];
   /** Number of key stripes the calling thread currently holds (nesting). */
   private lockDepth = 0;
-  /**
-   * The 5th shared buffer: reference-counting ring buffer + heartbeat +
-   * global refcount table. Shared with workers so they can report acquire/
-   * release events to the main thread's coordinator. Optional; created lazily
-   * by the coordinator when auto-GC is enabled.
-   */
-  readonly refCountBuffer: SharedArrayBuffer | null;
-
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
 
@@ -539,13 +530,6 @@ export class SharedMemory {
   private internLayoutVersion = 0;
   private lastInterned: string | undefined;
   private lastInternedRef: StringRef | undefined;
-
-  /**
-   * Monotonic counter for stable object/array identity. Each object and array
-   * gets a unique id that is independent of its DataTable/ArrayTable offset
-   * (which changes during defragmentation). Used to key the refcount table.
-   */
-  private nextObjectId = 1;
 
   constructor(options?: SharedMemoryOptions) {
     if (liveMemory !== null) {
@@ -669,7 +653,6 @@ export class SharedMemory {
               new StripeLock(region, { byteOffset: (i + 1) * LOCK_STRIDE }),
           )
         : new Array<Mutex>(LOCK_STRIPES).fill(this.lock);
-    this.refCountBuffer = buffers?.refCount ?? null;
     this.internCapacity = options?.internCapacity ?? DEFAULT_INTERN_CAPACITY;
     this.internMax = options?.internMax ?? DEFAULT_INTERN_MAX;
     liveMemory = this;
@@ -721,7 +704,7 @@ export class SharedMemory {
   /**
    * Callback that reclaims dead space when a write exhausts the budget.
    * Defaults to {@link reclaimInPlace}, which every thread (including workers)
-   * can run on its own. The `RefCountCoordinator` replaces it on the main
+   * can run on its own. The `MaintenanceCoordinator` replaces it on the main
    * thread with a full defragmentation that also releases unused chunks and
    * broadcasts the new chunk lists to the workers.
    */
@@ -1015,17 +998,6 @@ export class SharedMemory {
   }
 
   /**
-   * Attach the reference-counting buffer (5th SAB) to this memory so it is
-   * included in `exportBuffers()`. No-op if a buffer is already attached.
-   */
-  attachRefCountBuffer(sab: SharedArrayBuffer): void {
-    if (this.refCountBuffer === null) {
-      (this as { refCountBuffer: SharedArrayBuffer | null }).refCountBuffer =
-        sab;
-    }
-  }
-
-  /**
    * Export all shared buffers (including the lock) so they can be sent to a
    * worker via `postMessage` and reconstructed there with `fromBuffers()`.
    *
@@ -1041,7 +1013,6 @@ export class SharedMemory {
     arrayTable: SharedArrayBuffer[];
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
-    refCount: SharedArrayBuffer | null;
     maxByteLength: number;
     indexTableMaxByteLength: number;
     maxTotalBytes: number | null;
@@ -1065,7 +1036,6 @@ export class SharedMemory {
       arrayTable: this.arrayTable.buffers,
       layoutVersion: this.layoutVersion.buffer as SharedArrayBuffer,
       lock: this.lock.buffer as SharedArrayBuffer,
-      refCount: this.refCountBuffer,
       maxByteLength: this.maxByteLength,
       indexTableMaxByteLength: this.indexTableMaxByteLength,
       maxTotalBytes: this.maxTotalBytes,
@@ -1095,7 +1065,6 @@ export class SharedMemory {
     arrayTable: SharedArrayBuffer | SharedArrayBuffer[];
     layoutVersion: SharedArrayBuffer;
     lock: SharedArrayBuffer;
-    refCount?: SharedArrayBuffer | null;
     maxByteLength?: number;
     indexTableMaxByteLength?: number;
     maxTotalBytes?: number | null;
@@ -1129,7 +1098,6 @@ export class SharedMemory {
         stringTable: buffers.stringTable,
         arrayTable: buffers.arrayTable,
         layoutVersion: buffers.layoutVersion,
-        refCount: buffers.refCount ?? undefined,
         budget: buffers.budget ?? undefined,
         cursors: buffers.cursors,
         freeLists: buffers.freeLists,
@@ -1225,7 +1193,7 @@ export class SharedMemory {
    * Unlike `storeString` (which interns into the append-only StringTable for
    * property names and keys), string values are stored in the ArrayTable so
    * they can be freed and reused when their reference is overwritten. Each
-   * block starts with a 4-byte objectId header (for refcounting), followed by
+   * block starts with a 4-byte reserved header word, followed by
    * the UTF-8 bytes of the string.
    *
    * @returns a StringRef pointing into the ArrayTable.
@@ -1236,7 +1204,7 @@ export class SharedMemory {
     // In-place update: if the new string fits in the existing block (same
     // length or shorter), overwrite it without allocating a new block. This
     // keeps repeated writes to the same string property cheap and avoids
-    // unbounded ArrayTable growth. The block's objectId header is preserved.
+    // unbounded ArrayTable growth. The reserved header word is preserved.
     if (oldRef !== undefined && size <= ARRAY_HEADER + oldRef.length) {
       this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
       return {
@@ -1263,8 +1231,6 @@ export class SharedMemory {
       }
     }
     const offset = this.arrayTable.reserve(size);
-    const objectId = this.nextObjectId++;
-    this.arrayTable.setInt32(offset, objectId);
     this.arrayTable.writeBytes(offset + ARRAY_HEADER, bytes);
     return { offset, length: bytes.byteLength, reserved: size };
   }
@@ -1319,7 +1285,7 @@ export class SharedMemory {
   /**
    * Release a reference to a string value.
    *
-   * No-op: string-value refcounting is disabled. Blocks are never freed on the
+   * No-op: string blocks are reclaimed by defragmentation. Blocks are never freed on the
    * hot path; dead space is reclaimed by defragmentation.
    */
   releaseStringValue(_ref: StringRef): void {
@@ -1329,7 +1295,7 @@ export class SharedMemory {
   /**
    * Acquire a reference to a string value.
    *
-   * No-op: string-value refcounting is disabled.
+   * No-op: string blocks are reclaimed by defragmentation.
    */
   acquireStringValue(_ref: StringRef): void {
     // Intentionally a no-op; see freeStringValue.
@@ -1342,7 +1308,7 @@ export class SharedMemory {
   /**
    * Append an array of value slots to the ArrayTable and return its reference.
    *
-   * Each array block starts with a 4-byte objectId header (for refcounting),
+   * Each array block starts with a 4-byte reserved header word,
    * followed by `capacity` value slots. `capacity` is the number of slots
    * reserved for the array (>= slots.length). The extra slots are padding so
    * `push` can grow the array in place without overwriting the next array.
@@ -1353,8 +1319,6 @@ export class SharedMemory {
     const cap = Math.max(capacity ?? 0, count, 1);
     const size = ARRAY_HEADER + cap * SLOT_SIZE;
     const offset = this.arrayTable.reserve(size);
-    const objectId = this.nextObjectId++;
-    this.arrayTable.setInt32(offset, objectId);
     for (let i = 0; i < count; i++) {
       writeSlot(
         this.arrayTable,
@@ -1485,11 +1449,6 @@ export class SharedMemory {
     );
   }
 
-  /** Read the stable objectId of an array block in the ArrayTable. */
-  getArrayObjectId(offset: number): number {
-    return this.arrayTable.getInt32(offset);
-  }
-
   /**
    * Move an array to a new location with a larger capacity, copying its slots.
    * Returns the new reference. The caller must update the array-ref slot in
@@ -1498,8 +1457,6 @@ export class SharedMemory {
   moveArray(ref: ArrayRef, newCapacity: number): ArrayRef {
     const size = ARRAY_HEADER + newCapacity * SLOT_SIZE;
     const newOffset = this.arrayTable.reserve(size);
-    const objectId = this.getArrayObjectId(ref.offset);
-    this.arrayTable.setInt32(newOffset, objectId);
     for (let i = 0; i < ref.count; i++) {
       writeSlot(
         this.arrayTable,
@@ -1752,10 +1709,8 @@ export class SharedMemory {
       OBJECT_HEADER + properties.length * (NAME_REF_SIZE + SLOT_SIZE);
     const offset = this.dataTable.reserve(blockSize);
 
-    const objectId = this.nextObjectId++;
     this.dataTable.setInt32(offset, TYPE_OBJECT);
     this.dataTable.setInt32(offset + 4, properties.length);
-    this.dataTable.setInt32(offset + 8, objectId);
 
     let cursor = offset + OBJECT_HEADER;
     for (const [name, slot] of properties) {
@@ -1784,11 +1739,6 @@ export class SharedMemory {
       properties.push([name, slot]);
     }
     return properties;
-  }
-
-  /** Read the stable objectId of an object block in the DataTable. */
-  getObjectId(offset: number): number {
-    return this.dataTable.getInt32(offset + 8);
   }
 
   /**

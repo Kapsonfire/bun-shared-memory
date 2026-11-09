@@ -94,7 +94,7 @@ CORE API
 6. Worker Integration
    Main thread:
      import { init, spawnWorker, acceptWorker, stopInit } from "bun-shared-memory";
-     await init({ maxTotalBytes: 64 * 1024 * 1024 });  // sets up refcount coordinator
+     await init({ maxTotalBytes: 64 * 1024 * 1024 });  // starts the maintenance coordinator
      const worker = spawnWorker(new URL("./worker.ts", import.meta.url), { type: "module" });
      // or acceptWorker(worker) for browser environments
      stopInit();                     // cleanup
@@ -121,9 +121,6 @@ MEMORY ARCHITECTURE (4 + 1 BUFFERS)
 
 4) ArrayTable     - append-only storage for arrays
    Chunked, capacity padding for O(1) push, relocate on overflow (doubled capacity)
-
-5) RefCountBuffer - ring buffer + heartbeat + global refcount table
-   Auto-started by init() for auto-GC
 
 Value Slot Layout (16 bytes each):
   [0..3]   type (Int32):
@@ -179,7 +176,7 @@ SYNCHRONIZATION MODEL
 4. Layout Version: Global cell bumped on GC/defragmentation, invalidating offset
    and layout caches across all workers.
 5. Bounded waits: every lock wait times out (default 30 s, LockTimeoutError);
-   a dead worker's locks are released by the RefCountCoordinator.
+   a dead worker's locks are released by the MaintenanceCoordinator.
 6. One SharedMemory per thread, created on the main thread only; workers get it
    through init() / SharedMemory.fromBuffers().
 7. Atomic Registration: Initial value writes hold the lock, so racing workers from
@@ -196,7 +193,7 @@ PERFORMANCE OPTIMIZATIONS
 - Field cache: Each property getter has its own cache (avoids Map lookup per read)
 - Target cache: __cache, __offset, __arrayRef on proxy targets skip Map lookups on writes
 - Defragmentation: Auto-runs when free space < 20%, compacts all tables in-place
-- Background maintenance: Timer drains refcount events and runs defrag every 100ms (unref'd)
+- Background maintenance: Timer runs defrag when a table is nearly full, checked every 100ms (unref'd)
 
 MEMORY BUDGET
 =============
@@ -207,15 +204,15 @@ MEMORY BUDGET
 - chunkSize: Minimum growth step (default 32 MiB, min 4 MiB). Raised as needed so no table
   exceeds 1024 chunks.
 
-REFERENCE COUNTING (AUTO-GC)
-=============================
-When init() is called on the main thread, a RefCountCoordinator starts automatically:
-- Workers have RefCountTracker instances with FinalizationRegistry
-- Ring buffer message queue: workers send acquire/release events to main thread
-- Heartbeat table: main thread detects dead workers via heartbeat stalls (3 ticks)
-- Defragmentation reclaims dead space when free space is low (80% threshold)
-- Crash recovery: main thread releases all refs on worker close event (Bun) or
-  heartbeat stall (browser)
+MAINTENANCE COORDINATOR
+=======================
+When init() is called on the main thread, a MaintenanceCoordinator starts automatically:
+- Defragmentation reclaims dead space when a table is more than 80% full and
+  broadcasts the new chunk lists to the workers
+- Crash recovery: force-releases the locks of a worker on its close event (Bun) or
+  via unregisterWorker(worker) (browsers, terminated workers)
+- No reference counting: the former RefCountCoordinator/Tracker/Buffer were removed
+  (the counters were never used for any decision)
 
 FILE STRUCTURE
 ==============
@@ -226,7 +223,7 @@ FILE STRUCTURE
     growable-buffer.ts - Growable SAB helper + SharedBudget (chunked)
     mutex.ts           - Re-entrant Atomics mutex
     notifier.ts        - Atomics wait/notify signaling
-    refcount.ts        - RefCountBuffer, RefCountCoordinator, RefCountTracker
+    coordinator.ts     - MaintenanceCoordinator (defrag timer, dead-worker lock recovery)
     worker.ts          - Worker handshake: init(), spawnWorker(), acceptWorker()
     env.ts             - Environment detection (isBun, isMainThread, etc.)
   dist/esm/            - Compiled ESM output
@@ -238,5 +235,4 @@ DESIGN DOCUMENTATION
 ====================
   SPEC.md     - Project specification and milestones
   DESIGN.md   - Memory architecture deep-dive
-  REFCOUNT.md - Reference counting details
   BENCH.md    - Benchmark results table
