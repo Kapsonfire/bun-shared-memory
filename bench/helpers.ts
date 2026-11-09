@@ -73,8 +73,9 @@ export function benchPair(
   if (!warmedUp) {
     warmedUp = true;
     const warmConst = 0;
-    measure(() => warmConst, 1_000_000, 300);
-    measure(() => warmConst, 1_000_000, 300);
+    const warmMeasure = makeMeasure();
+    warmMeasure(() => warmConst, 1_000_000, 300);
+    warmMeasure(() => warmConst, 1_000_000, 300);
   }
 
   // Warm up both paths so JIT compilation doesn't skew the comparison.
@@ -88,11 +89,14 @@ export function benchPair(
 
   // Warm up the exact native closure (it also gets a one-time boost on its
   // first measure() loop) and let the shared path reach its optimized tier.
-  measure(native, iterations, 500);
-  measure(shared, iterations, 300);
+  // Each function gets its own measuring loop (see makeMeasure).
+  const measureNative = makeMeasure(true);
+  const measureShared = makeMeasure();
+  measureNative(native, iterations, 500);
+  measureShared(shared, iterations, 300);
 
-  const sharedOps = measure(shared, iterations);
-  const nativeOps = measure(native, iterations);
+  const sharedOps = measureShared(shared, iterations);
+  const nativeOps = measureNative(native, iterations);
 
   if (onlyCase !== undefined) {
     console.log(
@@ -214,19 +218,21 @@ function currentCommit(): { commit: string; timestamp: number } {
   }
 }
 
-/** Measure ops/sec for `fn` over a fixed wall-clock duration. */
-function measure(
-  fn: () => unknown,
-  iterations: number,
-  minDurationMs = 1_000,
-): number {
-  // Measure a fixed wall-clock duration (1s) rather than a fixed iteration
-  // count. A fixed count is unreliable for very fast ops (e.g. native reads
-  // at hundreds of millions of ops/s finish in a few ms), which makes the
-  // measurement dominated by background noise. Running for a fixed duration
-  // averages out that noise. 1 s is enough: 5 fresh processes per case showed the
-  // same spread at 5 s, 1 s and 0.5 s (the run-to-run noise of the process, about
-  // 3 %, does not shrink with a longer measurement). `iterations` is used only to size the batch.
+/**
+ * Source of the measuring loop. Every measurement gets its own copy compiled
+ * with `new Function`: closures of one function share one JIT profile, so a
+ * single `measure` that timed the native closure, the shared closure and the
+ * warm-up closure had a call site with several targets, and whether the
+ * optimizer inlined the measured call depended on compile timing. The same
+ * `read()` then ran either at ~200 or at ~440 M ops/s from one process to the
+ * next. With a loop per function the call site sees one target.
+ */
+const MEASURE_SOURCE = `return function measure(fn, iterations, minDurationMs) {
+  // Measure a fixed wall-clock duration rather than a fixed iteration count. A
+  // fixed count is unreliable for very fast ops (native reads at hundreds of
+  // millions of ops/s finish in a few ms), which makes the measurement
+  // dominated by background noise. 1 s is enough: 5 fresh processes per case
+  // showed the same spread at 5 s, 1 s and 0.5 s. \`iterations\` only sizes the batch.
   const batch = Math.max(1, Math.floor(iterations / 10));
   let total = 0;
   const start = performance.now();
@@ -237,6 +243,40 @@ function measure(
     elapsed = performance.now() - start;
   } while (elapsed < minDurationMs);
   return Math.round(total / (elapsed / 1000));
+}`;
+
+type Measure = (
+  fn: () => unknown,
+  iterations: number,
+  minDurationMs?: number,
+) => number;
+
+let measureCopies = 0;
+
+/**
+ * A fresh measuring loop (own code block, own JIT profile).
+ *
+ * `opaque` makes the loop's call site megamorphic first (by timing a few
+ * unrelated functions), so the optimizer cannot inline the measured call. The
+ * native side needs this: a trivial `() => value` inlined into the loop is
+ * folded away and "runs" at 11 G ops/s, which says nothing about the cost of a
+ * call and made every ratio meaningless. Native has always been measured as an
+ * ordinary call (about 1 G ops/s); this keeps it so.
+ */
+function makeMeasure(opaque = false): Measure {
+  const copy = new Function(
+    `${MEASURE_SOURCE}\n//# sourceURL=bench-measure-${measureCopies++}`,
+  )() as Measure;
+  if (opaque) {
+    for (let k = 0; k < 8; k++) {
+      const dummy = new Function(
+        `let x = ${k}; return () => (x += ${k + 1});`,
+      )();
+      copy(dummy, 1_000_000, 10);
+    }
+  }
+  return (fn, iterations, minDurationMs = 1_000) =>
+    copy(fn, iterations, minDurationMs);
 }
 
 /** A unique key per benchmark run, so runs don't collide in the registry. */

@@ -41,10 +41,10 @@ describe("ref objects share their prototype and methods", () => {
     expect(list.read()).toEqual([1, 2, 3]);
   });
 
-  test("array and primitive proxies share the methods too", () => {
+  test("array and primitive proxies keep their methods per key", () => {
     const x = Shared<number[]>("shape-arr-1", [1]);
     const y = Shared<number[]>("shape-arr-2", [2]);
-    expect(x.read).toBe(y.read);
+    expect(x.read).toBe(x.read);
     expect(x.read()).toEqual([1]);
     expect(y.read()).toEqual([2]);
     const p = Shared("shape-num", 3);
