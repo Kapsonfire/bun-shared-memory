@@ -106,6 +106,7 @@ share cache lines). Measured on macOS arm64 (14 cores), Bun 1.4.4.
 | 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | own key  | 56.24    | 37.77     | 46.02     | 60.62     |
 | 2026-11-09 | `88a1c63` | Release 1.1.0: single chunk resolution per slot, `StripeLock`, no closure per write | 0       | same key | 55.15    | 16.24     | 17.13     | 12.99     |
 
+
 Notes:
 
 - With the global mutex, adding writers made the total **slower** (lock convoy:
