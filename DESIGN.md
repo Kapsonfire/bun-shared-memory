@@ -159,8 +159,10 @@ then     capacity * 16-byte value slots (count of them are in use)
 **Writes** are serialized by one re-entrant, `Atomics`-based `Mutex`
 (`src/mutex.ts`), shared by all threads. **Reads are lock-free** as long as the
 value is unchanged: each key has a version cell, and a per-thread read cache
-is valid while the version matches (see V3 below). A read that misses its cache
-decodes the value under the mutex.
+is valid while the version matches (see V3 below). A miss on an **object
+property** is still lock-free: only that property's slot is decoded and cached
+per property. A miss on a **whole value** (`read()`, a top-level primitive, or
+an array element) decodes it under the mutex.
 
 The mutex lives in a 12-byte `SharedArrayBuffer`: cell 0 is the state
 (**0** = free, **1** = held, **2** = held with waiters), cell 1 the owner

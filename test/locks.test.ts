@@ -130,6 +130,62 @@ describe("lock timeouts", () => {
   });
 });
 
+describe("browser main thread (no Atomics.wait)", () => {
+  test("lock waits fall back to a bounded busy-wait", async () => {
+    // Simulate the browser main thread in a worker: `window` + `document`
+    // exist and Atomics.wait throws, exactly as it does there.
+    const code = `
+      globalThis.window = {};
+      globalThis.document = {};
+      Atomics.wait = () => {
+        throw new TypeError("Atomics.wait cannot be called in this context");
+      };
+      const { Mutex } = await import(${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )});
+      self.onmessage = (e) => {
+        const { step, buf } = e.data;
+        try {
+          if (step === 1) new Mutex(buf, { timeoutMs: 100 }).lock();
+          else { const m = new Mutex(buf, { timeoutMs: 5000 }); m.lock(); m.unlock(); }
+          self.postMessage({ step, result: "acquired" });
+        } catch (err) {
+          self.postMessage({ step, result: err.name });
+        }
+      };
+      self.postMessage({ step: 0, result: "ready" });
+    `;
+    const worker = new Worker(
+      new URL(
+        "data:text/javascript," + encodeURIComponent(code),
+        import.meta.url,
+      ),
+      { type: "module" },
+    );
+    const next = () =>
+      new Promise<{ step: number; result: string }>((resolve, reject) => {
+        worker.onerror = (e) => reject(e);
+        worker.onmessage = (e) => resolve(e.data);
+      });
+    expect((await next()).result).toBe("ready");
+
+    const m = new Mutex();
+    m.lock(); // held by this (main) thread
+    let reply = next();
+    worker.postMessage({ step: 1, buf: m.buffer });
+    // The wait is bounded: a LockTimeoutError, not the TypeError from wait().
+    expect((await reply).result).toBe("LockTimeoutError");
+
+    // Released while the worker busy-waits: it acquires.
+    reply = next();
+    worker.postMessage({ step: 2, buf: m.buffer });
+    await new Promise((r) => setTimeout(r, 100));
+    m.unlock();
+    expect((await reply).result).toBe("acquired");
+    worker.terminate();
+  }, 15000);
+});
+
 describe("budget exhaustion", () => {
   const big = () => new Array(1000).fill(1) as number[];
   const smallMemory = () =>

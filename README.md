@@ -436,10 +436,13 @@ overhead in Bun, where workers are auto-registered). If you prefer to build the
 > contended. Do heavy or write-intensive work in Web Workers and keep main-thread
 > access to short, mostly read-only operations.
 
-> **Write scalability.** All writes are serialized by one global mutex, and a
-> read that misses its cache also takes it. Reads of unchanged values are
-> lock-free and fast (~3–5× native); writes cost ~25–40× native and do not
-> scale with the number of writer threads.
+> **Write scalability.** All writes are serialized by one global mutex, so
+> writes cost ~25–40× native and do not scale with the number of writer
+> threads. Reads of unchanged values are lock-free and fast (~3–5× native). After
+> a value changed, reading an **object property** is still lock-free (only that
+> property's slot is decoded), while reading a **whole value** (`read()`, a
+> top-level primitive, or an array element) takes the mutex once to refill its
+> cache.
 
 ## Memory budget
 
