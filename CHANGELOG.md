@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Varianz`.
 - Tests: regression tests for many keys, Index Table insert ordering and
   concurrent key creation from several workers.
+- Docs: README/DESIGN now state precisely when a read takes the mutex (only
+  whole-value reads after a change; object property reads stay lock-free).
+  Test for the browser-main-thread busy-wait fallback.
 
 ### Fixed
 
