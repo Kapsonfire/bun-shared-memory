@@ -186,7 +186,7 @@ per case.
 
 | Date       | Commit              | Change                                                                                 | object (4 props) | number | string | array  |
 | ---------- | ------------------- | -------------------------------------------------------------------------------------- | ---------------- | ------ | ------ | ------ |
-| 2026-11-09 | `c6a8d70`           | `release/1.1.0` (per-key prototype, closures, Proxy handler)                           | 3826 B           | 1373 B | 1374 B | 1374 B |
+| 2026-11-09 | `9eef3f8`           | `release/1.1.0` (per-key prototype, closures, Proxy handler)                           | 3826 B           | 1373 B | 1374 B | 1374 B |
 | 2026-11-09 | `perf/per-key-heap` | Shared prototype/methods/Proxy handler, per-property state object, lazy write callback | 1997 B           | 877 B  | -      | 877 B  |
 
 Hot paths, ns/op (`bench/refspeed.ts`, same machine, `release/1.1.0` → branch):
