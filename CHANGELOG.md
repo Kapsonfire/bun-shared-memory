@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-09
+
 ### Added
 
 - **Lock timeouts.** All lock waits (`Mutex`, `RWLock`, the object seqlock,
@@ -26,33 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retried once, instead of failing until the next 100 ms maintenance tick
   (which a busy main thread never reaches). Writes in worker threads still
   rely on the main thread's maintenance.
-
-### Changed
-
-- **One `SharedMemory` per thread; created on the main thread only.**
-  Constructing a second `SharedMemory` in a thread now throws (the per-thread
-  read/offset/layout/key caches are keyed by key name, so two instances in one
-  thread corrupted each other). A fresh memory (no `buffers`) can only be
-  created on the main thread; workers must obtain it through `init()` or
-  `SharedMemory.fromBuffers()`. New `SharedMemory.current()` and
-  `memory.dispose()` (frees the slot and clears the caches). `init()` on the
-  main thread creates the memory; `setDefaultMemory(mem)` now only accepts the
-  thread's live instance. **Breaking** for code that created several memories
-  in one thread.
-
-### Fixed
-
-- **Mutex re-entrancy across instances.** Re-entrancy was tracked per `Mutex`
-  object, so two instances over the same buffer in one thread deadlocked. It is
-  now tracked in the shared buffer.
-- **`Atomics.wait` on the browser main thread** threw a `TypeError`. Locks,
-  `Notifier` and the seqlock now fall back to a bounded busy-wait there.
-- A timed-out `RWLock` writer no longer leaves the `WRITES_QUEUED` bit set,
-  which would have blocked new readers.
-
-## [1.0.2] - 2026-11-09
-
-### Added
 
 - **V3 Seqlock embedded in each object's version cell.** The read/write lock
   for `withRWLock` / `withWriteLock` / `withReadLock` now lives in the
@@ -76,7 +51,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and re-entrancy is tracked per-thread (read, write, and read-inside-write);
   a reader→writer upgrade from the same thread throws (deadlock risk).
 
+### Changed
+
+- **One `SharedMemory` per thread; created on the main thread only.**
+  Constructing a second `SharedMemory` in a thread now throws (the per-thread
+  read/offset/layout/key caches are keyed by key name, so two instances in one
+  thread corrupted each other). A fresh memory (no `buffers`) can only be
+  created on the main thread; workers must obtain it through `init()` or
+  `SharedMemory.fromBuffers()`. New `SharedMemory.current()` and
+  `memory.dispose()` (frees the slot and clears the caches). `init()` on the
+  main thread creates the memory; `setDefaultMemory(mem)` now only accepts the
+  thread's live instance. **Breaking** for code that created several memories
+  in one thread.
+
 ### Fixed
+
+- **Mutex re-entrancy across instances.** Re-entrancy was tracked per `Mutex`
+  object, so two instances over the same buffer in one thread deadlocked. It is
+  now tracked in the shared buffer.
+- **`Atomics.wait` on the browser main thread** threw a `TypeError`. Locks,
+  `Notifier` and the seqlock now fall back to a bounded busy-wait there.
+- A timed-out `RWLock` writer no longer leaves the `WRITES_QUEUED` bit set,
+  which would have blocked new readers.
 
 - **Quadratic key lookup.** `SharedMemory.lookupIndex` scanned the whole Index
   Table and decoded every key string on each lookup, so creating many keys was
@@ -489,7 +485,7 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
-[1.0.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.0.2
+[1.1.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.3...v1.0.0
 [0.2.3]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.2...v0.2.3
