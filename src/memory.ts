@@ -1,4 +1,11 @@
 import {
+  LockTimeoutError,
+  deadlineFor,
+  getDefaultLockTimeout,
+  waitUntil,
+} from "./wait.ts";
+import {
+  BudgetExceededError,
   GrowableBuffer,
   MIN_BLOCK_SIZE,
   SharedBudget,
@@ -516,6 +523,46 @@ export class SharedMemory {
   /** Run `fn` while holding the shared lock. */
   withLock<T>(fn: () => T): T {
     return this.lock.withLock(fn);
+  }
+
+  /**
+   * Optional callback that compacts the tables to reclaim dead space. Set by
+   * the `RefCountCoordinator` (main thread), which also broadcasts the new
+   * chunk lists to workers. Left `null` where no safe owner of defragmentation
+   * exists (standalone memory, worker threads).
+   */
+  reclaimHook: (() => void) | null = null;
+  private reclaiming = false;
+
+  /**
+   * Run a write under the shared lock. If the write fails because the memory
+   * budget is exhausted and a `reclaimHook` is installed, the dead space left
+   * behind by overwritten values is reclaimed and the write is retried once,
+   * instead of failing until the next periodic maintenance tick (which a busy
+   * main thread may never get to run).
+   */
+  withWriteLock<T>(fn: () => T): T {
+    return this.lock.withLock(() => {
+      try {
+        return fn();
+      } catch (error) {
+        const hook = this.reclaimHook;
+        if (
+          !(error instanceof BudgetExceededError) ||
+          hook === null ||
+          this.reclaiming
+        ) {
+          throw error;
+        }
+        this.reclaiming = true;
+        try {
+          hook();
+        } finally {
+          this.reclaiming = false;
+        }
+        return fn();
+      }
+    });
   }
 
   /**
@@ -1417,8 +1464,16 @@ export class SharedMemory {
 
   /** Wait until no lock-free writes are in flight. */
   waitForWritesToFinish(): void {
-    while (Atomics.load(this.layoutVersion, 1) !== 0) {
-      Atomics.wait(this.layoutVersion, 1, Atomics.load(this.layoutVersion, 1));
+    const timeoutMs = getDefaultLockTimeout();
+    const deadline = deadlineFor(timeoutMs);
+    for (;;) {
+      const inFlight = Atomics.load(this.layoutVersion, 1);
+      if (inFlight === 0) return;
+      if (
+        waitUntil(this.layoutVersion, 1, inFlight, deadline) === "timed-out"
+      ) {
+        throw new LockTimeoutError("waitForWritesToFinish", timeoutMs);
+      }
     }
   }
 

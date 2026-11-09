@@ -1,4 +1,16 @@
 /**
+ * Thrown when a table cannot grow because the shared memory budget
+ * (`maxTotalBytes`) is exhausted. A `RangeError` subclass, so existing
+ * `instanceof RangeError` checks keep working.
+ */
+export class BudgetExceededError extends RangeError {
+  constructor(message: string) {
+    super(message);
+    this.name = "BudgetExceededError";
+  }
+}
+
+/**
  * Shared memory budget shared across multiple GrowableBuffers.
  *
  * Tracks the combined physical size of DataTable, StringTable, and ArrayTable.
@@ -267,7 +279,7 @@ export class GrowableBuffer {
     }
     const growth = this.chunkSize - oldSize;
     if (this.budget && !this.budget.tryReserve(growth)) {
-      throw new RangeError(
+      throw new BudgetExceededError(
         `Shared memory budget exceeded: need ${growth} additional bytes`,
       );
     }

@@ -1,3 +1,10 @@
+import {
+  LockTimeoutError,
+  deadlineFor,
+  getDefaultLockTimeout,
+  waitUntil,
+} from "./wait.ts";
+
 /**
  * A cross-worker, re-entrant read/write lock built on Atomics.
  *
@@ -36,9 +43,24 @@
 export class RWLock {
   private readonly cell: Int32Array;
 
-  constructor(buffer?: SharedArrayBuffer) {
+  private readonly timeoutMs: number | undefined;
+
+  /**
+   * @param options.timeoutMs Lock-wait timeout in ms (`Infinity` = forever);
+   *   defaults to `getDefaultLockTimeout()`. On expiry the acquire throws a
+   *   `LockTimeoutError` instead of hanging behind a crashed lock holder.
+   */
+  constructor(buffer?: SharedArrayBuffer, options?: { timeoutMs?: number }) {
     const sab = buffer ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
     this.cell = new Int32Array(sab);
+    this.timeoutMs = options?.timeoutMs;
+  }
+
+  private timedOut(): never {
+    throw new LockTimeoutError(
+      "RWLock",
+      this.timeoutMs ?? getDefaultLockTimeout(),
+    );
   }
 
   /** The underlying SharedArrayBuffer, for sharing with other workers. */
@@ -56,11 +78,14 @@ export class RWLock {
       readDepths.set(this, rd + 1);
       return;
     }
+    const deadline = deadlineFor(this.timeoutMs ?? getDefaultLockTimeout());
     while (true) {
       const v = Atomics.load(this.cell, 0);
       if ((v & WRITER) !== 0 || (v & WRITES_QUEUED) !== 0) {
         // A writer holds the lock or is waiting: block until it releases.
-        Atomics.wait(this.cell, 0, v);
+        if (waitUntil(this.cell, 0, v, deadline) === "timed-out") {
+          this.timedOut();
+        }
         continue;
       }
       // Free or only-readers: bump the reader count.
@@ -109,6 +134,7 @@ export class RWLock {
         "RWLock: cannot upgrade a read lock to a write lock from the same thread (deadlock risk)",
       );
     }
+    const deadline = deadlineFor(this.timeoutMs ?? getDefaultLockTimeout());
     while (true) {
       const v = Atomics.load(this.cell, 0);
       if (v === 0) {
@@ -135,7 +161,26 @@ export class RWLock {
       if (q !== v) {
         Atomics.compareExchange(this.cell, 0, v, q);
       }
-      Atomics.wait(this.cell, 0, q);
+      if (waitUntil(this.cell, 0, q, deadline) === "timed-out") {
+        this.clearQueuedIfAlone();
+        this.timedOut();
+      }
+    }
+  }
+
+  /**
+   * After a writer gives up waiting, drop the WRITES_QUEUED bit it set if no
+   * writer holds the lock, so readers are not blocked by a phantom waiter. (If
+   * another writer is genuinely queued it re-sets the bit on its next loop.)
+   */
+  private clearQueuedIfAlone(): void {
+    while (true) {
+      const v = Atomics.load(this.cell, 0);
+      if ((v & WRITES_QUEUED) === 0) return;
+      if (Atomics.compareExchange(this.cell, 0, v, v & ~WRITES_QUEUED) === v) {
+        Atomics.notify(this.cell, 0, Infinity);
+        return;
+      }
     }
   }
 

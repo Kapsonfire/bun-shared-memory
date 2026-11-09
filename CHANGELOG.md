@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Lock timeouts.** All lock waits (`Mutex`, `RWLock`, the object seqlock,
+  `waitForWritesToFinish`) are bounded (default 30 s) and throw
+  `LockTimeoutError` instead of hanging forever behind a crashed lock holder.
+  Configure per thread with `setDefaultLockTimeout(ms)` or per lock with
+  `new Mutex(buf, { timeoutMs })` / `new RWLock(buf, { timeoutMs })`.
+  `Infinity` restores the old behaviour.
+- **Mutex owner tracking.** The owning thread id and re-entrancy depth are
+  stored in the shared buffer (default buffer is now 12 bytes). New
+  `mutex.owner`, `mutex.heldByCurrentThread` and `mutex.forceUnlock(ownerId)`
+  allow recovering a lock held by a dead worker. 4-byte buffers created by
+  older versions still work.
+- **Reclaim on budget exhaustion.** A write that fails with the new
+  `BudgetExceededError` (a `RangeError` subclass) now triggers an immediate
+  defragmentation via the `RefCountCoordinator` (`memory.reclaimHook`) and is
+  retried once, instead of failing until the next 100 ms maintenance tick
+  (which a busy main thread never reaches). Writes in worker threads still
+  rely on the main thread's maintenance.
+
+### Fixed
+
+- **Mutex re-entrancy across instances.** Re-entrancy was tracked per `Mutex`
+  object, so two instances over the same buffer in one thread deadlocked. It is
+  now tracked in the shared buffer.
+- **`Atomics.wait` on the browser main thread** threw a `TypeError`. Locks,
+  `Notifier` and the seqlock now fall back to a bounded busy-wait there.
+- A timed-out `RWLock` writer no longer leaves the `WRITES_QUEUED` bit set,
+  which would have blocked new readers.
+
 ## [1.0.2] - 2026-11-09
 
 ### Added
