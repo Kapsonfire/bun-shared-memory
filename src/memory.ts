@@ -396,6 +396,10 @@ export class SharedMemory {
    * beyond `internCapacity`.
    */
   private readonly internCache = new Map<string, StringRef>();
+  /** Per-instance key -> Index Table position, filled incrementally. */
+  private readonly keyIndex = new Map<string, number>();
+  /** Number of Index Table entries already folded into `keyIndex`. */
+  private keyIndexScanned = 0;
   private internCapacity: number;
   private readonly internMax: number;
   /** Fast path: the most recently interned string and its ref. */
@@ -1273,20 +1277,23 @@ export class SharedMemory {
    * used to address the key's version cell.
    */
   lookupIndex(key: string): number | null {
+    const known = this.keyIndex.get(key);
+    if (known !== undefined) return known;
+    // Incrementally index the entries added since the last scan. Keys are
+    // never removed or reordered, so each entry is decoded at most once per
+    // SharedMemory instance (O(1) amortized lookup instead of a full scan).
     const count = this.indexTable.getInt32(0);
-    for (let i = 0; i < count; i++) {
+    for (let i = this.keyIndexScanned; i < count; i++) {
       const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
       const keyOffset = this.indexTable.getInt32(entryOffset);
       const keyLength = this.indexTable.getInt32(entryOffset + 4);
-      const storedKey = this.readString({
-        offset: keyOffset,
-        length: keyLength,
-      });
-      if (storedKey === key) {
-        return i;
-      }
+      this.keyIndex.set(
+        this.readString({ offset: keyOffset, length: keyLength }),
+        i,
+      );
     }
-    return null;
+    this.keyIndexScanned = count;
+    return this.keyIndex.get(key) ?? null;
   }
 
   /**
@@ -1337,13 +1344,12 @@ export class SharedMemory {
   /** Insert a key → dataOffset mapping into the Index Table. */
   insert(key: string, dataOffset: number): void {
     const keyRef = this.storeString(key);
-    // Atomically reserve the next entry index. The count cell (index 0) is
-    // incremented with a single Atomics.add, so concurrent workers each get a
-    // distinct entry slot without a mutex. The Index Table is a single
-    // growable SAB, so a fresh Int32Array view over its current buffer is
-    // correct (insert is rare — only on first write of a key).
+    // Inserts are serialized by the shared mutex (registerInitial/writeValue),
+    // so the entry is fully written *before* the count is published. Readers
+    // scanning the Index Table without the mutex therefore never observe a
+    // half-initialized entry or one beyond the buffer length.
     const view = new Int32Array(this.indexTable.buffers[0]!);
-    const count = Atomics.add(view, 0, 1);
+    const count = Atomics.load(view, 0);
     const entryOffset = INDEX_HEADER + count * INDEX_ENTRY_SIZE;
     this.indexTable.ensureCapacity(entryOffset + INDEX_ENTRY_SIZE);
     this.indexTable.setInt32(entryOffset, keyRef.offset);
@@ -1351,6 +1357,7 @@ export class SharedMemory {
     this.indexTable.setInt32(entryOffset + 8, dataOffset);
     // The 4th field is the key's version cell, initialized to 0.
     this.indexTable.setInt32(entryOffset + INDEX_VERSION_OFFSET, 0);
+    Atomics.store(new Int32Array(this.indexTable.buffers[0]!), 0, count + 1);
 
     // Rebuild the version view over the first chunk (the Index Table is small
     // and stays within the first chunk for typical workloads; version cells
