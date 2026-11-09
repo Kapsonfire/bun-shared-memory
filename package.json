@@ -29,7 +29,8 @@
     "bench:real": "bun bench/real-world/run.ts",
     "bench:real:seed": "bun bench/real-world/seed.ts",
     "bench:real:mysql": "docker compose -f bench/real-world/docker-compose.yml up -d",
-    "bench:contention": "bun bench/contention.ts"
+    "bench:contention": "bun bench/contention.ts",
+    "bench:real:sockets": "docker compose -f bench/real-world/docker-compose.yml -f bench/real-world/docker-compose.sockets.yml up -d"
   },
   "keywords": [
     "bun",

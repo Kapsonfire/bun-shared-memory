@@ -34,22 +34,29 @@ docker compose -f bench/real-world/docker-compose.yml up -d
 bun bench/real-world/seed.ts
 ```
 
-> **Note (MySQL auth):** MySQL 8.4 defaults to the `caching_sha2_password`
-> auth plugin, which Bun's native SQL client cannot use over an insecure
-> connection ("server requested RSA public key retrieval"). If `seed.ts`
-> fails with that error, switch the `bench` user to `mysql_native_password`:
->
-> ```sh
-> docker exec bun-shared-memory-mysql sh -c \
->   'printf "[mysqld]\nmysql_native_password=ON\n" > /etc/mysql/conf.d/native-password.cnf'
-> docker restart bun-shared-memory-mysql
-> docker exec bun-shared-memory-mysql mysql -uroot -proot -e \
->   "ALTER USER 'bench'@'%' IDENTIFIED WITH mysql_native_password BY 'bench'; FLUSH PRIVILEGES;"
-> ```
->
-> The config file lives inside the container, so it is lost on
-> `docker compose down`/`up` and must be re-applied after recreating the
-> container.
+The compose file starts both services over **TCP**, which works everywhere,
+including Docker Desktop on macOS and Windows. It also takes care of two
+pitfalls automatically:
+
+- **MySQL 8.4 auth:** MySQL 8.4 disables `mysql_native_password`, but Bun's
+  native SQL client cannot use the default `caching_sha2_password` over an
+  insecure connection ("server requested RSA public key retrieval" / "Plugin
+  'mysql_native_password' is not loaded"). The compose file starts MySQL with
+  `--mysql-native-password=ON` and `mysql-init.sql` switches the `bench` user to
+  that method when the container is first created.
+- **Unix sockets (Linux only):** bind-mounting host directories for Unix sockets
+  does not work on Docker Desktop (Redis: "Failed opening Unix socket: bind: Not
+  supported", MySQL's entrypoint aborts, so the containers exit immediately).
+  The socket mounts therefore live in a separate override file. On Linux, to
+  benchmark the socket transport as well:
+
+  ```sh
+  docker compose -f bench/real-world/docker-compose.yml \
+                 -f bench/real-world/docker-compose.sockets.yml up -d
+  ```
+
+  If a previous run left stale files in `bench/real-world/sockets/`, delete that
+  directory before starting the containers.
 
 ## Run
 
@@ -72,10 +79,19 @@ takes the **minimum** over several measurements — contention can only slow a
 run down, never speed it up, so the minimum is the best estimate of true
 throughput:
 
-- **Samples per worker** (default 5): each worker runs the full request loop
-  several times and reports its fastest sample.
-- **Runs per methodology** (default 3): each methodology is run several times
-  (each run spawns the 4 workers again) and the fastest run is kept.
+- **Samples per worker**: each worker runs the full request loop several times
+  and reports its fastest sample (15 for `shared`/`sqlite`, 3 for `mysql`/`redis`).
+- **Runs per methodology**: each methodology is run several times (each run
+  spawns the 4 workers again) and the fastest run is kept (5 for
+  `shared`/`sqlite`, 2 for `mysql`/`redis`).
+
+MySQL and Redis answer only ~5 000 requests/s per connection, so the high
+counts used for the millisecond-fast methodologies would take 6-7 minutes for
+each of them; their numbers are stable with fewer samples, and the whole run
+takes a few minutes. The runner prints `1/2 2/2 ...` as each run finishes, so a
+slow methodology does not look like a hang. Override the counts for all
+methodologies with `BENCH_SAMPLES` and `BENCH_RUNS`, e.g.
+`BENCH_SAMPLES=15 BENCH_RUNS=5 bun run bench:real`.
 
 For the most reliable results, close or pause CPU-heavy applications (IDE,
 Copilot, language servers) before running.
@@ -94,7 +110,7 @@ which also has no per-request setup cost.
 MySQL and Redis are benchmarked over **both** transports automatically:
 
 - **TCP** — connects to `127.0.0.1:3306` / `127.0.0.1:6379`.
-- **Unix socket** — connects via the Unix sockets mounted from `./sockets`
+- **Unix socket** (Linux only, needs `docker-compose.sockets.yml`) — connects via the Unix sockets mounted from `./sockets`
   (`sockets/mysql/mysqld.sock`, `sockets/redis/redis.sock`).
 
 > **Note:** the Unix-socket run is only executed on **Linux**, where Docker
