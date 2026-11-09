@@ -2,7 +2,7 @@ import {
   LockTimeoutError,
   deadlineFor,
   getDefaultLockTimeout,
-  waitUntil,
+  waitSliceUntil,
 } from "./wait.ts";
 import {
   SharedMemory,
@@ -33,6 +33,8 @@ import {
   type ValueSlot,
   NOT_PRIMITIVE,
   onMemoryDisposed,
+  readCellDepths,
+  writeCellDepths,
 } from "./memory.ts";
 import type { RefCountTracker } from "./refcount.ts";
 import { getDefaultMemory, getDefaultTracker } from "./worker.ts";
@@ -101,7 +103,7 @@ function writeLock<T>(
     index = getIndex(mem, key);
     if (target !== undefined) target.__index = index;
   }
-  return mem.withKeyLock(index, fn);
+  return mem.withKeyWrite(index, fn);
 }
 
 /** Inclusive bounds of a signed 64-bit integer (stored as a fast int64 slot). */
@@ -324,11 +326,6 @@ const readCache = new Map<
 // tracked with simple depth maps keyed by the version-cell index.
 // ---------------------------------------------------------------------------
 
-/** Reentrancy depth per cell: how many nested write locks this thread holds. */
-const writeCellDepths = new Map<number, number>();
-/** Reentrancy depth per cell: how many nested read locks this thread holds. */
-const readCellDepths = new Map<number, number>();
-
 function bumpCellDepth(map: Map<number, number>, cell: number): void {
   const d = map.get(cell);
   map.set(cell, d === undefined ? 1 : d + 1);
@@ -347,25 +344,34 @@ function dropCellDepth(map: Map<number, number>, cell: number): void {
  * case the version is read directly.
  */
 function waitForVersionCell(mem: SharedMemory, cell: number): number {
+  return stableRaw(mem, cell) >> VERSION_LOCK_SHIFT_BITS;
+}
+
+/**
+ * The raw version cell once no other thread holds a lock bit on it: the value
+ * a lock-free read starts from and later validates against (see `getter` of an
+ * object accessor). Bits this thread set itself (it is writing, or holds a
+ * user-level lock) are returned as they are. An ordinary write holds the bit
+ * for a few instructions, so wait by spinning first, then in short slices (such
+ * a writer does not call `Atomics.notify`; a user-level lock does).
+ */
+function stableRaw(mem: SharedMemory, cell: number): number {
   let raw = Atomics.load(mem.versionView, cell);
-  // Common case: no lock bits set, so nobody (this thread included) holds a
-  // lock on the object. Checked first so the hot cache-hit read does not pay
-  // for the depth-map lookups below.
-  if ((raw & VERSION_LOCK_MASK) === 0) return raw >> VERSION_LOCK_SHIFT_BITS;
-  if (writeCellDepths.has(cell) || readCellDepths.has(cell)) {
-    // This worker already holds a lock on this cell (reentrant read): read the
-    // live version directly, don't wait on our own lock.
-    return raw >> VERSION_LOCK_SHIFT_BITS;
+  if ((raw & VERSION_LOCK_MASK) === 0) return raw;
+  if (mem.holdsCell(cell)) return raw;
+  for (let i = 0; i < 200; i++) {
+    raw = Atomics.load(mem.versionView, cell);
+    if ((raw & VERSION_LOCK_MASK) === 0) return raw;
   }
   const timeoutMs = getDefaultLockTimeout();
   const deadline = deadlineFor(timeoutMs);
   do {
-    if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+    if (waitSliceUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
       throw new LockTimeoutError("object lock", timeoutMs);
     }
     raw = Atomics.load(mem.versionView, cell);
   } while ((raw & VERSION_LOCK_MASK) !== 0);
-  return raw >> VERSION_LOCK_SHIFT_BITS;
+  return raw;
 }
 
 /**
@@ -383,12 +389,19 @@ function acquireCellLock(
     bumpCellDepth(depths, cell);
     return false;
   }
+  // This thread is itself in the middle of an ordinary write of the object
+  // (the lock is requested from inside `update()` for example): nothing to
+  // acquire, and waiting for the bit would wait for ourselves.
+  if (mem.isWritingCell(cell)) return false;
   let raw = Atomics.load(mem.versionView, cell);
   const timeoutMs = getDefaultLockTimeout();
   const deadline = deadlineFor(timeoutMs);
   for (;;) {
     if ((raw & VERSION_LOCK_MASK) !== 0) {
-      if (waitUntil(mem.versionView, cell, raw, deadline) === "timed-out") {
+      // Sliced waits: an ordinary write clears its bit without a wake-up.
+      if (
+        waitSliceUntil(mem.versionView, cell, raw, deadline) === "timed-out"
+      ) {
         throw new LockTimeoutError("object lock", timeoutMs);
       }
       raw = Atomics.load(mem.versionView, cell);
@@ -990,8 +1003,7 @@ function readProp(
   // to match; otherwise we fall through to `readValue`, which waits out any
   // active lock before decoding.
   const cached = readCache.get(key);
-  const raw =
-    cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
+  const raw = cached !== undefined ? mem.versionView[cached.cell]! : -1;
   let value: unknown;
   if (
     cached !== undefined &&
@@ -1356,6 +1368,10 @@ function createSharedRef<T>(
   tracker?: RefCountTracker,
   arrayCapacity?: number,
 ): SharedRef<T> {
+  // The reference handed back to the caller (accessor object or proxy), set
+  // once it exists. Lock callbacks receive it, not the internal `target`, so
+  // `self.prop = x` inside `withWriteLock` writes to shared memory.
+  let publicRef: SharedRef<T> | undefined;
   const target = {
     key,
     mem,
@@ -1415,7 +1431,7 @@ function createSharedRef<T>(
       const cell = mem.getVersionCellIndex(getIndex(mem, key));
       const acquired = acquireCellLock(mem, cell, WRITER_BIT, writeCellDepths);
       try {
-        return fn(target as unknown as SharedRef<T>);
+        return fn((publicRef ?? target) as unknown as SharedRef<T>);
       } finally {
         if (acquired) releaseCellLock(mem, cell, WRITER_BIT, writeCellDepths);
       }
@@ -1427,7 +1443,7 @@ function createSharedRef<T>(
       const cell = mem.getVersionCellIndex(getIndex(mem, key));
       const acquired = acquireCellLock(mem, cell, READLOCK_BIT, readCellDepths);
       try {
-        return fn(target as unknown as SharedRef<T>);
+        return fn((publicRef ?? target) as unknown as SharedRef<T>);
       } finally {
         if (acquired) releaseCellLock(mem, cell, READLOCK_BIT, readCellDepths);
       }
@@ -1579,6 +1595,67 @@ function createSharedRef<T>(
           target,
         );
       };
+
+      /**
+       * The getter's miss path, kept out of the getter itself so the hot hit
+       * path stays small enough for the JIT to inline.
+       */
+      const readMiss = (): unknown => {
+        // Set by the getter before it gets here.
+        const cell = cellIndex!;
+        // Miss: wait until nobody is writing, then decode and validate.
+        let raw = stableRaw(mem, cell);
+        if (fieldCache.version === raw >> VERSION_LOCK_SHIFT_BITS) {
+          return fieldCache.value;
+        }
+        // If this property is an array, return the stable cached proxy
+        // (which reads fresh data on each access) instead of recreating it
+        // on every write.
+        if (arrayProxy !== undefined) {
+          return arrayProxy;
+        }
+        // The slot is read without a lock, so a write that overlaps the read
+        // could be seen half done (a string assembled from two writes). The
+        // version cell is a seqlock: a writer holds its WRITER bit while it
+        // writes and bumps the version when done, so if the cell is not
+        // exactly what it was before the read, decode again. The validating
+        // add(…, 0) is a full barrier, keeping the data reads before it.
+        let value: unknown;
+        for (let attempt = 0; ; attempt++) {
+          value = readObjectProp(
+            mem,
+            key,
+            name,
+            fieldCache,
+            raw >> VERSION_LOCK_SHIFT_BITS,
+            arrayCapacity,
+            resolveSlot(mem.getLayoutVersion()),
+          );
+          if (Atomics.add(mem.versionView, cell, 0) === raw) break;
+          if (attempt === 8) {
+            // Heavily written object: read once under the key's lock.
+            const keyIndex = getIndex(mem, key);
+            raw = stableRaw(mem, cell);
+            value = mem.withKeyLock(keyIndex, () =>
+              readObjectProp(
+                mem,
+                key,
+                name,
+                fieldCache,
+                raw >> VERSION_LOCK_SHIFT_BITS,
+                arrayCapacity,
+                resolveSlot(mem.getLayoutVersion()),
+              ),
+            );
+            break;
+          }
+          raw = stableRaw(mem, cell);
+        }
+        if (Array.isArray(value)) {
+          arrayProxy = value;
+        }
+        return value;
+      };
       Object.defineProperty(ref, name, {
         enumerable: true,
         configurable: false,
@@ -1590,29 +1667,18 @@ function createSharedRef<T>(
           if (cellIndex === null) {
             cellIndex = mem.getVersionCellIndex(getIndex(mem, key));
           }
-          const version = waitForVersionCell(mem, cellIndex);
-          if (fieldCache.version === version) {
+          // Hit: a plain (non-atomic) read of the version cell. An atomic load
+          // of a cache line that many workers read does not scale (readers of
+          // the same hot key got slower with every worker added); a plain load
+          // does, and a stale value only delays seeing a change.
+          const seen = mem.versionView[cellIndex]!;
+          if (
+            (seen & VERSION_LOCK_MASK) === 0 &&
+            fieldCache.version === seen >> VERSION_LOCK_SHIFT_BITS
+          ) {
             return fieldCache.value;
           }
-          // If this property is an array, return the stable cached proxy
-          // (which reads fresh data on each access) instead of recreating it
-          // on every write.
-          if (arrayProxy !== undefined) {
-            return arrayProxy;
-          }
-          const value = readObjectProp(
-            mem,
-            key,
-            name,
-            fieldCache,
-            version,
-            arrayCapacity,
-            resolveSlot(mem.getLayoutVersion()),
-          );
-          if (Array.isArray(value)) {
-            arrayProxy = value;
-          }
-          return value;
+          return readMiss();
         },
         set(v: unknown) {
           target.__cache = undefined;
@@ -1630,7 +1696,8 @@ function createSharedRef<T>(
     // Fixed shape: reject adding new properties (throws in strict mode).
     Object.preventExtensions(ref);
     sharedKeyMap.set(ref, key);
-    return ref as unknown as SharedRef<T>;
+    publicRef = ref as unknown as SharedRef<T>;
+    return publicRef;
   }
 
   // Arrays, primitives, or unknown shape: use a Proxy (index access, array
@@ -1671,7 +1738,8 @@ function createSharedRef<T>(
     },
   });
   sharedKeyMap.set(proxy, key);
-  return proxy as unknown as SharedRef<T>;
+  publicRef = proxy as unknown as SharedRef<T>;
+  return publicRef;
 }
 
 /**
@@ -1714,8 +1782,7 @@ function readValue(
   // {hit,value} union returned by readCachedValue. The version cell doubles as
   // a seqlock: a hit requires clear lock bits and a matching version.
   const cached = readCache.get(key);
-  const raw =
-    cached !== undefined ? Atomics.load(mem.versionView, cached.cell) : -1;
+  const raw = cached !== undefined ? mem.versionView[cached.cell]! : -1;
   if (
     cached !== undefined &&
     (raw & VERSION_LOCK_MASK) === 0 &&
@@ -2224,7 +2291,7 @@ const CACHE_MISS: unique symbol = Symbol("cache-miss");
 function peekCached(mem: SharedMemory, key: string): unknown {
   const cached = readCache.get(key);
   if (cached === undefined) return CACHE_MISS;
-  const raw = Atomics.load(mem.versionView, cached.cell);
+  const raw = mem.versionView[cached.cell]!;
   if (
     (raw & VERSION_LOCK_MASK) === 0 &&
     cached.version === raw >> VERSION_LOCK_SHIFT_BITS
@@ -2254,7 +2321,7 @@ function tryReadElement(
 ): unknown {
   const cached = readCache.get(key);
   if (cached === undefined) return NOT_PRIMITIVE;
-  const raw = Atomics.load(mem.versionView, cached.cell);
+  const raw = mem.versionView[cached.cell]!;
   if ((raw & VERSION_LOCK_MASK) !== 0) return NOT_PRIMITIVE;
   const version = raw >> VERSION_LOCK_SHIFT_BITS;
   if (cached.version === version || cached.ev === version) {
