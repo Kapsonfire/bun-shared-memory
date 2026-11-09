@@ -13,11 +13,23 @@ bun run bench
 
 This compares shared-memory access against native JS access for every
 supported data type and its arrays (primitives, arrays, objects). Results are
-reported as ops/sec and relative slowdown. Every measurement runs for at least
+reported as ops/sec and relative slowdown. Every case runs in its **own fresh
+process** (`bench/bench.ts` starts `bench/index.ts` once per case): in a single
+process the JIT type feedback of earlier cases changed the numbers of later
+ones, so a result depended on the order of the cases. `bun bench/index.ts` still
+runs all cases in one process, `BENCH_CASE="number · read" bun bench/index.ts`
+runs one. Every measurement runs for at least
 1 s (shared and native each; a full run takes about 1.5 minutes). Before
 `perf/per-key-heap` it was 5 s: 5 fresh processes per case gave the same mean and
 the same run-to-run spread (0.3–3 %) at 5 s, 1 s and 0.5 s, so rows before and
 after that commit stay comparable. Differences below 5 % are variance either way.
+
+**Methodology change (fresh process per case):** the numbers are not comparable
+with rows measured in one process. Top-level primitive reads, for example, were
+about twice as fast in the single process (476 M ops/s) as they are when the
+case runs alone (about 200 M), while object property reads were slower there
+(255 M against about 440 M). The first row measured this way has no valid
+`Δ vs prev`; measure the previous commit again the same way to compare.
 
 ## Results
 
