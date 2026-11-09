@@ -432,7 +432,6 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - Optimize the read hot path: direct cache on the proxy target.
 - Optimize `Mutex`: skip notify when no worker is waiting.
 - Start the refcount coordinator/tracker automatically in `init()`.
-[1.0.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.0.2
 - Document the minimum Bun version (`>= 1.4.0`).
 
 ## [0.1.0] - 2026-11-01
@@ -447,6 +446,7 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[1.0.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.3...v1.0.0
 [0.2.3]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.2...v0.2.3
