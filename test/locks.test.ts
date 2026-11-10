@@ -115,6 +115,21 @@ describe("Mutex re-entrancy and ownership", () => {
     const m = new Mutex(new SharedArrayBuffer(4));
     expect(m.withLock(() => m.withLock(() => "ok"))).toBe("ok");
   });
+
+  test("a release racing with the waiter marking leaves a claimable cell", () => {
+    // The state a waiter can leave behind: the owner released between the
+    // waiter's failed acquire and its `Atomics.or`, so the cell carries only
+    // the waiter bit. Any acquire must be able to claim it — nobody will ever
+    // store 0 into it again, so waiting on it would hang until the timeout.
+    const sab = new SharedArrayBuffer(8);
+    const cell = new Int32Array(sab);
+    cell[0] = 0x80000000 | 0;
+    const m = new Mutex(sab);
+    m.lock();
+    expect(m.owner).toBe(getThreadId());
+    m.unlock();
+    expect(m.owner).toBe(0);
+  });
 });
 
 describe("lock timeouts", () => {

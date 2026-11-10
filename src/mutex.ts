@@ -8,29 +8,35 @@ import {
 /**
  * A cross-worker, re-entrant mutex built on Atomics.
  *
- * Uses a single Int32 cell in a SharedArrayBuffer. The cell encodes the lock
- * state: 0 = free, 1 = held (no waiters), 2 = held (waiters present).
+ * Uses one Int32 state cell in a SharedArrayBuffer. The cell encodes both the
+ * lock state and the owner: 0 = free, otherwise the owning thread's id, with
+ * bit 31 set when at least one other thread is waiting for the lock. Keeping
+ * the owner inside the state cell makes an uncontended acquire/release a
+ * single `compareExchange` plus a single `exchange` — the hot path of every
+ * write.
  *
  * `lock()` acquires the mutex with a compare-exchange spin, falling back to
  * `Atomics.wait` so the thread sleeps instead of busy-spinning while the lock
  * is held elsewhere. `unlock()` releases the cell and wakes waiting workers.
  *
- * The "2 = has waiters" encoding lets `unlock()` skip the (relatively
- * expensive) `Atomics.notify` entirely when no other worker is waiting — the
- * common uncontended case. When the cell was 2, all waiters are woken
- * (`notify(Infinity)`); those that lose the race re-mark the cell as 2 and
- * sleep again. The waiter re-checks the cell after marking it 2, so a release
- * that happens between the failed acquire and the `wait` is not lost (the
- * `wait` returns immediately with "not-equal" and the loop retries).
+ * The waiter bit lets `unlock()` skip the (relatively expensive)
+ * `Atomics.notify` entirely when no other worker is waiting — the common
+ * uncontended case. When the bit was set, all waiters are woken
+ * (`notify(Infinity)`); those that lose the race re-mark the cell and sleep
+ * again. A release that lands between a waiter's failed compare-exchange and
+ * its `Atomics.or` leaves the cell as a lone waiter bit, which the next loop
+ * iteration claims with the second compare-exchange — so the release is never
+ * lost and no waiter ever sleeps on a bit nobody can clear.
  *
  * The mutex is re-entrant: the same thread may acquire it multiple times
  * (e.g. a locked operation that internally calls another locked operation)
- * without deadlocking. The owning thread's id and the re-entrancy depth live
- * in the shared buffer itself (cells 1 and 2), so re-entrancy is recognised
- * even when several `Mutex` instances (or several `SharedArrayBuffer` objects
- * received via `postMessage`) wrap the same memory in one thread. Buffers of
- * only 4 bytes (the pre-1.0.3 layout) still work, with re-entrancy tracked per
- * `Mutex` instance.
+ * without deadlocking. The owner lives in the state cell itself; the
+ * re-entrancy depth lives in the second cell of the buffer (when the buffer
+ * is big enough), so re-entrancy is recognised even when several `Mutex`
+ * instances (or several `SharedArrayBuffer` objects received via
+ * `postMessage`) wrap the same memory in one thread. Buffers of only 4 bytes
+ * (the pre-1.0.3 layout) still work, with re-entrancy tracked per `Mutex`
+ * instance.
  *
  * Waiting is bounded: after `timeoutMs` (default {@link getDefaultLockTimeout})
  * `lock()` throws a {@link LockTimeoutError} naming the owner thread, so a
@@ -40,8 +46,17 @@ import {
  * The same Mutex instance (backed by the same SharedArrayBuffer) must be
  * shared across all workers that access the protected data.
  */
-/** Bytes needed for the full layout: state, owner id, depth. */
-const FULL_BYTES = 12;
+/** Bytes needed for the full layout: the state cell plus a depth cell. */
+const FULL_BYTES = 8;
+
+/**
+ * Bit 31 of the state cell: at least one thread is waiting for the lock.
+ * `| 0` makes it the *signed* int32 value (-2147483648), matching what
+ * `Atomics` operations read back from an Int32Array.
+ */
+const WAITERS_BIT = 0x80000000 | 0;
+/** Mask selecting the owner id in the state cell (0 = free). */
+const OWNER_MASK = 0x7fffffff;
 
 /** Random non-zero id identifying this thread as a lock owner. */
 const THREAD_ID: number = (() => {
@@ -67,7 +82,7 @@ export interface MutexOptions {
 
 export class Mutex {
   protected readonly cell: Int32Array;
-  /** Whether the buffer has the owner/depth cells (>= 12 bytes). */
+  /** Whether the buffer has the state + depth cells (>= 8 bytes). */
   protected readonly full: boolean;
   private readonly timeoutMs: number | undefined;
 
@@ -75,7 +90,7 @@ export class Mutex {
     const sab = buffer ?? new SharedArrayBuffer(FULL_BYTES);
     const byteOffset = options?.byteOffset ?? 0;
     this.full = sab.byteLength - byteOffset >= FULL_BYTES;
-    this.cell = new Int32Array(sab, byteOffset, this.full ? 3 : 1);
+    this.cell = new Int32Array(sab, byteOffset, this.full ? 2 : 1);
     this.timeoutMs = options?.timeoutMs;
   }
 
@@ -86,27 +101,28 @@ export class Mutex {
 
   /** Id of the thread currently holding the lock (0 = free / unknown). */
   get owner(): number {
-    return this.full ? Atomics.load(this.cell, 1) : 0;
+    return Atomics.load(this.cell, 0) & OWNER_MASK;
   }
 
   /** Whether the calling thread currently holds the lock. */
   get heldByCurrentThread(): boolean {
     return this.full
-      ? Atomics.load(this.cell, 1) === THREAD_ID
+      ? (Atomics.load(this.cell, 0) & OWNER_MASK) === THREAD_ID
       : (depths.get(this) ?? 0) > 0;
   }
 
   /** Acquire the mutex, blocking until it is available (or it times out). */
   lock(): void {
-    // Fast path: uncontended acquire.
-    if (Atomics.compareExchange(this.cell, 0, 0, 1) === 0) {
+    // Fast path: uncontended acquire. The owner id doubles as the "held"
+    // state, so one compare-exchange is all it takes.
+    if (Atomics.compareExchange(this.cell, 0, 0, THREAD_ID) === 0) {
       this.markOwned();
       return;
     }
     // Re-entrant acquire by the owning thread. The owner id is cleared before
     // every release, so it equals ours only while we really hold the lock.
     if (this.heldByCurrentThread) {
-      if (this.full) Atomics.add(this.cell, 2, 1);
+      if (this.full) Atomics.add(this.cell, 1, 1);
       else depths.set(this, depths.get(this)! + 1);
       return;
     }
@@ -117,50 +133,67 @@ export class Mutex {
     const timeoutMs = this.timeoutMs ?? getDefaultLockTimeout();
     const deadline = deadlineFor(timeoutMs);
     while (true) {
-      // Try to claim the lock: 0 (free) -> 1 (held, no waiters).
-      if (Atomics.compareExchange(this.cell, 0, 0, 1) === 0) {
+      // Try to claim the lock. The second compare-exchange also claims a cell
+      // left as a lone waiter bit by a waiter whose release raced with the
+      // marking (see the class comment).
+      if (Atomics.compareExchange(this.cell, 0, 0, THREAD_ID) === 0) {
         this.markOwned();
         return;
       }
-      // Lock is held elsewhere. Mark the cell as "has waiters" (1 -> 2), then
-      // sleep. If the lock was released between our failed acquire and this
-      // mark, the cell is 0 and `wait` returns immediately ("not-equal"), so
-      // the loop retries instead of sleeping forever.
-      Atomics.compareExchange(this.cell, 0, 1, 2);
-      if (waitUntil(this.cell, 0, 2, deadline) === "timed-out") {
+      if (
+        Atomics.compareExchange(this.cell, 0, WAITERS_BIT, THREAD_ID) ===
+        WAITERS_BIT
+      ) {
+        this.markOwned();
+        return;
+      }
+      // Lock is held elsewhere. Mark the waiter bit, then sleep. `or` returns
+      // the *old* value, so the cell now holds `old | WAITERS_BIT` — that is
+      // what we wait on. A release stores 0, which differs from it, so a
+      // release landing between the mark and the `wait` returns immediately
+      // ("not-equal") and the loop retries instead of sleeping forever.
+      const old = Atomics.or(this.cell, 0, WAITERS_BIT);
+      if (old === 0) {
+        // The owner released between the failed compare-exchange and the
+        // marking: the cell is now a lone waiter bit, which the next
+        // iteration's compare-exchange claims directly. Don't wait on it.
+        continue;
+      }
+      if (
+        waitUntil(this.cell, 0, old | WAITERS_BIT, deadline) === "timed-out"
+      ) {
         throw new LockTimeoutError(
           "Mutex",
           timeoutMs,
-          this.full ? `owner thread ${this.owner}` : undefined,
+          `owner thread ${old & OWNER_MASK}`,
         );
       }
     }
   }
 
   protected markOwned(): void {
-    if (this.full) {
-      Atomics.store(this.cell, 2, 1);
-      Atomics.store(this.cell, 1, THREAD_ID);
-    } else {
-      depths.set(this, 1);
-    }
+    if (this.full) Atomics.store(this.cell, 1, 1);
+    else depths.set(this, 1);
   }
 
   /** Release the mutex and wake any waiting workers. */
   unlock(): void {
     if (this.full) {
-      if (Atomics.load(this.cell, 1) !== THREAD_ID) {
+      const raw = Atomics.load(this.cell, 0);
+      if ((raw & OWNER_MASK) !== THREAD_ID) {
         throw new Error("Mutex: unlock() by a thread that does not hold it");
       }
-      const depth = Atomics.load(this.cell, 2);
+      const depth = Atomics.load(this.cell, 1);
       if (depth > 1) {
-        Atomics.store(this.cell, 2, depth - 1);
+        Atomics.store(this.cell, 1, depth - 1);
         return;
       }
-      // Clear ownership *before* releasing so a stale owner id can never
-      // make another thread look like the owner.
-      Atomics.store(this.cell, 1, 0);
-      Atomics.store(this.cell, 2, 0);
+      // Release with one exchange: it clears the owner and returns the waiter
+      // bit set while we held the lock. Only wake waiters if there were any;
+      // in the uncontended case we skip the expensive notify.
+      if (Atomics.exchange(this.cell, 0, 0) & WAITERS_BIT) {
+        Atomics.notify(this.cell, 0, Infinity);
+      }
     } else {
       const depth = depths.get(this) ?? 0;
       if (depth > 1) {
@@ -168,11 +201,9 @@ export class Mutex {
         return;
       }
       depths.delete(this);
-    }
-    // Release the lock. Only wake waiters if there were any (cell was 2);
-    // in the uncontended case (cell was 1) we skip the expensive notify.
-    if (Atomics.exchange(this.cell, 0, 0) === 2) {
-      Atomics.notify(this.cell, 0, Infinity);
+      if (Atomics.exchange(this.cell, 0, 0) & WAITERS_BIT) {
+        Atomics.notify(this.cell, 0, Infinity);
+      }
     }
   }
 
@@ -184,12 +215,12 @@ export class Mutex {
    * inconsistent.
    */
   forceUnlock(ownerId: number): boolean {
-    if (!this.full || ownerId === 0) return false;
-    if (Atomics.compareExchange(this.cell, 1, ownerId, 0) !== ownerId) {
+    if (ownerId === 0) return false;
+    if ((Atomics.load(this.cell, 0) & OWNER_MASK) !== ownerId) {
       return false;
     }
-    Atomics.store(this.cell, 2, 0);
     Atomics.store(this.cell, 0, 0);
+    if (this.full) Atomics.store(this.cell, 1, 0);
     Atomics.notify(this.cell, 0, Infinity);
     return true;
   }
@@ -207,22 +238,22 @@ export class Mutex {
 
 /**
  * A `Mutex` whose re-entrancy depth is a plain field of this instance instead
- * of a cell in the shared buffer. It halves the atomic operations of an
- * uncontended lock/unlock pair (4 instead of 8), which matters on the write
- * hot path.
+ * of a cell in the shared buffer. An uncontended lock/unlock pair then costs
+ * two atomic operations (one compare-exchange, one exchange), which matters on
+ * the write hot path.
  *
  * Only valid where exactly one `StripeLock` instance per thread wraps a given
  * cell, so that the instance sees every acquisition made by its thread. That
  * holds for the per-key lock stripes of `SharedMemory` (one `SharedMemory` per
- * thread). The owner id is still published in the shared cell, so recovery of
- * a lock held by a dead thread (`forceUnlock`) works as before.
+ * thread). The owner id is still published in the shared state cell, so
+ * recovery of a lock held by a dead thread (`forceUnlock`) works as before.
  */
 export class StripeLock extends Mutex {
   private depth = 0;
 
   constructor(buffer: SharedArrayBuffer, options?: MutexOptions) {
     super(buffer, options);
-    if (!this.full) throw new RangeError("StripeLock needs a 12-byte cell");
+    if (!this.full) throw new RangeError("StripeLock needs an 8-byte cell");
   }
 
   override get heldByCurrentThread(): boolean {
@@ -234,8 +265,8 @@ export class StripeLock extends Mutex {
       this.depth++;
       return;
     }
-    if (Atomics.compareExchange(this.cell, 0, 0, 1) === 0) {
-      Atomics.store(this.cell, 1, THREAD_ID);
+    // The thread id itself is the "held" state: one compare-exchange to own it.
+    if (Atomics.compareExchange(this.cell, 0, 0, THREAD_ID) === 0) {
       this.depth = 1;
       return;
     }
@@ -243,7 +274,6 @@ export class StripeLock extends Mutex {
   }
 
   protected override markOwned(): void {
-    Atomics.store(this.cell, 1, THREAD_ID);
     this.depth = 1;
   }
 
@@ -256,10 +286,9 @@ export class StripeLock extends Mutex {
       throw new Error("Mutex: unlock() by a thread that does not hold it");
     }
     this.depth = 0;
-    // Clear ownership before releasing so a stale owner id can never make
-    // another thread look like the owner.
-    Atomics.store(this.cell, 1, 0);
-    if (Atomics.exchange(this.cell, 0, 0) === 2) {
+    // One exchange clears ownership and returns the waiter bit accumulated
+    // while the lock was held; only wake waiters if there were any.
+    if (Atomics.exchange(this.cell, 0, 0) & WAITERS_BIT) {
       Atomics.notify(this.cell, 0, Infinity);
     }
   }
