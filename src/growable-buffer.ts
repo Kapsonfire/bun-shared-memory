@@ -95,9 +95,18 @@ interface Chunk {
 /** Round `n` up to the next power of two (chunk sizes must be powers of two). */
 export function nextPowerOfTwo(n: number): number {
   if (n <= 0) return 1;
-  let p = 1;
-  while (p < n) p <<= 1;
-  return p;
+  // The bit trick below works through 2^31; above it `>>>` wraps to uint32 and
+  // would produce a wrong (or zero) result. Those inputs never occur in
+  // practice (chunk sizes are bounded by the memory budget), but stay correct.
+  if (n > 2 ** 31) return 2 ** Math.ceil(Math.log2(n));
+  // Fill all bits below the highest set bit, then add one.
+  n = n - 1;
+  n |= n >>> 1;
+  n |= n >>> 2;
+  n |= n >>> 4;
+  n |= n >>> 8;
+  n |= n >>> 16;
+  return n + 1;
 }
 
 export function largestPowerOfTwo(n: number): number {
