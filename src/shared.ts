@@ -96,6 +96,7 @@ function writeLock<T>(
   // Key creation (and other global-mutex sections) writes a key that has no
   // Index Table entry yet: nothing else can touch it, and the global mutex
   // already excludes maintenance.
+  // Fast path: if global lock held, skip stripe lock and index lookup.
   if (mem.holdsGlobalLock) return fn();
   let index = target?.__index;
   if (index === undefined) {
@@ -606,10 +607,20 @@ const layoutCache = new Map<
   { layout: ObjectLayout | null; version: number }
 >();
 
-/** Get (and cache) the stable layout of an object value, or null if not an object. */
-function getObjectLayout(mem: SharedMemory, key: string): ObjectLayout | null {
+/**
+ * Get (and cache) the stable layout of an object value, or null if not an
+ * object. `layoutVersion` may be passed when the caller already holds the
+ * key's stripe (or the global mutex) and has read the version without
+ * atomics; otherwise it is read with an `Atomics.load`.
+ */
+function getObjectLayout(
+  mem: SharedMemory,
+  key: string,
+  layoutVersion?: number,
+): ObjectLayout | null {
+  const version = layoutVersion ?? mem.getLayoutVersion();
   const cached = layoutCache.get(key);
-  if (cached !== undefined && cached.version === mem.getLayoutVersion()) {
+  if (cached !== undefined && cached.version === version) {
     return cached.layout;
   }
   const layout = mem.withLock(() => mem.getObjectLayout(key));
@@ -1319,12 +1330,16 @@ function writePropInner(
   arrayCapacity?: number,
   target?: WriteTarget,
 ): void {
+  // While we hold the key's stripe the layout version is stable, so we read it
+  // once (plain read, no atomics) and reuse it for all checks below.
+  const cachedLv = mem.layoutVersionInLock();
+
   // If the slot type is already cached on the target, we can skip the
   // getObjectLayout Map lookup for top-level arrays (which are never objects).
   const knownType = target?.__type;
   if (knownType !== TYPE_ARRAY_REF) {
     // Object property: use the cached layout to write only that slot.
-    const layout = getObjectLayout(mem, key);
+    const layout = getObjectLayout(mem, key, cachedLv);
     if (layout !== null) {
       const slotOffset = layout.properties.get(prop as string);
       if (slotOffset === undefined) {
@@ -1338,9 +1353,6 @@ function writePropInner(
   }
 
   // Top-level array index write: update only that array slot.
-  // While we hold the key's stripe the layout version is stable, so we read it
-  // once and reuse it for all checks below.
-  const cachedLv = mem.layoutVersionInLock();
   const offset = getCachedOffset(mem, key, target, cachedLv);
   if (offset === null) {
     throw new Error(`No shared value found for key "${key}"`);
@@ -2611,14 +2623,17 @@ function createArrayProxy(
    * when the cached count is too small for a requested index (the array may
    * have grown in place via `push` without a layout-version bump).
    */
+  // Only ever called from writeArrayProp, which runs inside the key's stripe
+  // lock, so the layout version can be read without atomics.
   function getRef(minCount = 0): {
     offset: number;
     count: number;
     capacity: number;
   } {
-    if (cachedLayoutVersion !== mem.getLayoutVersion()) {
+    const lv = mem.layoutVersionInLock();
+    if (cachedLayoutVersion !== lv) {
       cachedRef = undefined;
-      cachedLayoutVersion = mem.getLayoutVersion();
+      cachedLayoutVersion = lv;
     }
     if (cachedRef !== undefined && cachedRef.count >= minCount)
       return cachedRef;
