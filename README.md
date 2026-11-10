@@ -36,22 +36,25 @@ by hand and passed directly to `app.fetch()` (no HTTP server); each methodology
 is benchmarked sequentially with 4 workers. See
 [`bench/real-world/README.md`](bench/real-world/README.md) for setup.
 
-Measured on macOS (arm64, Bun 1.4.4, 100,000 requests per methodology, sorted
-by speed; MySQL/Redis ran in Docker over TCP; each methodology is the minimum
-over several runs × samples to filter CPU-contention noise; the full log is
-`benchlogs/1794219946-0e4a234-real.md`):
+Measured on Linux (Core Ultra 7 265K, Bun 1.4.4, 100,000 requests per
+methodology, sorted by speed; MySQL/Redis ran in Docker, once over TCP and once
+over a Unix socket; each methodology is the minimum over several runs × samples
+to filter CPU-contention noise; the full log is
+`benchlogs/1794292058-5e470fc-real.md`):
 
-| Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared  |
-| ----------- | --------- | -------- | ------------ | --------- | ----------- |
-| `shared`    | —         | 100,000  | 21           | 4,675,965 | —           |
-| `sqlite`    | —         | 100,000  | 185          | 539,807   | 8.7× slower |
-| `redis`     | tcp       | 100,000  | 6,296        | 15,883    | 294× slower |
-| `mysql`     | tcp       | 100,000  | 7,464        | 13,398    | 349× slower |
+| Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared   |
+| ----------- | --------- | -------- | ------------ | --------- | ------------ |
+| `shared`    | —         | 100,000  | 15           | 6,758,358 | —            |
+| `sqlite`    | —         | 100,000  | 81           | 1,235,619 | 5.5× slower  |
+| `redis`     | socket    | 100,000  | 275          | 364,207   | 18.6× slower |
+| `mysql`     | socket    | 100,000  | 429          | 233,111   | 29.0× slower |
+| `redis`     | tcp       | 100,000  | 821          | 121,876   | 55.5× slower |
+| `mysql`     | tcp       | 100,000  | 1,059        | 94,433    | 71.6× slower |
 
-Shared memory is the fastest by a wide margin: ~9× faster than a live SQLite
-read and ~300× faster than live MySQL/Redis reads over TCP. The database numbers
-depend heavily on the machine and on how the containers are networked; treat
-them as an order of magnitude, not a constant.
+Shared memory is the fastest by a wide margin: ~5× faster than a live SQLite
+read, ~20–30× faster than MySQL/Redis over a Unix socket and ~55–70× faster over
+TCP. The database numbers depend heavily on the machine and on how the
+containers are networked; treat them as an order of magnitude, not a constant.
 
 ## ✨ Features
 
