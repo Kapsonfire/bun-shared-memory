@@ -2519,11 +2519,13 @@ function parseIndex(prop: string | symbol): number {
   if (typeof prop !== "string") return -1;
   const length = prop.length;
   if (length === 0) return -1;
-  if (length > 15) return /^\d+$/.test(prop) ? Number(prop) : -1;
   let index = 0;
   for (let i = 0; i < length; i++) {
     const digit = prop.charCodeAt(i) - 48;
     if (digit < 0 || digit > 9) return -1;
+    // For 16+ digits `index` overflows 2^53 and the value is rounded, but any
+    // such index is beyond the Int32 array bounds anyway, so the rounding does
+    // not matter: the caller's bounds check rejects it just the same.
     index = index * 10 + digit;
   }
   return index;
