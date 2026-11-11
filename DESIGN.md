@@ -191,23 +191,31 @@ load while a stripe is held (taking the lock is a full barrier). What remains
 shared is the per-key version cell and stripe, which only the writers of that
 key touch.
 
-Each mutex occupies 12 bytes: cell 0 is the state
-(**0** = free, **1** = held, **2** = held with waiters), cell 1 the owner
-thread id, cell 2 the re-entrancy depth.
+Each mutex occupies 8 bytes. Cell 0 is a single state word that encodes both
+the owner and the waiters: **0** = free, otherwise the owning thread's id, with
+bit 31 set when at least one other thread is waiting. Cell 1 is the
+re-entrancy depth.
 
-- `lock()` claims cell 0 with `Atomics.compareExchange` (0 → 1). On failure it
-  marks the cell as "has waiters" (1 → 2) and falls back to a bounded
-  `Atomics.wait`, so the thread sleeps instead of busy-spinning. The waiter
-  re-checks the cell after marking it 2, so a release between the failed
-  acquire and the `wait` is not lost.
-- `unlock()` clears owner and depth, then releases the cell with
-  `Atomics.exchange` (→ 0). It only calls `Atomics.notify` when the previous
-  value was 2 (waiters present).
-- **Re-entrancy** is recorded in the shared buffer itself (owner id + depth).
-  The owner id is cleared before every release, so it equals the calling
-  thread's id only while that thread really holds the lock. This also works
-  when several `Mutex` instances wrap the same buffer in one thread. Legacy
-  4-byte buffers fall back to per-instance depth tracking.
+- `lock()` claims cell 0 with one `Atomics.compareExchange` (0 → own thread id)
+  — the owner id _is_ the "held" state, so an uncontended acquire is a single
+  atomic. On failure it re-checks for a cell left as a lone waiter bit (see
+  below), then marks bit 31 with `Atomics.or` and falls back to a bounded
+  `Atomics.wait`, so the thread sleeps instead of busy-spinning. `or` returns
+  the _old_ value; the waiter waits on `old | waiter bit`, so a release that
+  lands between the marking and the `wait` stores 0, differs from that value,
+  and wakes the waiter immediately.
+- `unlock()` releases with one `Atomics.exchange` (→ 0), which also returns the
+  waiter bit. It calls `Atomics.notify` only when that bit was set.
+- **Re-entrancy** is recorded in cell 1 (depth), and the owner lives in the
+  state word itself. The owner is cleared by every release, so it equals the
+  calling thread's id only while that thread really holds the lock. This also
+  works when several `Mutex` instances wrap the same buffer in one thread.
+  Legacy 4-byte buffers fall back to per-instance depth tracking.
+
+An unstored `Mutex` (no owner, just the waiter bit) is claimed directly by the
+next `compareExchange`, so a release that races with a waiter's marking is
+never lost.
+
 - **Bounded waits.** Every lock wait (`Mutex`, `RWLock`, the object seqlock,
   `waitForWritesToFinish`) times out (default 30 s, `setDefaultLockTimeout`)
   with a `LockTimeoutError`, so a crashed lock holder cannot hang other

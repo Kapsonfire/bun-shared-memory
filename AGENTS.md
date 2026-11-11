@@ -17,17 +17,35 @@ Key entry points:
 - `src/mutex.ts`, `src/notifier.ts` — Atomics-based synchronization
 - `src/index.ts` — public exports
 
+## Benchmarks are run by a human, never by an agent
+
+**Local benchmark runs are executed by a human.** An agent must not run
+`bun run bench`, `bun run bench:contention`, `bun run bench:readscale`,
+`bench/refspeed.ts`, `bench/heap.ts`, `bench/gcheap.ts` or the real-world
+benchmark itself — it asks the human to run them.
+
+- The agent prepares the run: which commit to measure, which previous row to
+  compare against, and the exact commands to run. Then it hands them to the
+  human and waits.
+- **While a benchmark is running, the agent does nothing else.** No other
+  commands, no tests, no subagents, no background tasks — anything competing
+  for CPU or memory skews the numbers.
+- The human says when the run is finished. Only then does the agent read the
+  results and write the `BENCH.md` row.
+- `bun test` and `bun run typecheck` are unaffected by this rule and may still
+  be run by the agent — but not while a benchmark is in progress.
+
 ## Required workflow before every commit
 
 1. **All tests must pass.** Run `bun test`. Do not commit if any test fails.
    `bun run test:coverage` additionally writes `coverage/lcov.info`, which the
    Sonar configuration (`sonar-project.properties`) reads.
-2. **Run the benchmark for every codebase change.** Run `bun run bench` (or
-   `bun bench/bench.ts`). Record the results in the running table in
-   `BENCH.md` (see below).
+2. **A benchmark is needed for every codebase change.** Ask the human to run
+   `bun run bench` (or `bun bench/bench.ts`), then record the results in the
+   running table in `BENCH.md` (see below).
 3. **Locking changes also need the contention benchmark.** If you touch locks,
-   the write path or defragmentation, additionally run
-   `bun run bench:contention` and record the numbers in `BENCH.md`.
+   the write path or defragmentation, the human additionally runs
+   `bun run bench:contention` and the numbers go into `BENCH.md`.
 4. **Typecheck.** Run `bun run typecheck` (`bun check`). Keep it clean.
 5. **Format.** Run `bun fmt` if formatting is expected.
 

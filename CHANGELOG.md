@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Mutex state cell packs owner and waiters.** The owning thread id is now
+  stored in the lock's state cell itself (bit 31 = "someone is waiting"),
+  instead of in a separate owner cell. An uncontended `lock()`/`unlock()` pair
+  therefore costs two atomic operations (one `compareExchange`, one `exchange`)
+  instead of six; every write pays for this. The mutex buffer is now 8 bytes
+  (state + re-entrancy depth) instead of 12. Buffers created by older versions
+  (4 bytes and 12 bytes) still work: a 12-byte buffer is read as the new
+  8-byte layout plus an unused cell.
+- **`nextPowerOfTwo` is a bit trick** instead of a shift loop, with an explicit
+  `Math.log2` fallback above 2^31.
+
+### Fixed
+
+- **Mutex deadlock under contention.** A waiter marked the waiter bit with
+  `Atomics.or` and then slept on the value `or` _returned_ — the old value. If
+  the owner released the lock between the waiter's failed acquire and the
+  marking, the cell became a lone waiter bit and the waiter slept on `0` while
+  nobody stored `0` again: the lock was free but the waiter never woke, until
+  the 30 s timeout. Waiters now sleep on `old | waiter bit`, and a cell that is
+  a lone waiter bit is claimed directly by the next compare-exchange.
+
 ## [1.1.0] - 2026-11-09
 
 ### Added
