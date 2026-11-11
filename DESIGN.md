@@ -199,8 +199,10 @@ re-entrancy depth.
 - `lock()` claims cell 0 with one `Atomics.compareExchange` (0 → own thread id)
   — the owner id _is_ the "held" state, so an uncontended acquire is a single
   atomic. On failure it re-checks for a cell left as a lone waiter bit (see
-  below), then marks bit 31 with `Atomics.or` and falls back to a bounded
-  `Atomics.wait`, so the thread sleeps instead of busy-spinning. `or` returns
+  below), spins briefly on plain loads (only while no other thread is queued;
+  a critical section is shorter than a sleep/wake round trip), then marks
+  bit 31 with `Atomics.or` and falls back to a bounded `Atomics.wait`, so the
+  thread sleeps instead of busy-spinning. `or` returns
   the _old_ value; the waiter waits on `old | waiter bit`, so a release that
   lands between the marking and the `wait` stores 0, differs from that value,
   and wakes the waiter immediately.

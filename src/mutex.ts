@@ -15,9 +15,11 @@ import {
  * single `compareExchange` plus a single `exchange` — the hot path of every
  * write.
  *
- * `lock()` acquires the mutex with a compare-exchange spin, falling back to
- * `Atomics.wait` so the thread sleeps instead of busy-spinning while the lock
- * is held elsewhere. `unlock()` releases the cell and wakes waiting workers.
+ * `lock()` acquires the mutex with a compare-exchange. If the lock is held
+ * elsewhere it first spins for a bounded number of loads (a critical section is
+ * usually shorter than a sleep/wake round trip), then falls back to
+ * `Atomics.wait` so the thread sleeps instead of busy-spinning for long.
+ * `unlock()` releases the cell and wakes waiting workers.
  *
  * The waiter bit lets `unlock()` skip the (relatively expensive)
  * `Atomics.notify` entirely when no other worker is waiting — the common
@@ -57,6 +59,11 @@ const FULL_BYTES = 8;
 const WAITERS_BIT = 0x80000000 | 0;
 /** Mask selecting the owner id in the state cell (0 = free). */
 const OWNER_MASK = 0x7fffffff;
+/**
+ * Loads of the state cell a contended `lock()` spends waiting for the owner to
+ * release before it marks the waiter bit and sleeps (see `lockSlow`).
+ */
+const SPIN_LIMIT = 128;
 
 /** Random non-zero id identifying this thread as a lock owner. */
 const THREAD_ID: number = (() => {
@@ -132,6 +139,24 @@ export class Mutex {
   protected lockSlow(): void {
     const timeoutMs = this.timeoutMs ?? getDefaultLockTimeout();
     const deadline = deadlineFor(timeoutMs);
+    // Spin briefly before sleeping: a critical section (one write) lasts tens
+    // of nanoseconds, a sleep/wake round trip through the futex takes
+    // microseconds, and a sleeping waiter also forces the owner's `unlock()`
+    // to pay for a `notify`. The loop only reads the cell (no marking, no
+    // writes), so it does not disturb the owner; once the cell looks free the
+    // compare-exchanges below claim it.
+    //
+    // Only the first contender spins: once the waiter bit is set somebody is
+    // already queued, and with several threads polling the same cache line
+    // every release invalidates it in all of them, which costs more than the
+    // sleep it saves. Later contenders go straight to sleep.
+    const cell = this.cell;
+    if ((Atomics.load(cell, 0) & WAITERS_BIT) === 0) {
+      for (let spin = 0; spin < SPIN_LIMIT; spin++) {
+        const state = Atomics.load(cell, 0);
+        if (state === 0 || (state & WAITERS_BIT) !== 0) break;
+      }
+    }
     while (true) {
       // Try to claim the lock. The second compare-exchange also claims a cell
       // left as a lone waiter bit by a waiter whose release raced with the
