@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8-byte layout plus an unused cell.
 - **`nextPowerOfTwo` is a bit trick** instead of a shift loop, with an explicit
   `Math.log2` fallback above 2^31.
+- **Contended `lock()` spins briefly before it sleeps.** A critical section
+  (one write) lasts tens of nanoseconds, a futex sleep/wake round trip takes
+  microseconds. The first contender now polls the state cell for up to 128
+  loads before it marks the waiter bit and waits; further contenders (waiter
+  bit already set) sleep at once, because several threads polling one cache
+  line cost more than they save. Two writers on the same key gain roughly
+  30-60 %; the uncontended path and independent keys are unchanged.
 
 ### Fixed
 
