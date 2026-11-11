@@ -273,9 +273,10 @@ try {
 ```
 
 A forced unlock may leave the protected data half-written, so only use it when
-the owner is known to be dead. The mutex records the owning thread and
-re-entrancy depth in the shared buffer, so several `Mutex` instances over the
-same buffer in one thread correctly see each other's holds.
+the owner is known to be dead. The mutex stores the owning thread id _inside_
+the state cell (so an uncontended lock/unlock pair needs just two atomic
+operations) plus the re-entrancy depth in the next cell, which lets several
+`Mutex` instances over the same buffer in one thread see each other's holds.
 
 ### Notifier
 
