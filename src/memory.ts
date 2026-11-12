@@ -2206,8 +2206,13 @@ export class SharedMemory {
     }
 
     // Phase 6: Rewrite object property names and value slots, and array slots.
+    // Whether a block is an object comes from `liveObjects` (old offsets,
+    // recorded while marking): after Phase 2 the bytes at an old offset belong
+    // to whatever block was moved there, so reading the type there misread
+    // objects as single slots (and the other way round) whenever the
+    // compaction moved anything, leaving nested object references unmapped.
     for (const oldOffset of sortedData) {
-      if (this.dataTable.getInt32(oldOffset) !== TYPE_OBJECT) continue;
+      if (!liveObjects.has(oldOffset)) continue;
       const newOff = objectRemap.get(oldOffset)!;
       const count = this.dataTable.getInt32(newOff + 4);
       let cursor = newOff + OBJECT_HEADER;
@@ -2220,7 +2225,7 @@ export class SharedMemory {
       }
     }
     for (const oldOffset of sortedData) {
-      if (this.dataTable.getInt32(oldOffset) === TYPE_OBJECT) continue;
+      if (liveObjects.has(oldOffset)) continue;
       const newOff = objectRemap.get(oldOffset)!;
       remapSlot(this.dataTable, newOff, stringRemap, arrayRemap, objectRemap);
     }
