@@ -834,9 +834,14 @@ function readValueAtLocator(mem: SharedMemory, locator: ArrayLocator): unknown {
  */
 function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
   if (Array.isArray(value)) {
-    const copy: unknown[] = [];
-    for (let i = 0; i < value.length; i++) {
-      copy.push(copyValue(value[i], seen));
+    // `slice` copies the primitives in one native call; only nested arrays and
+    // objects need a copy of their own.
+    const copy = value.slice();
+    for (let i = 0; i < copy.length; i++) {
+      const element = copy[i];
+      if (element !== null && typeof element === "object") {
+        copy[i] = copyValue(element, seen);
+      }
     }
     return copy;
   }
@@ -852,13 +857,17 @@ function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
       const copy = Object.assign({} as Record<string, unknown>, value);
       map.set(value, copy);
       for (const k in copy) {
-        copy[k] = copyValue(copy[k], map);
+        const v = copy[k];
+        if (v !== null && typeof v === "object") copy[k] = copyValue(v, map);
       }
       return copy;
     }
+    // `Object.assign` already copied the primitives; only nested arrays and
+    // objects need a copy of their own.
     const copy = Object.assign({} as Record<string, unknown>, value);
     for (const k in copy) {
-      copy[k] = copyValue(copy[k], seen);
+      const v = copy[k];
+      if (v !== null && typeof v === "object") copy[k] = copyValue(v, seen);
     }
     return copy;
   }
