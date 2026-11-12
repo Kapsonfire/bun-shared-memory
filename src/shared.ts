@@ -413,6 +413,8 @@ const readCache = new Map<
   string,
   {
     version: number;
+    /** The version cell's raw value for `version` (lock bits clear): a hit is `cell === raw`. */
+    raw: number;
     value: unknown;
     index: number;
     cell: number;
@@ -873,7 +875,9 @@ function createNestedObjectProxy(
   // Per-property read cache of this proxy: value and the key version it was
   // read at. Filled under the key's lock by `readFieldBody`.
   let cell = -1;
-  const fields = new Map<string, { version: number; value: unknown }>();
+  // Entries hold the version cell's raw value they were read at (lock bits
+  // clear), so a hit is one comparison with the cell.
+  const fields = new Map<string, { raw: number; value: unknown }>();
   let fieldProp = "";
   const readFieldBody = (): unknown => {
     const prop = fieldProp;
@@ -907,15 +911,14 @@ function createNestedObjectProxy(
       }
     }
     if ((rawIn & VERSION_LOCK_MASK) === 0) {
-      const version = rawIn >> VERSION_LOCK_SHIFT_BITS;
       const entry = fields.get(prop);
       if (entry === undefined) {
         // Bounded: any name asked for gets an entry (also names the object
         // does not have, such as `then` probed by `await`).
         if (fields.size >= MAX_CHILD_PROXIES) fields.clear();
-        fields.set(prop, { version, value });
+        fields.set(prop, { raw: rawIn, value });
       } else {
-        entry.version = version;
+        entry.raw = rawIn;
         entry.value = value;
       }
     }
@@ -931,19 +934,14 @@ function createNestedObjectProxy(
       if (prop === "buffer") return mem.dataTable.buffers[0];
       if (typeof prop !== "string") return undefined;
       // This proxy's per-property cache, valid while the key's version is
-      // unchanged and no lock bit is set (the same check as everywhere).
+      // unchanged and no lock bit is set (the same check as everywhere). An
+      // entry exists only after a miss, which resolved `cell` below.
+      const hit = fields.get(prop);
+      if (hit !== undefined && mem.versionView[cell] === hit.raw) {
+        return hit.value;
+      }
       if (cell < 0) {
         cell = mem.getVersionCellIndex(getIndex(mem, locator.key));
-      }
-      const raw = mem.versionView[cell]!;
-      if ((raw & VERSION_LOCK_MASK) === 0) {
-        const hit = fields.get(prop);
-        if (
-          hit !== undefined &&
-          hit.version === raw >> VERSION_LOCK_SHIFT_BITS
-        ) {
-          return hit.value;
-        }
       }
       // Miss: read just this property's slot under the key's lock (not the
       // whole root value: decoding all of a large value for one property
@@ -1297,13 +1295,9 @@ function readProp(
   // to match; otherwise we fall through to `readValue`, which waits out any
   // active lock before decoding.
   const cached = readCache.get(key);
-  const raw = cached !== undefined ? mem.versionView[cached.cell]! : -1;
   let value: unknown;
-  if (
-    cached !== undefined &&
-    (raw & VERSION_LOCK_MASK) === 0 &&
-    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
-  ) {
+  // `cached.raw` has no lock bits: equal means unlocked and current.
+  if (cached !== undefined && mem.versionView[cached.cell] === cached.raw) {
     value = cached.value;
   } else {
     // Miss (typically right after a write). A single element of an array need
@@ -1353,7 +1347,7 @@ function readObjectProp(
   mem: SharedMemory,
   key: string,
   prop: string,
-  fieldCache: { version: number; value: unknown },
+  fieldCache: { version: number; raw: number; value: unknown },
   version: number,
   arrayCapacity?: number,
   knownSlotOffset?: number,
@@ -1376,6 +1370,7 @@ function readObjectProp(
   const primitive = mem.readPrimitiveAt(slotOffset);
   if (primitive !== NOT_PRIMITIVE) {
     fieldCache.version = version;
+    fieldCache.raw = version << VERSION_LOCK_SHIFT_BITS;
     fieldCache.value = primitive;
     return primitive;
   }
@@ -1389,6 +1384,7 @@ function readObjectProp(
       arrayCapacity,
     );
     fieldCache.version = version;
+    fieldCache.raw = version << VERSION_LOCK_SHIFT_BITS;
     fieldCache.value = value;
     return value;
   }
@@ -1401,6 +1397,7 @@ function readObjectProp(
     );
   }
   fieldCache.version = version;
+  fieldCache.raw = version << VERSION_LOCK_SHIFT_BITS;
   fieldCache.value = value;
   return value;
 }
@@ -1669,6 +1666,7 @@ class RefTarget<T = unknown> {
   __cache:
     | {
         version: number;
+        raw: number;
         value: unknown;
         index: number;
         cell: number;
@@ -1911,10 +1909,23 @@ const REF_PROTO: object = (() => {
 interface PropState {
   t: RefTarget;
   name: string;
-  /** Version-cell index, resolved lazily; -1 until then. */
+  /**
+   * Version-cell index, resolved by the first `readPropMiss`; 0 until then
+   * (the Index Table header, which the getter may read: it never equals
+   * `raw`'s start value, so the first access always misses).
+   */
   cell: number;
+  cellResolved: boolean;
   /** Version and decoded value of the property cache (`readObjectProp` fills them). */
   version: number;
+  /**
+   * The version cell's raw value that `version` corresponds to (lock bits
+   * clear), so the getter's hit test is one comparison. Starts as -1: both
+   * lock bits set, a state a version cell never has (READLOCK and WRITER are
+   * never set together), and not a key count either, so it never matches
+   * before a value was read.
+   */
+  raw: number;
   value: unknown;
   /**
    * Stable proxies for an array property and a plain nested object property.
@@ -2081,7 +2092,11 @@ function makeWriteBody(st: PropState): () => void {
 function readPropMiss(st: PropState): unknown {
   const { mem, key, arrayCapacity } = st.t;
   const name = st.name;
-  const cell = st.cell; // set by the getter before it gets here
+  if (!st.cellResolved) {
+    st.cell = mem.getVersionCellIndex(getIndex(mem, key));
+    st.cellResolved = true;
+  }
+  const cell = st.cell;
   // If this property is an array or a plain nested object, return the stable
   // cached proxy (which reads fresh data on each access) instead of making a
   // new one after every write. The proxy reads nothing here, so there is no
@@ -2117,6 +2132,7 @@ function readPropMiss(st: PropState): unknown {
       // access after a write came back here).
       if ((seen & VERSION_LOCK_MASK) === 0 && now === seen) {
         st.version = seen >> VERSION_LOCK_SHIFT_BITS;
+        st.raw = seen;
         st.value = proxy;
       }
       return proxy;
@@ -2219,14 +2235,13 @@ function readPropMiss(st: PropState): unknown {
  * answer for these cases.
  */
 function readIndexFast(t: RefTarget, prop: string): unknown {
-  const cached = readCache.get(t.key);
-  if (cached === undefined) return NOT_PRIMITIVE;
-  const raw = t.mem.versionView[cached.cell]!;
-  if (
-    (raw & VERSION_LOCK_MASK) !== 0 ||
-    cached.version !== raw >> VERSION_LOCK_SHIFT_BITS
-  ) {
-    return NOT_PRIMITIVE;
+  // The entry is remembered on the target, so a hit skips the Map lookup.
+  let cached = t.__cache;
+  if (cached === undefined || t.mem.versionView[cached.cell] !== cached.raw) {
+    cached = readCache.get(t.key);
+    if (cached === undefined) return NOT_PRIMITIVE;
+    if (t.mem.versionView[cached.cell] !== cached.raw) return NOT_PRIMITIVE;
+    t.__cache = cached;
   }
   const value = cached.value;
   if (!Array.isArray(value)) return NOT_PRIMITIVE;
@@ -2265,6 +2280,9 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
     // Every shared method (`this[TARGET]`) asks for this first.
     if (prop === TARGET) return t;
     if (prop === "read") {
+      // Not tried again: checking `t.__cache` here before `readValue` (to skip
+      // its Map lookup, as `readIndexFast` does) made primitive reads 31 %
+      // slower, measured twice (number read 486 → 335 M ops/s).
       return (t.__readFn ??= () => {
         const v = readValue(t.mem, t.key, t);
         return typeof v === "object" && v !== null ? copyValue(v) : v;
@@ -2347,8 +2365,10 @@ function createSharedRef<T>(
       const st: PropState = {
         t: target,
         name,
-        cell: -1,
+        cell: 0,
+        cellResolved: false,
         version: -1,
+        raw: -1,
         value: undefined,
         arrayProxy: undefined,
         objectProxy: undefined,
@@ -2365,21 +2385,12 @@ function createSharedRef<T>(
           // without a function-call chain. The version cell doubles as a
           // seqlock: we wait (without a mutex) while a lock is held, then
           // compare the version so reads that raced a write re-decode.
-          let cell = st.cell;
-          if (cell < 0) {
-            cell = st.cell = mem.getVersionCellIndex(getIndex(mem, key));
-          }
           // Hit: a plain (non-atomic) read of the version cell. An atomic load
           // of a cache line that many workers read does not scale (readers of
           // the same hot key got slower with every worker added); a plain load
           // does, and a stale value only delays seeing a change.
-          const seen = mem.versionView[cell]!;
-          if (
-            (seen & VERSION_LOCK_MASK) === 0 &&
-            st.version === seen >> VERSION_LOCK_SHIFT_BITS
-          ) {
-            return st.value;
-          }
+          // `st.raw` has no lock bits, so equal means: unlocked and current.
+          if (mem.versionView[st.cell] === st.raw) return st.value;
           return readPropMiss(st);
         },
         set(v: unknown) {
@@ -2440,6 +2451,7 @@ function readValue(
   cacheTarget?: {
     __cache?: {
       version: number;
+      raw: number;
       value: unknown;
       index: number;
       cell: number;
@@ -2451,12 +2463,7 @@ function readValue(
   // {hit,value} union returned by readCachedValue. The version cell doubles as
   // a seqlock: a hit requires clear lock bits and a matching version.
   const cached = readCache.get(key);
-  const raw = cached !== undefined ? mem.versionView[cached.cell]! : -1;
-  if (
-    cached !== undefined &&
-    (raw & VERSION_LOCK_MASK) === 0 &&
-    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
-  ) {
+  if (cached !== undefined && mem.versionView[cached.cell] === cached.raw) {
     return cached.value;
   }
 
@@ -2502,7 +2509,14 @@ function readValue(
     return decodeValue(mem, mem.readValueSlot(offset));
   });
 
-  const entry = { version, value, index, cell, ev: -1 };
+  const entry = {
+    version,
+    raw: version << VERSION_LOCK_SHIFT_BITS,
+    value,
+    index,
+    cell,
+    ev: -1,
+  };
   readCache.set(key, entry);
   if (cacheTarget) cacheTarget.__cache = entry;
   return value;
@@ -3005,13 +3019,7 @@ const CACHE_MISS: unique symbol = Symbol("cache-miss");
 function peekCached(mem: SharedMemory, key: string): unknown {
   const cached = readCache.get(key);
   if (cached === undefined) return CACHE_MISS;
-  const raw = mem.versionView[cached.cell]!;
-  if (
-    (raw & VERSION_LOCK_MASK) === 0 &&
-    cached.version === raw >> VERSION_LOCK_SHIFT_BITS
-  ) {
-    return cached.value;
-  }
+  if (mem.versionView[cached.cell] === cached.raw) return cached.value;
   return CACHE_MISS;
 }
 
