@@ -145,6 +145,24 @@ function runSequence(
         show(ref.read()),
         `seed ${seed} ${shape} step ${step}: ${op}`,
       ).toBe(show(model));
+      // Element reads through the proxy, twice (the second one is the cached
+      // path), including one past the end.
+      const views: Array<[any, unknown[]]> =
+        shape === "top"
+          ? [[ref, model]]
+          : shape === "prop"
+            ? [[ref.tags, model.tags]]
+            : model.tags.map((m: unknown[], i: number) => [ref.tags[i], m]);
+      for (const [shared, m] of views) {
+        for (let pass = 0; pass < 2; pass++) {
+          for (let i = 0; i <= m.length; i++) {
+            expect(
+              show(shared[i]),
+              `seed ${seed} ${shape} step ${step}: ${op}, element ${i}`,
+            ).toBe(show(m[i]));
+          }
+        }
+      }
     }
   } finally {
     mem.dispose();
