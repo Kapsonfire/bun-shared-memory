@@ -1570,6 +1570,14 @@ export class SharedMemory {
     return offset;
   }
 
+  /** Type tag of the DataTable slot at `offset`, read straight from the chunk view. */
+  slotTypeAt(offset: number): number {
+    const buf = this.dataTable;
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return buf.getInt32(offset);
+    return buf.viewAt(offset).getInt32(o, true);
+  }
+
   /**
    * The primitive stored in the DataTable slot at `offset` (number, boolean,
    * bigint, null, inline string), or `NOT_PRIMITIVE`. Allocation-free fast

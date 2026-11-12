@@ -12,7 +12,7 @@ import { Shared, SharedMemory } from "../src/index.ts";
 
 const WORKERS = 4;
 
-type Scenario = "slots" | "samestr" | "late" | "mix";
+type Scenario = "slots" | "samestr" | "late" | "mix" | "nested";
 
 /** What one worker does; runs inside the worker (no imports, no closures). */
 function work(scenario: Scenario, w: number, W: number, n: number, ref: any) {
@@ -23,6 +23,10 @@ function work(scenario: Scenario, w: number, W: number, n: number, ref: any) {
     }
   } else if (scenario === "samestr") {
     for (let c = 1; c <= n; c++) ref.write(`${w}:${c}`);
+  } else if (scenario === "nested") {
+    // Long strings (heap blocks, reused in place) into a nested object.
+    const p = ref.p;
+    for (let c = 1; c <= n; c++) p.s = `${w}:${c}:` + String(w).repeat(30);
   } else if (scenario === "late") {
     // Write to the index this very push created while the others keep pushing.
     for (let c = 0; c < n; c++) {
@@ -172,6 +176,21 @@ describe("concurrent writers", () => {
     });
     r.dispose();
     expect(r.problems).toEqual([]);
+  });
+
+  test("nested object writes: readers never see a string mixed from two writes", async () => {
+    const n = 5000;
+    const r = await run("nested", { p: { s: "0:0" } }, n, (ref, fail) => {
+      const v: string = ref.p.s;
+      const m = /^(\d+):(\d+):(\d+)$/.exec(v);
+      if (v !== "0:0" && (!m || m[3] !== m[1]!.repeat(30))) {
+        fail(`read ${JSON.stringify(v)}`);
+      }
+    });
+    const fin: string = r.ref.read().p.s;
+    r.dispose();
+    expect(r.problems).toEqual([]);
+    expect(fin).toMatch(new RegExp(`^\\d:${n}:\\d{30}$`));
   });
 
   test("an index made valid by a push is writable at once, while others push", async () => {
