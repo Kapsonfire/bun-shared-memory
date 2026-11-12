@@ -610,6 +610,41 @@ describe("Shared", () => {
     // The cache must be unaffected by mutating the returned copy.
     expect(user.name).toBe("Alice");
   });
+
+  test("mutating what read() returned leaves every cached read path intact", () => {
+    // `arr[i]` answers from the cached decoded array, so a copy that shared
+    // its storage with the cache would show up there first.
+    const flat = Shared("cache-4", [1, 2, 3]);
+    const a = flat.read();
+    a[0] = 999;
+    a.push(4);
+    expect(flat[0]).toBe(1);
+    expect(flat.length).toBe(3);
+    expect(flat.read()).toEqual([1, 2, 3]);
+
+    const nested = Shared("cache-5", [[1, 2], [3]]);
+    const n = nested.read();
+    n[0]![0] = 999;
+    n[1]!.push(7);
+    expect(nested.read()).toEqual([[1, 2], [3]]);
+
+    const obj = Shared("cache-6", {
+      tags: ["x", "y"],
+      profile: { name: "A", level: 1 },
+      n: 1,
+    });
+    const o = obj.read();
+    o.tags[0] = "mutated";
+    o.tags.push("z");
+    o.profile.name = "mutated";
+    o.n = 2;
+    expect(obj.read()).toEqual({
+      tags: ["x", "y"],
+      profile: { name: "A", level: 1 },
+      n: 1,
+    });
+    expect(obj.tags[0]).toBe("x");
+  });
 });
 
 describe("SharedMemory string interning", () => {
