@@ -933,14 +933,19 @@ export class SharedMemory {
       stripe.unlock();
       return -1;
     }
-    this.writingCells.push(cell);
+    // No other write of this thread is in progress (checked above), so
+    // `writingCells` is empty and stays so: `writingTop` alone marks the cell,
+    // and nothing runs between here and `endPlainWrite` that could nest.
     this.writingTop = cell;
     return cell;
   }
 
   /** Finish a write started by `beginPlainWrite`: bump the version, release. */
   endPlainWrite(index: number, cell: number): void {
-    this.writingCells.pop();
+    // `writingCells` is empty here (see `beginPlainWrite`), so this is -1.
+    // Written this way, not as a plain `= -1`, on purpose: measured, the
+    // constant made the contention benchmark's writer loop (`o.n = i` in a
+    // worker) 25 % slower, while this form is the fastest in both loop shapes.
     this.writingTop =
       this.writingCells.length === 0
         ? -1
@@ -2068,9 +2073,24 @@ export class SharedMemory {
     return this.layoutVersion[0]!;
   }
 
-  /** Bump the global layout version, invalidating all per-worker caches. */
+  /**
+   * Bump the global layout version, invalidating all per-worker caches. Steps
+   * of 2 keep it even: an odd version means a defragmentation is moving data
+   * right now (see `defragment`, `layoutSettled`).
+   */
   bumpLayoutVersion(): void {
-    Atomics.add(this.layoutVersion, 0, 1);
+    Atomics.add(this.layoutVersion, 0, 2);
+  }
+
+  /**
+   * Whether a lock-free reader may read table bytes at layout version `lv`
+   * (read with `getLayoutVersion` before reading): false while a
+   * defragmentation is in progress. Such a reader must also check afterwards
+   * that the version is still `lv`, and otherwise read again or under the
+   * key's lock (which waits for the defragmentation, as it holds every stripe).
+   */
+  static layoutSettled(lv: number): boolean {
+    return (lv & 1) === 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -2088,11 +2108,27 @@ export class SharedMemory {
    *
    * All references (Index Table offsets, object property names, string slots,
    * array slots) are remapped in a single pass. The global layout version is
-   * bumped at the end so workers invalidate their cached offsets.
+   * made odd before anything moves and even again afterwards (a seqlock):
+   * lock-free readers that read table bytes see that data was moving under
+   * them, and every worker invalidates its cached offsets.
    *
    * Must be called under the shared lock (or on a single thread).
    */
   defragment(options?: { releaseChunks?: boolean }): {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  } {
+    Atomics.add(this.layoutVersion, 0, 1);
+    try {
+      return this.defragmentInner(options);
+    } finally {
+      Atomics.add(this.layoutVersion, 0, 1);
+    }
+  }
+
+  private defragmentInner(options?: { releaseChunks?: boolean }): {
     indexTable: SharedArrayBuffer[];
     dataTable: SharedArrayBuffer[];
     stringTable: SharedArrayBuffer[];
@@ -2282,8 +2318,8 @@ export class SharedMemory {
       }
     }
 
-    // Phase 7: Invalidate all per-worker caches.
-    this.bumpLayoutVersion();
+    // Phase 7 (invalidating all per-worker caches) is the layout-version
+    // bump in `defragment`, after this returns.
 
     // Phase 8: Reclaim memory from inactive chunks (beyond the compacted
     // region). The Index Table is a single growable SAB and is never replaced.

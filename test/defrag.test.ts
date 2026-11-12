@@ -93,6 +93,24 @@ describe("MaintenanceCoordinator", () => {
 });
 
 describe("Defragmentation", () => {
+  test("the layout version is odd only while a defragmentation runs", () => {
+    // Lock-free readers of table bytes treat an odd version as "data is
+    // moving" and an unchanged even one as "nothing moved" (a seqlock).
+    const mem = new SharedMemory({ initialSize: 4096, maxByteLength: 1 << 24 });
+    const a = Shared("parity-a", { s: "x".repeat(40) }, { memory: mem });
+    a.s = "y".repeat(50); // dead space for the compaction
+    const before = mem.getLayoutVersion();
+    expect(before % 2).toBe(0);
+    mem.withLock(() => mem.defragment());
+    expect(mem.getLayoutVersion()).toBe(before + 2);
+    mem.bumpLayoutVersion();
+    expect(mem.getLayoutVersion()).toBe(before + 4);
+    expect(SharedMemory.layoutSettled(before)).toBe(true);
+    expect(SharedMemory.layoutSettled(before + 1)).toBe(false);
+    expect(a.s).toBe("y".repeat(50));
+    mem.dispose();
+  });
+
   test("remaps nested object references when the compaction moves blocks", () => {
     // A whole write stores new nested object blocks behind the old ones; the
     // compaction then moves the root block onto space that held something
