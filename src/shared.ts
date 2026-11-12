@@ -1530,6 +1530,37 @@ class RefTarget<T = unknown> {
 
   write(value: T): void {
     this.__cache = undefined;
+    // Fast path for a number into a slot whose offset, type and index are
+    // already cached: the same lock + version bump as `writeValue`, without its
+    // global state and closure. Validated once the stripe is held (defrag takes
+    // every stripe), and anything unusual (global section, nested write,
+    // user-level lock, layout moved, object slot) takes the general path.
+    if (typeof value === "number") {
+      const index = this.__index;
+      if (index !== undefined) {
+        const mem = this.mem;
+        const cell = mem.beginPlainWrite(index);
+        if (cell >= 0) {
+          let done = false;
+          try {
+            const offset = this.__offset;
+            const type = this.__type;
+            if (
+              offset !== undefined &&
+              type !== undefined &&
+              type !== 5 &&
+              this.__layoutVersion === mem.layoutVersionInLock()
+            ) {
+              mem.updateNumberSlot(offset, value);
+              done = true;
+            }
+          } finally {
+            mem.endPlainWrite(index, cell);
+          }
+          if (done) return;
+        }
+      }
+    }
     writeValue(this.mem, this.key, value, this.arrayCapacity, this);
   }
 
@@ -1763,7 +1794,14 @@ function readPropMiss(st: PropState): unknown {
  */
 const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
   get(t, prop) {
-    if (prop === "read") return (t.__readFn ??= () => t.read());
+    // Every shared method (`this[TARGET]`) asks for this first.
+    if (prop === TARGET) return t;
+    if (prop === "read") {
+      return (t.__readFn ??= () => {
+        const v = readValue(t.mem, t.key, t);
+        return typeof v === "object" && v !== null ? copyValue(v) : v;
+      });
+    }
     if (prop === "write") return REF_METHODS.write;
     if (prop === "update") return REF_METHODS.update;
     if (prop === "withRWLock") return REF_METHODS.withRWLock;
@@ -1771,7 +1809,6 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
     if (prop === "withReadLock") return REF_METHODS.withReadLock;
     if (prop === "key") return t.key;
     if (prop === "buffer") return t.mem.dataTable.buffers[0];
-    if (prop === TARGET) return t;
     if (prop === Symbol.toPrimitive) return REF_METHODS.toPrimitive;
 
     // push/pop on a top-level array: operate directly on the array ref
