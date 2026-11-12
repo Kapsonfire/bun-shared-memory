@@ -282,4 +282,88 @@ describe("number write fast path", () => {
       mem.dispose();
     });
   });
+
+  describe("array index writes follow a replaced array", () => {
+    test("top-level: an index write after a whole write lands in the new array", () => {
+      const mem = new SharedMemory();
+      const a = Shared<number[]>("rep-top", [1, 2, 3, 4], { memory: mem });
+      a[0] = 9;
+      a[1] = 8; // warm
+      a.write([7, 7, 7, 7, 7, 7]);
+      a[0] = 5;
+      expect(a.read()).toEqual([5, 7, 7, 7, 7, 7]);
+      a.write([1, 2]);
+      a[1] = 6;
+      expect(a.read()).toEqual([1, 6]);
+      expect(() => {
+        a[3] = 1;
+      }).toThrow(RangeError);
+      mem.dispose();
+    });
+
+    test("array property: the same, and pop / push / length keep the bounds", () => {
+      const mem = new SharedMemory();
+      const o = Shared<{ tags: number[]; n: number }>(
+        "rep-prop",
+        { tags: [1, 2, 3, 4], n: 1 },
+        { memory: mem, arrayCapacity: 8 },
+      );
+      o.tags[0] = 9;
+      o.tags[1] = 8; // warm
+      o.write({ tags: [7, 7, 7, 7, 7, 7], n: 1 });
+      o.tags[0] = 5;
+      expect(o.read().tags).toEqual([5, 7, 7, 7, 7, 7]);
+      o.write({ tags: [1, 2, 3, 4], n: 1 });
+      o.tags.pop();
+      expect(() => {
+        o.tags[3] = 1;
+      }).toThrow(RangeError);
+      o.tags.push(5);
+      o.tags[3] = 55;
+      expect(o.read().tags).toEqual([1, 2, 3, 55]);
+      o.tags.length = 2;
+      expect(() => {
+        o.tags[3] = 7;
+      }).toThrow(RangeError);
+      mem.dispose();
+    });
+
+    test("array property: a push by another worker is seen by the next index write", async () => {
+      const mem = new SharedMemory();
+      const o = Shared<{ tags: number[] }>(
+        "rep-worker",
+        { tags: [1, 2, 3, 4] },
+        { memory: mem, arrayCapacity: 8 },
+      );
+      o.tags[0] = 9;
+      o.tags[1] = 8; // warm
+      const code = `
+        import { Shared, SharedMemory } from ${JSON.stringify(
+          new URL("../src/index.ts", import.meta.url).href,
+        )};
+        self.onmessage = (e) => {
+          const mem = SharedMemory.fromBuffers(e.data);
+          const o = Shared("rep-worker", undefined, { memory: mem });
+          o.tags.push(5);
+          self.postMessage("pushed");
+        };
+      `;
+      const w = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(code),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      await new Promise<void>((resolve, reject) => {
+        w.onerror = (e) => reject(new Error(e.message));
+        w.onmessage = () => resolve();
+        w.postMessage(mem.exportBuffers());
+      });
+      w.terminate();
+      o.tags[4] = 55;
+      expect(o.read().tags).toEqual([9, 8, 3, 4, 55]);
+      mem.dispose();
+    });
+  });
 });
