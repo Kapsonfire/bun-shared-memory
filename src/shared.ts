@@ -1715,7 +1715,9 @@ class RefTarget<T = unknown> {
   ) {}
 
   read(): T {
-    return copyValue(readValue(this.mem, this.key, this)) as T;
+    const v = readValue(this.mem, this.key, this);
+    // Primitives need no copy.
+    return (typeof v === "object" && v !== null ? copyValue(v) : v) as T;
   }
 
   write(value: T): void {
@@ -2283,13 +2285,22 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
       // Not tried again: checking `t.__cache` here before `readValue` (to skip
       // its Map lookup, as `readIndexFast` does) made primitive reads 31 %
       // slower, measured twice (number read 486 → 335 M ops/s).
+      // The form of these wrappers matters to the JIT, measured: a bound
+      // `read` made primitive reads 46 % slower than this arrow function.
       return (t.__readFn ??= () => {
         const v = readValue(t.mem, t.key, t);
         return typeof v === "object" && v !== null ? copyValue(v) : v;
       });
     }
     if (prop === "write") {
-      return (t.__writeFn ??= (value: unknown) => t.write(value));
+      // A plain function expression. Measured against the alternatives
+      // (number write, M ops/s, `bun run bench` case / a loop of `o.write(i)`):
+      // arrow `(v) => t.write(v)` 49.6 / 79; `t.write.bind(t)` 80 / 48 (the
+      // loop shape, the common one, 40 % slower); `.call`/`.apply` 55 / 79;
+      // this one 57 / 81.
+      return (t.__writeFn ??= function (value: unknown) {
+        t.write(value);
+      });
     }
     if (prop === "update") return REF_METHODS.update;
     if (prop === "withRWLock") return REF_METHODS.withRWLock;
