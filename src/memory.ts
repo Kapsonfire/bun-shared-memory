@@ -117,6 +117,11 @@ export function isVersionCellLocked(raw: number): boolean {
  * held across a synchronous call stack.
  */
 export const writeCellDepths = new Map<number, number>();
+
+/** Results of `SharedMemory.tryBeginCellWrite`. */
+const CELL_BEGAN = 0;
+const CELL_OWN = 1;
+const CELL_BUSY = 2;
 /** Same for the user-level read locks (`withReadLock`) this thread holds. */
 export const readCellDepths = new Map<number, number>();
 
@@ -839,20 +844,38 @@ export class SharedMemory {
     if (this.globalDepth > 0) return fn();
     const cell = versionCellIndex(index);
     const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
-    stripe.lock();
-    this.lockDepth++;
     let began = false;
-    try {
+    let deadline = -1;
+    let timeoutMs = 0;
+    for (;;) {
+      stripe.lock();
+      this.lockDepth++;
       // Only an ordinary write of this same cell by this thread is checked up
-      // front (a cheap array test). A user-level lock held by this thread shows
-      // up as set lock bits in `beginCellWrite`, whose slow path recognises it:
-      // the common case pays for no map lookups.
-      if (!this.isWritingCell(cell)) {
-        began = this.beginCellWrite(cell);
-        if (began) {
-          this.writingCells.push(cell);
-          this.writingTop = cell;
-        }
+      // front (a cheap array test). A user-level lock held by this thread
+      // shows up as set lock bits, which `tryBeginCellWrite` recognises: the
+      // common case pays for no map lookups.
+      if (this.isWritingCell(cell)) break;
+      const state = this.tryBeginCellWrite(cell);
+      if (state !== CELL_BUSY) {
+        began = state === CELL_BEGAN;
+        break;
+      }
+      // Another thread holds a user-level lock on the object. Wait for it
+      // without holding the stripe: that holder may need the stripe itself (a
+      // read that misses its cache inside `withReadLock` takes it), and
+      // waiting with the stripe held deadlocked the two.
+      this.lockDepth--;
+      stripe.unlock();
+      if (deadline < 0) {
+        timeoutMs = getDefaultLockTimeout();
+        deadline = deadlineFor(timeoutMs);
+      }
+      this.waitCellFree(cell, deadline, timeoutMs);
+    }
+    try {
+      if (began) {
+        this.writingCells.push(cell);
+        this.writingTop = cell;
       }
       return fn();
     } catch (error) {
@@ -887,35 +910,88 @@ export class SharedMemory {
     return this.withKeyWrite(index, fn);
   }
 
-  /** Set the WRITER bit of `cell`; true if this call set it (and must clear it). */
-  private beginCellWrite(cell: number): boolean {
-    const old = Atomics.or(this.versionView, cell, WRITER_BIT);
-    if ((old & VERSION_LOCK_MASK) === 0) return true;
-    return this.beginCellWriteSlow(cell, old);
+  /**
+   * Closure-free start of a plain write, for hot paths that cannot allocate
+   * (see `RefTarget.write`): takes the key's stripe and the cell's WRITER bit
+   * like `withKeyWrite` does, and returns the version cell to hand to
+   * `endPlainWrite`, or -1 when the caller must use `withKeyWrite` instead (the
+   * thread is inside a global section, another write of this thread is in
+   * progress, or it holds a user-level lock on the object). Nothing is held
+   * after a -1. The caller must call `endPlainWrite` in a `finally` and must
+   * not allocate or throw a `BudgetExceededError` in between (no reclaim here).
+   */
+  beginPlainWrite(index: number): number {
+    if (this.globalDepth > 0 || this.writingTop !== -1) return -1;
+    const cell = versionCellIndex(index);
+    const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
+    stripe.lock();
+    this.lockDepth++;
+    // Anything but a free cell (a lock bit of this or another thread) goes to
+    // `withKeyWrite`, which waits for another holder without the stripe.
+    if (this.tryBeginCellWrite(cell) !== CELL_BEGAN) {
+      this.lockDepth--;
+      stripe.unlock();
+      return -1;
+    }
+    // No other write of this thread is in progress (checked above), so
+    // `writingCells` is empty and stays so: `writingTop` alone marks the cell,
+    // and nothing runs between here and `endPlainWrite` that could nest.
+    this.writingTop = cell;
+    return cell;
+  }
+
+  /** Finish a write started by `beginPlainWrite`: bump the version, release. */
+  endPlainWrite(index: number, cell: number): void {
+    // `writingCells` is empty here (see `beginPlainWrite`), so this is -1.
+    // Written this way, not as a plain `= -1`, on purpose: measured, the
+    // constant made the contention benchmark's writer loop (`o.n = i` in a
+    // worker) 25 % slower, while this form is the fastest in both loop shapes.
+    this.writingTop =
+      this.writingCells.length === 0
+        ? -1
+        : this.writingCells[this.writingCells.length - 1]!;
+    // Version + 1 and clear the WRITER bit in one add.
+    Atomics.add(this.versionView, cell, VERSION_STEP - WRITER_BIT);
+    this.lockDepth--;
+    this.stripes[index & (LOCK_STRIPES - 1)]!.unlock();
   }
 
   /**
-   * `beginCellWrite` found a lock bit already set (`old` is the cell before our
-   * `or`). Undo our bit if it was ours, then either recognise a lock this
-   * thread holds itself or wait for the other holder to release.
+   * Try to set the WRITER bit of `cell`, without waiting: `CELL_BEGAN` (this
+   * call set it and must clear it), `CELL_OWN` (this thread holds a
+   * user-level lock on the object, the write runs inside it without a bit of
+   * its own) or `CELL_BUSY` (another thread holds a lock bit; nothing is set).
    */
-  private beginCellWriteSlow(cell: number, old: number): boolean {
+  private tryBeginCellWrite(cell: number): number {
+    const old = Atomics.or(this.versionView, cell, WRITER_BIT);
+    if ((old & VERSION_LOCK_MASK) === 0) return CELL_BEGAN;
+    // Kept apart so this hot part stays small enough to inline.
+    return this.tryBeginCellWriteSlow(cell, old);
+  }
+
+  /** `tryBeginCellWrite` found a lock bit set (`old`, the cell before our `or`). */
+  private tryBeginCellWriteSlow(cell: number, old: number): number {
+    // Undo our bit if it was ours.
+    if ((old & WRITER_BIT) === 0) {
+      Atomics.and(this.versionView, cell, ~WRITER_BIT);
+    }
+    if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return CELL_OWN;
+    return CELL_BUSY;
+  }
+
+  /** Wait, holding no stripe, until no lock bit is set on `cell`. */
+  private waitCellFree(
+    cell: number,
+    deadline: number,
+    timeoutMs: number,
+  ): void {
     const view = this.versionView;
-    const timeoutMs = getDefaultLockTimeout();
-    const deadline = deadlineFor(timeoutMs);
-    for (;;) {
-      if ((old & WRITER_BIT) === 0) Atomics.and(view, cell, ~WRITER_BIT);
-      // A user-level lock held by this very thread: we are inside it.
-      if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return false;
-      let raw = Atomics.load(view, cell);
-      while ((raw & VERSION_LOCK_MASK) !== 0) {
-        if (waitSliceUntil(view, cell, raw, deadline) === "timed-out") {
-          throw new LockTimeoutError("object lock", timeoutMs);
-        }
-        raw = Atomics.load(view, cell);
+    let raw = Atomics.load(view, cell);
+    while ((raw & VERSION_LOCK_MASK) !== 0) {
+      if (waitSliceUntil(view, cell, raw, deadline) === "timed-out") {
+        throw new LockTimeoutError("object lock", timeoutMs);
       }
-      old = Atomics.or(view, cell, WRITER_BIT);
-      if ((old & VERSION_LOCK_MASK) === 0) return true;
+      raw = Atomics.load(view, cell);
     }
   }
 
@@ -1526,6 +1602,14 @@ export class SharedMemory {
     return offset;
   }
 
+  /** Type tag of the DataTable slot at `offset`, read straight from the chunk view. */
+  slotTypeAt(offset: number): number {
+    const buf = this.dataTable;
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return buf.getInt32(offset);
+    return buf.viewAt(offset).getInt32(o, true);
+  }
+
   /**
    * The primitive stored in the DataTable slot at `offset` (number, boolean,
    * bigint, null, inline string), or `NOT_PRIMITIVE`. Allocation-free fast
@@ -1573,6 +1657,33 @@ export class SharedMemory {
   /** Update a single value slot in the DataTable. */
   updateValueSlot(offset: number, slot: ValueSlot): void {
     writeSlot(this.dataTable, offset, slot);
+  }
+
+  /**
+   * Refresh `ref` from the array-ref slot at DataTable `offset`: where the
+   * array block is, how many elements it holds and its capacity. All three can
+   * change without a layout-version bump (a whole-value write stores a new
+   * block, push/pop/`length` change the count in place, from any thread), so a
+   * cached ArrayRef must be refreshed under the key's lock before it is used.
+   * Reads straight from the chunk view like the slot writers below. False
+   * (`ref` untouched) when the slot is not an array reference.
+   */
+  refreshArrayRef(ref: ArrayRef, offset: number): boolean {
+    const buf = this.dataTable;
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) {
+      if (buf.getInt32(offset) !== TYPE_ARRAY_REF) return false;
+      ref.offset = buf.getInt32(offset + 4);
+      ref.count = buf.getInt32(offset + 8);
+      ref.capacity = buf.getInt32(offset + 12);
+      return true;
+    }
+    const v = buf.viewAt(offset);
+    if (v.getInt32(o, true) !== TYPE_ARRAY_REF) return false;
+    ref.offset = v.getInt32(o + 4, true);
+    ref.count = v.getInt32(o + 8, true);
+    ref.capacity = v.getInt32(o + 12, true);
+    return true;
   }
 
   /**
@@ -1962,9 +2073,24 @@ export class SharedMemory {
     return this.layoutVersion[0]!;
   }
 
-  /** Bump the global layout version, invalidating all per-worker caches. */
+  /**
+   * Bump the global layout version, invalidating all per-worker caches. Steps
+   * of 2 keep it even: an odd version means a defragmentation is moving data
+   * right now (see `defragment`, `layoutSettled`).
+   */
   bumpLayoutVersion(): void {
-    Atomics.add(this.layoutVersion, 0, 1);
+    Atomics.add(this.layoutVersion, 0, 2);
+  }
+
+  /**
+   * Whether a lock-free reader may read table bytes at layout version `lv`
+   * (read with `getLayoutVersion` before reading): false while a
+   * defragmentation is in progress. Such a reader must also check afterwards
+   * that the version is still `lv`, and otherwise read again or under the
+   * key's lock (which waits for the defragmentation, as it holds every stripe).
+   */
+  static layoutSettled(lv: number): boolean {
+    return (lv & 1) === 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -1982,11 +2108,27 @@ export class SharedMemory {
    *
    * All references (Index Table offsets, object property names, string slots,
    * array slots) are remapped in a single pass. The global layout version is
-   * bumped at the end so workers invalidate their cached offsets.
+   * made odd before anything moves and even again afterwards (a seqlock):
+   * lock-free readers that read table bytes see that data was moving under
+   * them, and every worker invalidates its cached offsets.
    *
    * Must be called under the shared lock (or on a single thread).
    */
   defragment(options?: { releaseChunks?: boolean }): {
+    indexTable: SharedArrayBuffer[];
+    dataTable: SharedArrayBuffer[];
+    stringTable: SharedArrayBuffer[];
+    arrayTable: SharedArrayBuffer[];
+  } {
+    Atomics.add(this.layoutVersion, 0, 1);
+    try {
+      return this.defragmentInner(options);
+    } finally {
+      Atomics.add(this.layoutVersion, 0, 1);
+    }
+  }
+
+  private defragmentInner(options?: { releaseChunks?: boolean }): {
     indexTable: SharedArrayBuffer[];
     dataTable: SharedArrayBuffer[];
     stringTable: SharedArrayBuffer[];
@@ -2090,11 +2232,13 @@ export class SharedMemory {
     const sortedData = [...liveDataOffsets].sort((a, b) => a - b);
     let newDataOffset = 0;
     for (const oldOffset of sortedData) {
-      const size =
-        this.dataTable.getInt32(oldOffset) === TYPE_OBJECT
-          ? OBJECT_HEADER +
-            this.dataTable.getInt32(oldOffset + 4) * (NAME_REF_SIZE + SLOT_SIZE)
-          : SLOT_SIZE;
+      // The kind comes from the mark phase, like in Phase 6 (the bytes here
+      // are still intact only because blocks are copied strictly downwards in
+      // ascending order).
+      const size = liveObjects.has(oldOffset)
+        ? OBJECT_HEADER +
+          this.dataTable.getInt32(oldOffset + 4) * (NAME_REF_SIZE + SLOT_SIZE)
+        : SLOT_SIZE;
       copyBytes(this.dataTable, newDataOffset, oldOffset, size);
       objectRemap.set(oldOffset, newDataOffset);
       newDataOffset += size;
@@ -2135,8 +2279,13 @@ export class SharedMemory {
     }
 
     // Phase 6: Rewrite object property names and value slots, and array slots.
+    // Whether a block is an object comes from `liveObjects` (old offsets,
+    // recorded while marking): after Phase 2 the bytes at an old offset belong
+    // to whatever block was moved there, so reading the type there misread
+    // objects as single slots (and the other way round) whenever the
+    // compaction moved anything, leaving nested object references unmapped.
     for (const oldOffset of sortedData) {
-      if (this.dataTable.getInt32(oldOffset) !== TYPE_OBJECT) continue;
+      if (!liveObjects.has(oldOffset)) continue;
       const newOff = objectRemap.get(oldOffset)!;
       const count = this.dataTable.getInt32(newOff + 4);
       let cursor = newOff + OBJECT_HEADER;
@@ -2149,7 +2298,7 @@ export class SharedMemory {
       }
     }
     for (const oldOffset of sortedData) {
-      if (this.dataTable.getInt32(oldOffset) === TYPE_OBJECT) continue;
+      if (liveObjects.has(oldOffset)) continue;
       const newOff = objectRemap.get(oldOffset)!;
       remapSlot(this.dataTable, newOff, stringRemap, arrayRemap, objectRemap);
     }
@@ -2169,8 +2318,8 @@ export class SharedMemory {
       }
     }
 
-    // Phase 7: Invalidate all per-worker caches.
-    this.bumpLayoutVersion();
+    // Phase 7 (invalidating all per-worker caches) is the layout-version
+    // bump in `defragment`, after this returns.
 
     // Phase 8: Reclaim memory from inactive chunks (beyond the compacted
     // region). The Index Table is a single growable SAB and is never replaced.

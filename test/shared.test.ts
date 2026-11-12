@@ -610,6 +610,92 @@ describe("Shared", () => {
     // The cache must be unaffected by mutating the returned copy.
     expect(user.name).toBe("Alice");
   });
+
+  test("a property that held an array or object hands out what it holds now", () => {
+    const o = Shared("stale-1", {
+      tags: [1, 2] as unknown,
+      p: { q: 1 } as unknown,
+    });
+    expect(Array.isArray(o.tags)).toBe(true); // makes the array proxy
+    o.tags = 5;
+    expect(o.tags).toBe(5);
+    o.tags = [7];
+    expect((o.tags as number[])[0]).toBe(7);
+    expect((o.p as { q: number }).q).toBe(1); // makes the object proxy
+    o.p = "now a string";
+    expect(o.p).toBe("now a string");
+    o.p = { q: 9 };
+    expect((o.p as { q: number }).q).toBe(9);
+  });
+
+  test("index and length writes on an array that became a number leave the number", () => {
+    // The ref cached the slot type `array`; a whole write turned it into a
+    // number. Index writes went into the dead array block and `length = 0`
+    // replaced the number with an array made from its bits.
+    const a = Shared<unknown>("retyped-1", [1, 2, 3]) as any;
+    a[0] = 9; // caches the array slot
+    a.write(5);
+    expect(() => {
+      a[0] = 7;
+    }).toThrow(TypeError);
+    expect(() => {
+      a.length = 0;
+    }).toThrow(TypeError);
+    expect(a.read()).toBe(5);
+    a.write([4, 5]);
+    a[1] = 6;
+    expect(a.read()).toEqual([4, 6]);
+  });
+
+  test("nested arrays and objects keep their proxy identity", () => {
+    const grid = Shared("ident-1", [
+      [1, 2],
+      [3, 4],
+    ]);
+    expect(grid[0]).toBe(grid[0]);
+    const o = Shared("ident-2", { p: { r: { s: 1 } }, m: [[1], [2]] });
+    expect(o.p).toBe(o.p);
+    expect(o.p.r).toBe(o.p.r);
+    expect(o.m[1]).toBe(o.m[1]);
+    o.p.r.s = 2;
+    expect(o.p.r.s).toBe(2);
+    expect(o.p.r).toBe(o.p.r);
+  });
+
+  test("mutating what read() returned leaves every cached read path intact", () => {
+    // `arr[i]` answers from the cached decoded array, so a copy that shared
+    // its storage with the cache would show up there first.
+    const flat = Shared("cache-4", [1, 2, 3]);
+    const a = flat.read();
+    a[0] = 999;
+    a.push(4);
+    expect(flat[0]).toBe(1);
+    expect(flat.length).toBe(3);
+    expect(flat.read()).toEqual([1, 2, 3]);
+
+    const nested = Shared("cache-5", [[1, 2], [3]]);
+    const n = nested.read();
+    n[0]![0] = 999;
+    n[1]!.push(7);
+    expect(nested.read()).toEqual([[1, 2], [3]]);
+
+    const obj = Shared("cache-6", {
+      tags: ["x", "y"],
+      profile: { name: "A", level: 1 },
+      n: 1,
+    });
+    const o = obj.read();
+    o.tags[0] = "mutated";
+    o.tags.push("z");
+    o.profile.name = "mutated";
+    o.n = 2;
+    expect(obj.read()).toEqual({
+      tags: ["x", "y"],
+      profile: { name: "A", level: 1 },
+      n: 1,
+    });
+    expect(obj.tags[0]).toBe("x");
+  });
 });
 
 describe("SharedMemory string interning", () => {

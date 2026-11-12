@@ -93,6 +93,60 @@ describe("MaintenanceCoordinator", () => {
 });
 
 describe("Defragmentation", () => {
+  test("the layout version is odd only while a defragmentation runs", () => {
+    // Lock-free readers of table bytes treat an odd version as "data is
+    // moving" and an unchanged even one as "nothing moved" (a seqlock).
+    const mem = new SharedMemory({ initialSize: 4096, maxByteLength: 1 << 24 });
+    const a = Shared("parity-a", { s: "x".repeat(40) }, { memory: mem });
+    a.s = "y".repeat(50); // dead space for the compaction
+    const before = mem.getLayoutVersion();
+    expect(before % 2).toBe(0);
+    mem.withLock(() => mem.defragment());
+    expect(mem.getLayoutVersion()).toBe(before + 2);
+    mem.bumpLayoutVersion();
+    expect(mem.getLayoutVersion()).toBe(before + 4);
+    expect(SharedMemory.layoutSettled(before)).toBe(true);
+    expect(SharedMemory.layoutSettled(before + 1)).toBe(false);
+    expect(a.s).toBe("y".repeat(50));
+    mem.dispose();
+  });
+
+  test("remaps nested object references when the compaction moves blocks", () => {
+    // A whole write stores new nested object blocks behind the old ones; the
+    // compaction then moves the root block onto space that held something
+    // else. The remap pass used to read each block's type at its old offset
+    // (where another block now lies), so the root was not recognised as an
+    // object and `p` kept pointing at its old, now unused offset.
+    const long = "a long string value here";
+    const writes = [
+      { p: { q: null, r: { s: long } }, n: long },
+      { p: { q: 1, r: { s: long } }, n: long },
+      { p: { q: null, r: { s: "y" } }, n: "z" },
+    ];
+    for (const next of writes) {
+      for (const defragFirst of [true, false]) {
+        const mem = new SharedMemory({
+          initialSize: 4096,
+          maxByteLength: 1 << 24,
+        });
+        const o = Shared(
+          "defrag-nested",
+          { p: { q: 1 as unknown, r: { s: "x" as unknown } }, n: 0 as unknown },
+          { memory: mem },
+        );
+        Shared("defrag-filler", { a: [1, 2, 3], b: "filler" }, { memory: mem });
+        if (defragFirst) mem.withLock(() => mem.defragment());
+        o.write(structuredClone(next));
+        mem.withLock(() => mem.defragment());
+        const where = `${JSON.stringify(next)}, defrag first: ${defragFirst}`;
+        expect(o.p.r.s, where).toBe(next.p.r.s);
+        o.n = 5; // bump the version so the next read decodes from memory
+        expect(o.read(), where).toEqual({ ...next, n: 5 });
+        mem.dispose();
+      }
+    }
+  });
+
   test("reclaims dead space while preserving all values", () => {
     const mem = new SharedMemory({ initialSize: 1024, maxByteLength: 1 << 20 });
     const a = Shared(
