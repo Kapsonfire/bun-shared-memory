@@ -117,6 +117,11 @@ export function isVersionCellLocked(raw: number): boolean {
  * held across a synchronous call stack.
  */
 export const writeCellDepths = new Map<number, number>();
+
+/** Results of `SharedMemory.tryBeginCellWrite`. */
+const CELL_BEGAN = 0;
+const CELL_OWN = 1;
+const CELL_BUSY = 2;
 /** Same for the user-level read locks (`withReadLock`) this thread holds. */
 export const readCellDepths = new Map<number, number>();
 
@@ -839,20 +844,38 @@ export class SharedMemory {
     if (this.globalDepth > 0) return fn();
     const cell = versionCellIndex(index);
     const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
-    stripe.lock();
-    this.lockDepth++;
     let began = false;
-    try {
+    let deadline = -1;
+    let timeoutMs = 0;
+    for (;;) {
+      stripe.lock();
+      this.lockDepth++;
       // Only an ordinary write of this same cell by this thread is checked up
-      // front (a cheap array test). A user-level lock held by this thread shows
-      // up as set lock bits in `beginCellWrite`, whose slow path recognises it:
-      // the common case pays for no map lookups.
-      if (!this.isWritingCell(cell)) {
-        began = this.beginCellWrite(cell);
-        if (began) {
-          this.writingCells.push(cell);
-          this.writingTop = cell;
-        }
+      // front (a cheap array test). A user-level lock held by this thread
+      // shows up as set lock bits, which `tryBeginCellWrite` recognises: the
+      // common case pays for no map lookups.
+      if (this.isWritingCell(cell)) break;
+      const state = this.tryBeginCellWrite(cell);
+      if (state !== CELL_BUSY) {
+        began = state === CELL_BEGAN;
+        break;
+      }
+      // Another thread holds a user-level lock on the object. Wait for it
+      // without holding the stripe: that holder may need the stripe itself (a
+      // read that misses its cache inside `withReadLock` takes it), and
+      // waiting with the stripe held deadlocked the two.
+      this.lockDepth--;
+      stripe.unlock();
+      if (deadline < 0) {
+        timeoutMs = getDefaultLockTimeout();
+        deadline = deadlineFor(timeoutMs);
+      }
+      this.waitCellFree(cell, deadline, timeoutMs);
+    }
+    try {
+      if (began) {
+        this.writingCells.push(cell);
+        this.writingTop = cell;
       }
       return fn();
     } catch (error) {
@@ -903,16 +926,13 @@ export class SharedMemory {
     const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
     stripe.lock();
     this.lockDepth++;
-    let began = false;
-    try {
-      began = this.beginCellWrite(cell);
-    } finally {
-      if (!began) {
-        this.lockDepth--;
-        stripe.unlock();
-      }
+    // Anything but a free cell (a lock bit of this or another thread) goes to
+    // `withKeyWrite`, which waits for another holder without the stripe.
+    if (this.tryBeginCellWrite(cell) !== CELL_BEGAN) {
+      this.lockDepth--;
+      stripe.unlock();
+      return -1;
     }
-    if (!began) return -1;
     this.writingCells.push(cell);
     this.writingTop = cell;
     return cell;
@@ -931,35 +951,42 @@ export class SharedMemory {
     this.stripes[index & (LOCK_STRIPES - 1)]!.unlock();
   }
 
-  /** Set the WRITER bit of `cell`; true if this call set it (and must clear it). */
-  private beginCellWrite(cell: number): boolean {
+  /**
+   * Try to set the WRITER bit of `cell`, without waiting: `CELL_BEGAN` (this
+   * call set it and must clear it), `CELL_OWN` (this thread holds a
+   * user-level lock on the object, the write runs inside it without a bit of
+   * its own) or `CELL_BUSY` (another thread holds a lock bit; nothing is set).
+   */
+  private tryBeginCellWrite(cell: number): number {
     const old = Atomics.or(this.versionView, cell, WRITER_BIT);
-    if ((old & VERSION_LOCK_MASK) === 0) return true;
-    return this.beginCellWriteSlow(cell, old);
+    if ((old & VERSION_LOCK_MASK) === 0) return CELL_BEGAN;
+    // Kept apart so this hot part stays small enough to inline.
+    return this.tryBeginCellWriteSlow(cell, old);
   }
 
-  /**
-   * `beginCellWrite` found a lock bit already set (`old` is the cell before our
-   * `or`). Undo our bit if it was ours, then either recognise a lock this
-   * thread holds itself or wait for the other holder to release.
-   */
-  private beginCellWriteSlow(cell: number, old: number): boolean {
+  /** `tryBeginCellWrite` found a lock bit set (`old`, the cell before our `or`). */
+  private tryBeginCellWriteSlow(cell: number, old: number): number {
+    // Undo our bit if it was ours.
+    if ((old & WRITER_BIT) === 0) {
+      Atomics.and(this.versionView, cell, ~WRITER_BIT);
+    }
+    if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return CELL_OWN;
+    return CELL_BUSY;
+  }
+
+  /** Wait, holding no stripe, until no lock bit is set on `cell`. */
+  private waitCellFree(
+    cell: number,
+    deadline: number,
+    timeoutMs: number,
+  ): void {
     const view = this.versionView;
-    const timeoutMs = getDefaultLockTimeout();
-    const deadline = deadlineFor(timeoutMs);
-    for (;;) {
-      if ((old & WRITER_BIT) === 0) Atomics.and(view, cell, ~WRITER_BIT);
-      // A user-level lock held by this very thread: we are inside it.
-      if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return false;
-      let raw = Atomics.load(view, cell);
-      while ((raw & VERSION_LOCK_MASK) !== 0) {
-        if (waitSliceUntil(view, cell, raw, deadline) === "timed-out") {
-          throw new LockTimeoutError("object lock", timeoutMs);
-        }
-        raw = Atomics.load(view, cell);
+    let raw = Atomics.load(view, cell);
+    while ((raw & VERSION_LOCK_MASK) !== 0) {
+      if (waitSliceUntil(view, cell, raw, deadline) === "timed-out") {
+        throw new LockTimeoutError("object lock", timeoutMs);
       }
-      old = Atomics.or(view, cell, WRITER_BIT);
-      if ((old & VERSION_LOCK_MASK) === 0) return true;
+      raw = Atomics.load(view, cell);
     }
   }
 
