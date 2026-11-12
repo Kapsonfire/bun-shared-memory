@@ -527,17 +527,17 @@ function getOffset(mem: SharedMemory, key: string): number | null {
  * The per-key cache fields on a SharedRef proxy target that the write hot
  * paths use to skip Map lookups and DataTable reads. `__offset`/`__type` are
  * valid only while `__layoutVersion` matches the global layout version;
- * `__arrayRef` additionally requires `__arrayRefLayoutVersion` to match (it is
- * bumped on defragmentation and on array growth via `moveArray`). Its `count`
- * is not kept up to date (push, pop and `length` change it in place, in this or
- * another worker): the writers read the live length from the array slot.
+ * `__arrayRef` is only a holder of the three header fields (so a write
+ * allocates nothing): a whole-value write stores a new array block and
+ * push/pop/`length` change the count in place, in this or another worker,
+ * neither of which bumps the layout version. The writers therefore refresh it
+ * from the array-ref slot (`SharedMemory.refreshArrayRef`) under the lock.
  */
 interface WriteTarget {
   __offset?: number;
   __layoutVersion: number;
   __type?: number;
   __arrayRef?: { offset: number; count: number; capacity: number } | undefined;
-  __arrayRefLayoutVersion: number;
   __index?: number | undefined;
 }
 
@@ -1369,28 +1369,17 @@ function writePropInner(
   const parsedIndex = slotType === TYPE_ARRAY_REF ? parseIndex(prop) : -1;
   if (parsedIndex >= 0) {
     const index = parsedIndex;
-    // Use the cached ArrayRef when it is still valid (same layout version,
-    // i.e. no defragmentation or array growth has moved it). Otherwise
-    // re-read the 3 header Int32s and refresh the cache.
+    // The ArrayRef object is cached on the target, its fields are not.
     let ref = target?.__arrayRef;
-    if (ref === undefined || target!.__arrayRefLayoutVersion !== cachedLv) {
-      ref = {
-        offset: mem.dataTable.getInt32(offset + 4),
-        count: mem.dataTable.getInt32(offset + 8),
-        capacity: mem.dataTable.getInt32(offset + 12),
-      };
-      if (target !== undefined) {
-        target.__arrayRef = ref;
-        target.__arrayRefLayoutVersion = cachedLv;
-      }
+    if (ref === undefined) {
+      ref = { offset: 0, count: 0, capacity: 0 };
+      if (target !== undefined) target.__arrayRef = ref;
     }
-    // The cached ref is only good for `offset` and `capacity` (moving an array
-    // bumps the layout version). The length changes in place with push, pop and
-    // `length`, here or in another worker, so it is read from the slot.
-    const count = mem.arrayCountAt(offset);
-    if (index >= count) {
+    // Refreshed on every write, see `WriteTarget`.
+    mem.refreshArrayRef(ref, offset);
+    if (index >= ref.count) {
       throw new RangeError(
-        `Index ${index} out of bounds for array of length ${count}`,
+        `Index ${index} out of bounds for array of length ${ref.count}`,
       );
     }
     if (typeof val === "number") {
@@ -1506,7 +1495,6 @@ class RefTarget<T = unknown> {
    */
   __arrayRef: { offset: number; count: number; capacity: number } | undefined =
     undefined;
-  __arrayRefLayoutVersion = -1;
   /** Cached version-cell index (stable for the key's lifetime). */
   __index: number | undefined = undefined;
   /**
@@ -1835,13 +1823,12 @@ function writeIndexFast(
   try {
     const ref = t.__arrayRef;
     const offset = t.__offset;
-    const lv = mem.layoutVersionInLock();
     if (
       ref !== undefined &&
       offset !== undefined &&
-      t.__arrayRefLayoutVersion === lv &&
-      t.__layoutVersion === lv &&
-      i < mem.arrayCountAt(offset) // the live length, not the cached one
+      t.__layoutVersion === mem.layoutVersionInLock() &&
+      mem.refreshArrayRef(ref, offset) &&
+      i < ref.count
     ) {
       done = true;
       if (type === "number") mem.updateArrayNumberSlot(ref, i, v as number);
@@ -1882,15 +1869,17 @@ function readPropMiss(st: PropState): unknown {
   const { mem, key, arrayCapacity } = st.t;
   const name = st.name;
   const cell = st.cell; // set by the getter before it gets here
+  // If this property is an array, return the stable cached proxy (which reads
+  // fresh data on each access) instead of recreating it on every write. The
+  // proxy reads nothing here, so there is no lock to wait for either: that
+  // wait made `o.arr[i] = v` pay for it after every write of the array.
+  if (st.arrayProxy !== undefined) {
+    return st.arrayProxy;
+  }
   // Miss: wait until nobody is writing, then decode and validate.
   let raw = stableRaw(mem, cell);
   if (st.version === raw >> VERSION_LOCK_SHIFT_BITS) {
     return st.value;
-  }
-  // If this property is an array, return the stable cached proxy (which reads
-  // fresh data on each access) instead of recreating it on every write.
-  if (st.arrayProxy !== undefined) {
-    return st.arrayProxy;
   }
   // The slot is read without a lock, so a write that overlaps the read could
   // be seen half done (a string assembled from two writes). The version cell
@@ -2472,14 +2461,19 @@ function mutateValue<T, R>(
 function resolveArrayRef(
   mem: SharedMemory,
   locator: ArrayLocator,
-): { slot: ValueSlot; write: (s: ValueSlot) => void } | null {
+): {
+  slot: ValueSlot;
+  write: (s: ValueSlot) => void;
+  /** DataTable offset of the slot, when it lives there. */
+  offset?: number;
+} | null {
   const { key, path } = locator;
   if (path.length === 0) {
     const offset = getOffset(mem, key);
     if (offset === null) return null;
     const slot = mem.readValueSlot(offset);
     if (slot.type !== TYPE_ARRAY_REF) return null;
-    return { slot, write: (s) => mem.updateValueSlot(offset, s) };
+    return { slot, write: (s) => mem.updateValueSlot(offset, s), offset };
   }
   const first = path[0]!;
   if (first.kind === "prop") {
@@ -2490,7 +2484,11 @@ function resolveArrayRef(
     const slot = mem.readValueSlot(slotOffset);
     if (slot.type !== TYPE_ARRAY_REF) return null;
     if (path.length === 1) {
-      return { slot, write: (s) => mem.updateValueSlot(slotOffset, s) };
+      return {
+        slot,
+        write: (s) => mem.updateValueSlot(slotOffset, s),
+        offset: slotOffset,
+      };
     }
     return resolveNestedArrayRef(mem, slot, path.slice(1));
   }
@@ -2793,6 +2791,10 @@ function createArrayProxy(
   // layout version changes (defragmentation or array growth via moveArray).
   let cachedRef:
     { offset: number; count: number; capacity: number } | undefined;
+  // DataTable offset of the array-ref slot, for a locator that ends there (a
+  // top-level array or an array property); undefined for arrays nested in
+  // arrays, which are resolved again on every write.
+  let cachedSlotOffset: number | undefined;
   let cachedLayoutVersion = -1;
   // Cached version-cell index for this key, so writes can bump the version
   // cell without a Map lookup on every write. Stable for the key's lifetime.
@@ -2807,13 +2809,15 @@ function createArrayProxy(
   }
 
   /**
-   * Resolve the array ref, refreshing the cache when the layout changed or
-   * when the cached count is too small for a requested index (the array may
-   * have grown in place via `push` without a layout-version bump).
+   * The array's current ref. Where its slot is can change only with the layout
+   * version (defragmentation); what the slot says (the block, the count) also
+   * changes without it: a whole-value write stores a new block, push/pop and
+   * `length` change the count in place, here or in another worker. So the
+   * cached ref object is refreshed from the slot on every call.
    */
   // Only ever called from writeArrayProp, which runs inside the key's stripe
   // lock, so the layout version can be read without atomics.
-  function getRef(minCount = 0): {
+  function getRef(): {
     offset: number;
     count: number;
     capacity: number;
@@ -2821,10 +2825,16 @@ function createArrayProxy(
     const lv = mem.layoutVersionInLock();
     if (cachedLayoutVersion !== lv) {
       cachedRef = undefined;
+      cachedSlotOffset = undefined;
       cachedLayoutVersion = lv;
     }
-    if (cachedRef !== undefined && cachedRef.count >= minCount)
+    if (
+      cachedRef !== undefined &&
+      cachedSlotOffset !== undefined &&
+      mem.refreshArrayRef(cachedRef, cachedSlotOffset)
+    ) {
       return cachedRef;
+    }
     const resolved = resolveArrayRef(mem, locator);
     if (resolved === null) {
       throw new TypeError("Value is not an array");
@@ -2834,6 +2844,7 @@ function createArrayProxy(
       count: resolved.slot.b,
       capacity: resolved.slot.c,
     };
+    cachedSlotOffset = resolved.offset;
     return cachedRef;
   }
 
@@ -2845,7 +2856,7 @@ function createArrayProxy(
   function writeArrayProp(arrProp: string | symbol, val: unknown): boolean {
     const index = parseIndex(arrProp);
     if (index >= 0) {
-      const ref = getRef(index + 1);
+      const ref = getRef();
       if (index >= ref.count) {
         throw new RangeError(
           `Index ${index} out of bounds for array of length ${ref.count}`,
@@ -2923,6 +2934,52 @@ function createArrayProxy(
       },
       arrayCapacity,
     );
+  }
+
+  /**
+   * The `set` handler's fast path for `arr[i] = v` of a number, a boolean, an
+   * int64 bigint or a string that fits inline: the same lock and version bump
+   * as `writeLock`, through `beginPlainWrite`/`endPlainWrite`, without the
+   * pending-write state. False when the value does not qualify, the version
+   * cell index is not resolved yet (the first write resolves it) or the plain
+   * write cannot start; nothing has been stored then.
+   */
+  function writeElementFast(arrProp: string | symbol, val: unknown): boolean {
+    const cell0 = cachedIndex;
+    if (cell0 === undefined) return false;
+    const type = typeof val;
+    if (type === "string") {
+      if ((val as string).length > 11) return false;
+    } else if (type === "bigint") {
+      if ((val as bigint) < MIN_INT64 || (val as bigint) > MAX_INT64) {
+        return false;
+      }
+    } else if (type !== "number" && type !== "boolean") {
+      return false;
+    }
+    const index = parseIndex(arrProp);
+    if (index < 0) return false;
+    const cell = mem.beginPlainWrite(cell0);
+    if (cell < 0) return false;
+    let done = true;
+    try {
+      const ref = getRef();
+      if (index >= ref.count) {
+        throw new RangeError(
+          `Index ${index} out of bounds for array of length ${ref.count}`,
+        );
+      }
+      if (type === "number")
+        mem.updateArrayNumberSlot(ref, index, val as number);
+      else if (type === "boolean")
+        mem.updateArrayBooleanSlot(ref, index, val as boolean);
+      else if (type === "bigint")
+        mem.updateArrayBigIntSlot(ref, index, val as bigint);
+      else done = mem.updateArrayInlineStringSlot(ref, index, val as string);
+    } finally {
+      mem.endPlainWrite(cell0, cell);
+    }
+    return done;
   }
 
   // Pending array write (see the proxy's `set` handler).
@@ -3020,6 +3077,7 @@ function createArrayProxy(
       return method;
     },
     set(_target, arrProp, val) {
+      if (writeElementFast(arrProp, val)) return true;
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole value. Serialize under the key's
       // lock stripe (see `writeLock`). The pending property and value travel

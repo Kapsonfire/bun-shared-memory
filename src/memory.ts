@@ -1620,16 +1620,30 @@ export class SharedMemory {
   }
 
   /**
-   * The element count stored in the array-ref slot at DataTable `offset`,
-   * read straight from the chunk view like the slot writers below. The count
-   * changes in place (push, pop, `length`, from any worker), so a cached
-   * ArrayRef cannot be used for bounds checks; call this under the key's lock.
+   * Refresh `ref` from the array-ref slot at DataTable `offset`: where the
+   * array block is, how many elements it holds and its capacity. All three can
+   * change without a layout-version bump (a whole-value write stores a new
+   * block, push/pop/`length` change the count in place, from any thread), so a
+   * cached ArrayRef must be refreshed under the key's lock before it is used.
+   * Reads straight from the chunk view like the slot writers below. False
+   * (`ref` untouched) when the slot is not an array reference.
    */
-  arrayCountAt(offset: number): number {
+  refreshArrayRef(ref: ArrayRef, offset: number): boolean {
     const buf = this.dataTable;
     const o = buf.localOffset(offset);
-    if (o > buf.slotLimit) return buf.getInt32(offset + 8);
-    return buf.viewAt(offset).getInt32(o + 8, true);
+    if (o > buf.slotLimit) {
+      if (buf.getInt32(offset) !== TYPE_ARRAY_REF) return false;
+      ref.offset = buf.getInt32(offset + 4);
+      ref.count = buf.getInt32(offset + 8);
+      ref.capacity = buf.getInt32(offset + 12);
+      return true;
+    }
+    const v = buf.viewAt(offset);
+    if (v.getInt32(o, true) !== TYPE_ARRAY_REF) return false;
+    ref.offset = v.getInt32(o + 4, true);
+    ref.count = v.getInt32(o + 8, true);
+    ref.capacity = v.getInt32(o + 12, true);
+    return true;
   }
 
   /**
