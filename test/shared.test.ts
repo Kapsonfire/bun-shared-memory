@@ -611,6 +611,38 @@ describe("Shared", () => {
     expect(user.name).toBe("Alice");
   });
 
+  test("a property that held an array or object hands out what it holds now", () => {
+    const o = Shared("stale-1", {
+      tags: [1, 2] as unknown,
+      p: { q: 1 } as unknown,
+    });
+    expect(Array.isArray(o.tags)).toBe(true); // makes the array proxy
+    o.tags = 5;
+    expect(o.tags).toBe(5);
+    o.tags = [7];
+    expect((o.tags as number[])[0]).toBe(7);
+    expect((o.p as { q: number }).q).toBe(1); // makes the object proxy
+    o.p = "now a string";
+    expect(o.p).toBe("now a string");
+    o.p = { q: 9 };
+    expect((o.p as { q: number }).q).toBe(9);
+  });
+
+  test("nested arrays and objects keep their proxy identity", () => {
+    const grid = Shared("ident-1", [
+      [1, 2],
+      [3, 4],
+    ]);
+    expect(grid[0]).toBe(grid[0]);
+    const o = Shared("ident-2", { p: { r: { s: 1 } }, m: [[1], [2]] });
+    expect(o.p).toBe(o.p);
+    expect(o.p.r).toBe(o.p.r);
+    expect(o.m[1]).toBe(o.m[1]);
+    o.p.r.s = 2;
+    expect(o.p.r.s).toBe(2);
+    expect(o.p.r).toBe(o.p.r);
+  });
+
   test("mutating what read() returned leaves every cached read path intact", () => {
     // `arr[i]` answers from the cached decoded array, so a copy that shared
     // its storage with the cache would show up there first.

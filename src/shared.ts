@@ -73,6 +73,64 @@ interface ArrayLocator {
 }
 
 /**
+ * The proxies a proxy has handed out for its nested arrays and plain objects,
+ * by property name or index, so `o.p.r` and `grid[0]` are made once instead of
+ * on every access (and stay identical: `grid[0] === grid[0]`). A child proxy
+ * reads live data through its locator; the caller hands one out only after
+ * checking that the current value at that place is of the same kind.
+ */
+interface ChildProxies {
+  arrays: Map<string | number, unknown>;
+  objects: Map<string | number, unknown>;
+}
+
+function newChildProxies(): ChildProxies {
+  return { arrays: new Map(), objects: new Map() };
+}
+
+/** Child proxies of each key's top-level value (dropped with the key's caches). */
+const topLevelChildCache = new Map<string, ChildProxies>();
+
+function topLevelChildren(key: string): ChildProxies {
+  let children = topLevelChildCache.get(key);
+  if (children === undefined) {
+    children = newChildProxies();
+    topLevelChildCache.set(key, children);
+  }
+  return children;
+}
+
+function childProxy(
+  children: ChildProxies,
+  mem: SharedMemory,
+  locator: ArrayLocator,
+  step: "prop" | "index",
+  id: string | number,
+  isArray: boolean,
+  arrayCapacity: number | undefined,
+): unknown {
+  const map = isArray ? children.arrays : children.objects;
+  const known = map.get(id);
+  if (known !== undefined) return known;
+  const child: ArrayLocator = {
+    key: locator.key,
+    path: [
+      ...locator.path,
+      step === "prop"
+        ? { kind: "prop", name: id as string }
+        : { kind: "index", index: id as number },
+    ],
+  };
+  const made = isArray
+    ? createArrayProxy(mem, child, arrayCapacity)
+    : createNestedObjectProxy(mem, child, arrayCapacity);
+  // `createNestedObjectProxy` hands out a live shared reference when the
+  // place holds one by now: that is not this place's object proxy.
+  if (made !== null && !sharedKeyMap.has(made)) map.set(id, made);
+  return made;
+}
+
+/**
  * Run a write operation under the lock stripe of `key`. Writers to the same
  * value are serialized, so concurrent writers cannot lose updates or
  * interleave a multi-step write, while writers to different keys run in
@@ -741,6 +799,126 @@ function createNestedObjectProxy(
     >;
   }
 
+  // The pending write (see `set`) and the layout of the block last written:
+  // valid for that block offset at that layout version, since a block's layout
+  // never changes, a replaced sub-object gets a new block, and only a
+  // defragmentation (which bumps the layout version) reuses offsets.
+  const children = newChildProxies();
+  let setProp: string | symbol = "";
+  let setVal: unknown;
+  // Layouts of the object blocks on this proxy's path, by block offset. A
+  // block's layout never changes; a replaced sub-object gets a new block, and
+  // only a defragmentation (which bumps the layout version) reuses offsets,
+  // so the map is emptied when the layout version changes.
+  const layouts = new Map<number, ObjectLayout>();
+  let layoutsVersion = -1;
+  const layoutAt = (offset: number, lv: number): ObjectLayout | null => {
+    if (lv !== layoutsVersion) {
+      layouts.clear();
+      layoutsVersion = lv;
+    }
+    let layout = layouts.get(offset);
+    if (layout === undefined) {
+      const fresh = mem.getObjectLayoutAtOffset(offset);
+      if (fresh === null) return null;
+      // Replaced sub-objects leave dead blocks behind; keep the map small.
+      if (layouts.size >= 32) layouts.clear();
+      layouts.set(offset, fresh);
+      layout = fresh;
+    }
+    return layout;
+  };
+  // A path of property names only (`o.p`, `o.p.r`) is followed with the
+  // cached layouts and two slot reads per step; one through an array index
+  // takes the general `resolveAnchorOffset`.
+  const propPath = locator.path.every((step) => step.kind === "prop")
+    ? locator.path.map((step) => (step as { name: string }).name)
+    : null;
+  /** DataTable offset of this proxy's object block; call under the key's lock. */
+  const blockOffset = (lv: number): number | null => {
+    if (propPath === null) return resolveAnchorOffset(mem, locator);
+    let offset = getOffset(mem, locator.key);
+    if (
+      offset === null ||
+      mem.dataTable.getInt32(offset) !== 5 /* TYPE_OBJECT */
+    ) {
+      return null;
+    }
+    for (const name of propPath) {
+      const slotOffset = layoutAt(offset, lv)?.properties.get(name);
+      if (slotOffset === undefined) return null;
+      if (mem.dataTable.getInt32(slotOffset) !== TYPE_OBJECT_REF) return null;
+      offset = mem.dataTable.getInt32(slotOffset + 4);
+    }
+    return offset;
+  };
+  const setBody = (): void => {
+    const lv = mem.layoutVersionInLock();
+    const offset = blockOffset(lv);
+    if (offset === null) {
+      throw new TypeError("Value is not an object");
+    }
+    const layout = layoutAt(offset, lv);
+    if (layout === null) {
+      throw new TypeError("Value is not an object");
+    }
+    const slotOffset = layout.properties.get(setProp as string);
+    if (slotOffset === undefined) {
+      throw new TypeError(
+        `Nested object has a fixed shape: properties may not be added or removed`,
+      );
+    }
+    writeObjectSlot(mem, locator.key, slotOffset, setVal, arrayCapacity);
+  };
+
+  // Per-property read cache of this proxy: value and the key version it was
+  // read at. Filled under the key's lock by `readFieldBody`.
+  let cell = -1;
+  const fields = new Map<string, { version: number; value: unknown }>();
+  let fieldProp = "";
+  const readFieldBody = (): unknown => {
+    const prop = fieldProp;
+    // No ordinary writer of the key runs while its stripe is held, so the
+    // version read here belongs to the slot read below.
+    const rawIn = Atomics.load(mem.versionView, cell);
+    const lv = mem.layoutVersionInLock();
+    const offset = blockOffset(lv);
+    let value: unknown = undefined;
+    if (offset !== null) {
+      const slotOffset = layoutAt(offset, lv)?.properties.get(prop);
+      if (slotOffset !== undefined) {
+        const type = mem.dataTable.getInt32(slotOffset);
+        if (type === TYPE_ARRAY_REF || type === TYPE_OBJECT_REF) {
+          value = childProxy(
+            children,
+            mem,
+            locator,
+            "prop",
+            prop,
+            type === TYPE_ARRAY_REF,
+            arrayCapacity,
+          );
+        } else {
+          const primitive = mem.readPrimitiveAt(slotOffset);
+          value =
+            primitive !== NOT_PRIMITIVE
+              ? primitive
+              : decodeValue(mem, mem.readValueSlot(slotOffset));
+        }
+      }
+    }
+    if ((rawIn & VERSION_LOCK_MASK) === 0) {
+      const version = rawIn >> VERSION_LOCK_SHIFT_BITS;
+      const entry = fields.get(prop);
+      if (entry === undefined) fields.set(prop, { version, value });
+      else {
+        entry.version = version;
+        entry.value = value;
+      }
+    }
+    return value;
+  };
+
   const proxy = new Proxy({} as Record<string | symbol, unknown>, {
     get(_t, prop) {
       if (prop === "read") {
@@ -748,84 +926,51 @@ function createNestedObjectProxy(
       }
       if (prop === "key") return locator.key;
       if (prop === "buffer") return mem.dataTable.buffers[0];
-      // A primitive property is answered from the decoded root value in the
-      // read cache (decoded once per version on a miss, under the key's
-      // lock), instead of resolving the layout under the global mutex below.
-      if (typeof prop === "string") {
-        let obj = peekCached(mem, locator.key);
-        if (obj === CACHE_MISS) obj = readValue(mem, locator.key);
-        // Walk the path without assuming its shape still holds (the value
-        // may have been replaced since this proxy was made).
-        for (const step of locator.path) {
-          if (obj === null || typeof obj !== "object") break;
-          obj =
-            step.kind === "prop"
-              ? (obj as Record<string, unknown>)[step.name]
-              : (obj as unknown[])[step.index];
-        }
+      if (typeof prop !== "string") return undefined;
+      // This proxy's per-property cache, valid while the key's version is
+      // unchanged and no lock bit is set (the same check as everywhere).
+      if (cell < 0) {
+        cell = mem.getVersionCellIndex(getIndex(mem, locator.key));
+      }
+      const raw = mem.versionView[cell]!;
+      if ((raw & VERSION_LOCK_MASK) === 0) {
+        const hit = fields.get(prop);
         if (
-          obj !== null &&
-          typeof obj === "object" &&
-          !Array.isArray(obj) &&
-          !sharedKeyMap.has(obj)
+          hit !== undefined &&
+          hit.version === raw >> VERSION_LOCK_SHIFT_BITS
         ) {
-          const v = (obj as Record<string, unknown>)[prop];
-          // Objects, arrays (proxies below) and inherited functions such as
-          // `toString` (undefined below) take the general path.
-          if (
-            v === null ||
-            (typeof v !== "object" && typeof v !== "function")
-          ) {
-            return v;
-          }
+          return hit.value;
         }
       }
-      const offset = resolveAnchorOffset(mem, locator);
-      if (offset === null) return undefined;
-      const layout = mem.withLock(() => mem.getObjectLayoutAtOffset(offset));
-      if (layout === null) return undefined;
-      const slotOffset = layout.properties.get(prop as string);
-      if (slotOffset === undefined) return undefined;
-      const slot = mem.readValueSlot(slotOffset);
-      if (slot.type === TYPE_OBJECT_REF || slot.type === TYPE_KEY_REF) {
-        return createNestedObjectProxy(
-          mem,
-          {
-            key: locator.key,
-            path: [...locator.path, { kind: "prop", name: prop as string }],
-          },
-          arrayCapacity,
-        );
+      // Miss: read just this property's slot under the key's lock (not the
+      // whole root value: decoding all of a large value for one property
+      // after each write made such reads cost the whole value). Wait out a
+      // user-level lock held elsewhere first, like `readValue`.
+      stableRaw(mem, cell);
+      const sProp = fieldProp;
+      fieldProp = prop;
+      try {
+        return mem.withKeyLock(getIndex(mem, locator.key), readFieldBody);
+      } finally {
+        fieldProp = sProp;
       }
-      let value = decodeValue(mem, slot);
-      if (Array.isArray(value)) {
-        return createArrayProxy(
-          mem,
-          {
-            key: locator.key,
-            path: [...locator.path, { kind: "prop", name: prop as string }],
-          },
-          arrayCapacity,
-        );
-      }
-      return value;
     },
     set(_t, prop, val) {
-      const offset = resolveAnchorOffset(mem, locator);
-      if (offset === null) {
-        throw new TypeError("Value is not an object");
+      // Under the key's write lock like every other write (stripe, WRITER
+      // bit, version bump): readers see the value whole, and neither a
+      // defragmentation nor another writer of the key can run between
+      // resolving the slot and storing into it. The pending property and
+      // value travel through variables, so a write allocates no closure.
+      const sProp = setProp;
+      const sVal = setVal;
+      setProp = prop;
+      setVal = val;
+      try {
+        writeLock(mem, locator.key, setBody);
+      } finally {
+        setProp = sProp;
+        setVal = sVal;
       }
-      const layout = mem.withLock(() => mem.getObjectLayoutAtOffset(offset));
-      if (layout === null) {
-        throw new TypeError("Value is not an object");
-      }
-      const slotOffset = layout.properties.get(prop as string);
-      if (slotOffset === undefined) {
-        throw new TypeError(
-          `Nested object has a fixed shape: properties may not be added or removed`,
-        );
-      }
-      writeObjectSlot(mem, locator.key, slotOffset, val, arrayCapacity);
       return true;
     },
   });
@@ -962,6 +1107,7 @@ function dropKey(key: string): void {
   indexCache.delete(key);
   offsetCache.delete(key);
   layoutCache.delete(key);
+  topLevelChildCache.delete(key);
 }
 
 /** The live wrapper of `key`, if one exists. */
@@ -1003,6 +1149,7 @@ onMemoryDisposed(() => {
   indexCache.clear();
   offsetCache.clear();
   layoutCache.clear();
+  topLevelChildCache.clear();
   registry.clear();
   pendingLoads.clear();
 });
@@ -1167,17 +1314,20 @@ function readProp(
     return getTopLevelArrayMember(mem, key, value, prop, arrayCapacity);
   }
   const propValue = (value as Record<string | symbol, unknown>)[prop];
-  if (Array.isArray(propValue)) {
-    return createArrayProxy(
+  if (
+    propValue !== null &&
+    typeof propValue === "object" &&
+    typeof prop === "string" &&
+    Object.hasOwn(value as object, prop)
+  ) {
+    if (sharedKeyMap.has(propValue)) return propValue;
+    return childProxy(
+      topLevelChildren(key),
       mem,
-      { key, path: [{ kind: "prop", name: prop as string }] },
-      arrayCapacity,
-    );
-  }
-  if (propValue !== null && typeof propValue === "object") {
-    return createNestedObjectProxy(
-      mem,
-      { key, path: [{ kind: "prop", name: prop as string }] },
+      { key, path: [] },
+      "prop",
+      prop,
+      Array.isArray(propValue),
       arrayCapacity,
     );
   }
@@ -1759,8 +1909,13 @@ interface PropState {
   /** Version and decoded value of the property cache (`readObjectProp` fills them). */
   version: number;
   value: unknown;
-  /** Stable array proxy for an array property (survives writes). */
+  /**
+   * Stable proxies for an array property and a plain nested object property.
+   * They read live data, so they survive writes, but are handed out only
+   * while the slot still holds that kind of value (see `readPropMiss`).
+   */
   arrayProxy: unknown[] | undefined;
+  objectProxy: object | undefined;
   /** Cached slot offset, valid while `slotLayoutVersion` is the layout version. */
   slotOffset: number | undefined;
   slotLayoutVersion: number;
@@ -1910,12 +2065,21 @@ function readPropMiss(st: PropState): unknown {
   const { mem, key, arrayCapacity } = st.t;
   const name = st.name;
   const cell = st.cell; // set by the getter before it gets here
-  // If this property is an array, return the stable cached proxy (which reads
-  // fresh data on each access) instead of recreating it on every write. The
-  // proxy reads nothing here, so there is no lock to wait for either: that
-  // wait made `o.arr[i] = v` pay for it after every write of the array.
-  if (st.arrayProxy !== undefined) {
-    return st.arrayProxy;
+  // If this property is an array or a plain nested object, return the stable
+  // cached proxy (which reads fresh data on each access) instead of making a
+  // new one after every write. The proxy reads nothing here, so there is no
+  // lock to wait for either: that wait made `o.arr[i] = v` pay for it after
+  // every write. The slot's type tag decides whether the proxy still fits: a
+  // write may have replaced the array or object with something else (the
+  // array proxy used to be returned even after `o.arr = 5`).
+  if (st.arrayProxy !== undefined || st.objectProxy !== undefined) {
+    const type = mem.slotTypeAt(resolveSlot(st, mem.getLayoutVersion()));
+    if (type === TYPE_ARRAY_REF && st.arrayProxy !== undefined) {
+      return st.arrayProxy;
+    }
+    if (type === TYPE_OBJECT_REF && st.objectProxy !== undefined) {
+      return st.objectProxy;
+    }
   }
   // Miss: wait until nobody is writing, then decode and validate.
   let raw = stableRaw(mem, cell);
@@ -1961,6 +2125,14 @@ function readPropMiss(st: PropState): unknown {
   }
   if (Array.isArray(value)) {
     st.arrayProxy = value;
+  } else if (
+    value !== null &&
+    typeof value === "object" &&
+    !sharedKeyMap.has(value)
+  ) {
+    // A plain nested object's proxy (a live shared reference is a wrapper of
+    // its own and is not cached here).
+    st.objectProxy = value;
   }
   return value;
 }
@@ -2093,6 +2265,7 @@ function createSharedRef<T>(
         version: -1,
         value: undefined,
         arrayProxy: undefined,
+        objectProxy: undefined,
         slotOffset: undefined,
         slotLayoutVersion: -1,
         pending: undefined,
@@ -2803,17 +2976,15 @@ function getTopLevelArrayMember(
   const index = parseIndex(prop);
   if (index >= 0) {
     const element = value[index];
-    if (Array.isArray(element)) {
-      return createArrayProxy(
-        mem,
-        { key, path: [{ kind: "index", index }] },
-        arrayCapacity,
-      );
-    }
     if (element !== null && typeof element === "object") {
-      return createNestedObjectProxy(
+      if (sharedKeyMap.has(element)) return element;
+      return childProxy(
+        topLevelChildren(key),
         mem,
-        { key, path: [{ kind: "index", index }] },
+        { key, path: [] },
+        "index",
+        index,
+        Array.isArray(element),
         arrayCapacity,
       );
     }
@@ -3058,6 +3229,8 @@ function createArrayProxy(
     return done;
   }
 
+  const children = newChildProxies();
+
   // Pending array write (see the proxy's `set` handler).
   let apProp: string | symbol = "";
   let apVal: unknown;
@@ -3100,17 +3273,15 @@ function createArrayProxy(
           throw new TypeError("Value is not an array");
         }
         const element = rootArray[index];
-        if (Array.isArray(element)) {
-          return createArrayProxy(
-            mem,
-            { key, path: [...locator.path, { kind: "index", index }] },
-            arrayCapacity,
-          );
-        }
         if (element !== null && typeof element === "object") {
-          return createNestedObjectProxy(
+          if (sharedKeyMap.has(element)) return element;
+          return childProxy(
+            children,
             mem,
-            { key, path: [...locator.path, { kind: "index", index }] },
+            locator,
+            "index",
+            index,
+            Array.isArray(element),
             arrayCapacity,
           );
         }
