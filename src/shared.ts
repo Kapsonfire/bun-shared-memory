@@ -748,6 +748,38 @@ function createNestedObjectProxy(
       }
       if (prop === "key") return locator.key;
       if (prop === "buffer") return mem.dataTable.buffers[0];
+      // A primitive property is answered from the decoded root value in the
+      // read cache (decoded once per version on a miss, under the key's
+      // lock), instead of resolving the layout under the global mutex below.
+      if (typeof prop === "string") {
+        let obj = peekCached(mem, locator.key);
+        if (obj === CACHE_MISS) obj = readValue(mem, locator.key);
+        // Walk the path without assuming its shape still holds (the value
+        // may have been replaced since this proxy was made).
+        for (const step of locator.path) {
+          if (obj === null || typeof obj !== "object") break;
+          obj =
+            step.kind === "prop"
+              ? (obj as Record<string, unknown>)[step.name]
+              : (obj as unknown[])[step.index];
+        }
+        if (
+          obj !== null &&
+          typeof obj === "object" &&
+          !Array.isArray(obj) &&
+          !sharedKeyMap.has(obj)
+        ) {
+          const v = (obj as Record<string, unknown>)[prop];
+          // Objects, arrays (proxies below) and inherited functions such as
+          // `toString` (undefined below) take the general path.
+          if (
+            v === null ||
+            (typeof v !== "object" && typeof v !== "function")
+          ) {
+            return v;
+          }
+        }
+      }
       const offset = resolveAnchorOffset(mem, locator);
       if (offset === null) return undefined;
       const layout = mem.withLock(() => mem.getObjectLayoutAtOffset(offset));
