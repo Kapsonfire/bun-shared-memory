@@ -528,7 +528,9 @@ function getOffset(mem: SharedMemory, key: string): number | null {
  * paths use to skip Map lookups and DataTable reads. `__offset`/`__type` are
  * valid only while `__layoutVersion` matches the global layout version;
  * `__arrayRef` additionally requires `__arrayRefLayoutVersion` to match (it is
- * bumped on defragmentation and on array growth via `moveArray`).
+ * bumped on defragmentation and on array growth via `moveArray`). Its `count`
+ * is not kept up to date (push, pop and `length` change it in place, in this or
+ * another worker): the writers read the live length from the array slot.
  */
 interface WriteTarget {
   __offset?: number;
@@ -1382,9 +1384,13 @@ function writePropInner(
         target.__arrayRefLayoutVersion = cachedLv;
       }
     }
-    if (index >= ref.count) {
+    // The cached ref is only good for `offset` and `capacity` (moving an array
+    // bumps the layout version). The length changes in place with push, pop and
+    // `length`, here or in another worker, so it is read from the slot.
+    const count = mem.arrayCountAt(offset);
+    if (index >= count) {
       throw new RangeError(
-        `Index ${index} out of bounds for array of length ${ref.count}`,
+        `Index ${index} out of bounds for array of length ${count}`,
       );
     }
     if (typeof val === "number") {
@@ -1828,10 +1834,14 @@ function writeIndexFast(
   let done = false;
   try {
     const ref = t.__arrayRef;
+    const offset = t.__offset;
+    const lv = mem.layoutVersionInLock();
     if (
       ref !== undefined &&
-      t.__arrayRefLayoutVersion === mem.layoutVersionInLock() &&
-      i < ref.count
+      offset !== undefined &&
+      t.__arrayRefLayoutVersion === lv &&
+      t.__layoutVersion === lv &&
+      i < mem.arrayCountAt(offset) // the live length, not the cached one
     ) {
       done = true;
       if (type === "number") mem.updateArrayNumberSlot(ref, i, v as number);

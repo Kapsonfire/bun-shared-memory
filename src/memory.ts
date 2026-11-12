@@ -1620,6 +1620,19 @@ export class SharedMemory {
   }
 
   /**
+   * The element count stored in the array-ref slot at DataTable `offset`,
+   * read straight from the chunk view like the slot writers below. The count
+   * changes in place (push, pop, `length`, from any worker), so a cached
+   * ArrayRef cannot be used for bounds checks; call this under the key's lock.
+   */
+  arrayCountAt(offset: number): number {
+    const buf = this.dataTable;
+    const o = buf.localOffset(offset);
+    if (o > buf.slotLimit) return buf.getInt32(offset + 8);
+    return buf.viewAt(offset).getInt32(o + 8, true);
+  }
+
+  /**
    * Fast-path: write a float64 number slot directly into the DataTable,
    * avoiding the ValueSlot object allocation and the 4 separate Int32
    * writes of the generic path.
