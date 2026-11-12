@@ -56,6 +56,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "cofusion": "^0.0.6",
     "elysia": "^1.4.30",
     "typescript": "latest"
   }
