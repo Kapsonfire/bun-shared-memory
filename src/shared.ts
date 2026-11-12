@@ -1971,104 +1971,14 @@ function resolveSlot(st: PropState, lv: number): number {
 
 /*
  * Note on the plain-write fast paths (`RefTarget.writeSmallPrimitive`,
- * `writePropFast`, `writeIndexFast`, `writeElementFast` in `createArrayProxy`):
+ * the accessor setter in `createSharedRef`, the `set` trap of
+ * `REF_PROXY_HANDLER`, the `set` trap in `createArrayProxy`):
  * each checks and stores the value types itself, on purpose. Shared helpers
  * for the type check and the store collect JIT type feedback from all four
  * call sites, turn polymorphic over number/boolean/bigint/string, and made the
  * writes slower (measured: boolean write -20 %, string -14 %, bigint -6 %,
  * array index writes -5 %). Keep the copies in sync by hand.
  */
-
-/**
- * The setter's fast path for values that are stored in place without
- * allocating (a number, a boolean, an int64 bigint, a string that fits inline):
- * the same lock and version bump as `writeLock`, through
- * `beginPlainWrite`/`endPlainWrite`, without the callback. False when the value
- * does not qualify, the target has no cached index yet, or the plain write
- * cannot start (global section, nested write, user-level lock); nothing has
- * been stored then.
- */
-function writePropFast(st: PropState, v: unknown): boolean {
-  const t = st.t;
-  const index = t.__index;
-  if (index === undefined) return false;
-  const type = typeof v;
-  if (type === "string") {
-    if ((v as string).length > 11) return false;
-  } else if (type === "bigint") {
-    if ((v as bigint) < MIN_INT64 || (v as bigint) > MAX_INT64) return false;
-  } else if (type !== "number" && type !== "boolean") {
-    return false;
-  }
-  const mem = t.mem;
-  const cell = mem.beginPlainWrite(index);
-  if (cell < 0) return false;
-  let done = true;
-  try {
-    const slotOffset = resolveSlot(st, mem.layoutVersionInLock());
-    if (type === "number") mem.updateNumberSlot(slotOffset, v as number);
-    else if (type === "boolean")
-      mem.updateBooleanSlot(slotOffset, v as boolean);
-    else if (type === "bigint") mem.updateBigIntSlot(slotOffset, v as bigint);
-    else done = mem.updateInlineStringSlot(slotOffset, v as string);
-  } finally {
-    mem.endPlainWrite(index, cell);
-  }
-  return done;
-}
-
-/**
- * The proxy `set` trap's fast path for `arr[i] = v` on a top-level array, for
- * the same values and with the same lock as `writePropFast`. It needs the
- * cached ArrayRef (a former general write left it on the target) and checks it
- * against the layout version once the stripe is held. False when anything is
- * not as expected (not an array index, not cached, out of bounds, not
- * qualifying); the general path then stores the value or throws.
- */
-function writeIndexFast(
-  t: RefTarget,
-  prop: string | symbol,
-  v: unknown,
-): boolean {
-  const index = t.__index;
-  if (index === undefined || t.__type !== TYPE_ARRAY_REF) return false;
-  const type = typeof v;
-  if (type === "string") {
-    if ((v as string).length > 11) return false;
-  } else if (type === "bigint") {
-    if ((v as bigint) < MIN_INT64 || (v as bigint) > MAX_INT64) return false;
-  } else if (type !== "number" && type !== "boolean") {
-    return false;
-  }
-  const i = parseIndex(prop);
-  if (i < 0) return false;
-  const mem = t.mem;
-  const cell = mem.beginPlainWrite(index);
-  if (cell < 0) return false;
-  let done = false;
-  try {
-    const ref = t.__arrayRef;
-    const offset = t.__offset;
-    if (
-      ref !== undefined &&
-      offset !== undefined &&
-      t.__layoutVersion === mem.layoutVersionInLock() &&
-      mem.refreshArrayRef(ref, offset) &&
-      i < ref.count
-    ) {
-      done = true;
-      if (type === "number") mem.updateArrayNumberSlot(ref, i, v as number);
-      else if (type === "boolean")
-        mem.updateArrayBooleanSlot(ref, i, v as boolean);
-      else if (type === "bigint")
-        mem.updateArrayBigIntSlot(ref, i, v as bigint);
-      else done = mem.updateArrayInlineStringSlot(ref, i, v as string);
-    }
-  } finally {
-    mem.endPlainWrite(index, cell);
-  }
-  return done;
-}
 
 /** The setter's write callback; created on the first write of an accessor. */
 function makeWriteBody(st: PropState): () => void {
@@ -2299,6 +2209,35 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
       // loop shape, the common one, 40 % slower); `.call`/`.apply` 55 / 79;
       // this one 57 / 81.
       return (t.__writeFn ??= function (value: unknown) {
+        // The number fast path of `RefTarget.write`, written out here: one
+        // function level less (see the accessor setter in `createSharedRef`).
+        if (typeof value === "number") {
+          const index = t.__index;
+          if (index !== undefined) {
+            const mem = t.mem;
+            const cell = mem.beginPlainWrite(index);
+            if (cell >= 0) {
+              let done = false;
+              try {
+                const offset = t.__offset;
+                const type = t.__type;
+                if (
+                  offset !== undefined &&
+                  type !== undefined &&
+                  type !== 5 &&
+                  t.__layoutVersion === mem.layoutVersionInLock()
+                ) {
+                  t.__cache = undefined;
+                  mem.updateNumberSlot(offset, value);
+                  done = true;
+                }
+              } finally {
+                mem.endPlainWrite(index, cell);
+              }
+              if (done) return;
+            }
+          }
+        }
         t.write(value);
       });
     }
@@ -2324,7 +2263,55 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
   },
   set(t, prop, val) {
     t.__cache = undefined;
-    if (writeIndexFast(t, prop, val)) return true;
+    // `arr[i] = v` on a top-level array: the plain-write fast path, written
+    // out here and not called (one function level less, see the accessor
+    // setter in `createSharedRef`). It needs the cached ArrayRef (a former
+    // general write left it on the target), refreshed under the stripe. Any
+    // other case (not an index, not cached, out of bounds, a value that does
+    // not qualify) goes to `writeProp`, which stores it or throws.
+    const index = t.__index;
+    if (
+      index !== undefined &&
+      t.__type === TYPE_ARRAY_REF &&
+      (typeof val === "number" ||
+        typeof val === "boolean" ||
+        (typeof val === "string" && val.length <= 11) ||
+        (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64))
+    ) {
+      const i = parseIndex(prop);
+      if (i >= 0) {
+        const mem = t.mem;
+        const cell = mem.beginPlainWrite(index);
+        if (cell >= 0) {
+          let done = false;
+          try {
+            const ref = t.__arrayRef;
+            const offset = t.__offset;
+            if (
+              ref !== undefined &&
+              offset !== undefined &&
+              t.__layoutVersion === mem.layoutVersionInLock() &&
+              mem.refreshArrayRef(ref, offset) &&
+              i < ref.count
+            ) {
+              done = true;
+              if (typeof val === "number")
+                mem.updateArrayNumberSlot(ref, i, val);
+              else if (typeof val === "boolean") {
+                mem.updateArrayBooleanSlot(ref, i, val);
+              } else if (typeof val === "bigint") {
+                mem.updateArrayBigIntSlot(ref, i, val);
+              } else {
+                done = mem.updateArrayInlineStringSlot(ref, i, val as string);
+              }
+            }
+          } finally {
+            mem.endPlainWrite(index, cell);
+          }
+          if (done) return true;
+        }
+      }
+    }
     writeProp(t.mem, t.key, prop, val, t.arrayCapacity, t);
     return true;
   },
@@ -2406,7 +2393,43 @@ function createSharedRef<T>(
         },
         set(v: unknown) {
           target.__cache = undefined;
-          if (writePropFast(st, v)) return;
+          // The plain-write fast path, written out here and not called: from
+          // a setter, one more function level (a helper, a method, even a
+          // local arrow) cost about 12 ns per write, measured (18 vs 6 ns),
+          // apparently the JIT's inlining depth. Same values as
+          // `writeValueInner` stores in place without allocating: a number, a
+          // boolean, an int64 bigint, a string that may fit inline.
+          const index = target.__index;
+          if (
+            index !== undefined &&
+            (typeof v === "number" ||
+              typeof v === "boolean" ||
+              (typeof v === "string" && v.length <= 11) ||
+              (typeof v === "bigint" && v >= MIN_INT64 && v <= MAX_INT64))
+          ) {
+            const cell = mem.beginPlainWrite(index);
+            if (cell >= 0) {
+              let done = true;
+              try {
+                const lv = mem.layoutVersionInLock();
+                const slotOffset =
+                  st.slotLayoutVersion === lv && st.slotOffset !== undefined
+                    ? st.slotOffset
+                    : resolveSlot(st, lv);
+                if (typeof v === "number") mem.updateNumberSlot(slotOffset, v);
+                else if (typeof v === "boolean") {
+                  mem.updateBooleanSlot(slotOffset, v);
+                } else if (typeof v === "bigint") {
+                  mem.updateBigIntSlot(slotOffset, v);
+                } else {
+                  done = mem.updateInlineStringSlot(slotOffset, v as string);
+                }
+              } finally {
+                mem.endPlainWrite(index, cell);
+              }
+              if (done) return;
+            }
+          }
           // `writeBody` is created on the first write of this accessor; the
           // value travels through `pending`, so a write allocates no closure.
           st.pending = v;
@@ -3324,52 +3347,6 @@ function createArrayProxy(
     );
   }
 
-  /**
-   * The `set` handler's fast path for `arr[i] = v` of a number, a boolean, an
-   * int64 bigint or a string that fits inline: the same lock and version bump
-   * as `writeLock`, through `beginPlainWrite`/`endPlainWrite`, without the
-   * pending-write state. False when the value does not qualify, the version
-   * cell index is not resolved yet (the first write resolves it) or the plain
-   * write cannot start; nothing has been stored then.
-   */
-  function writeElementFast(arrProp: string | symbol, val: unknown): boolean {
-    const cell0 = cachedIndex;
-    if (cell0 === undefined) return false;
-    const type = typeof val;
-    if (type === "string") {
-      if ((val as string).length > 11) return false;
-    } else if (type === "bigint") {
-      if ((val as bigint) < MIN_INT64 || (val as bigint) > MAX_INT64) {
-        return false;
-      }
-    } else if (type !== "number" && type !== "boolean") {
-      return false;
-    }
-    const index = parseIndex(arrProp);
-    if (index < 0) return false;
-    const cell = mem.beginPlainWrite(cell0);
-    if (cell < 0) return false;
-    let done = true;
-    try {
-      const ref = getRef();
-      if (index >= ref.count) {
-        throw new RangeError(
-          `Index ${index} out of bounds for array of length ${ref.count}`,
-        );
-      }
-      if (type === "number")
-        mem.updateArrayNumberSlot(ref, index, val as number);
-      else if (type === "boolean")
-        mem.updateArrayBooleanSlot(ref, index, val as boolean);
-      else if (type === "bigint")
-        mem.updateArrayBigIntSlot(ref, index, val as bigint);
-      else done = mem.updateArrayInlineStringSlot(ref, index, val as string);
-    } finally {
-      mem.endPlainWrite(cell0, cell);
-    }
-    return done;
-  }
-
   const children = newChildProxies();
 
   // Pending array write (see the proxy's `set` handler).
@@ -3466,7 +3443,58 @@ function createArrayProxy(
       return method;
     },
     set(_target, arrProp, val) {
-      if (writeElementFast(arrProp, val)) return true;
+      // `arr[i] = v` of a number, a boolean, an int64 bigint or a string that
+      // may fit inline: the plain-write fast path, written out here and not
+      // called (one function level less, see the accessor setter in
+      // `createSharedRef`); the cached ref's common case inline too. The
+      // version cell index is resolved by the first general write.
+      const cell0 = cachedIndex;
+      if (
+        cell0 !== undefined &&
+        (typeof val === "number" ||
+          typeof val === "boolean" ||
+          (typeof val === "string" && val.length <= 11) ||
+          (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64))
+      ) {
+        const index = parseIndex(arrProp);
+        if (index >= 0) {
+          const cell = mem.beginPlainWrite(cell0);
+          if (cell >= 0) {
+            let done = true;
+            try {
+              const lv = mem.layoutVersionInLock();
+              const ref =
+                cachedLayoutVersion === lv &&
+                cachedRef !== undefined &&
+                cachedSlotOffset !== undefined &&
+                mem.refreshArrayRef(cachedRef, cachedSlotOffset)
+                  ? cachedRef
+                  : getRef();
+              if (index >= ref.count) {
+                throw new RangeError(
+                  `Index ${index} out of bounds for array of length ${ref.count}`,
+                );
+              }
+              if (typeof val === "number") {
+                mem.updateArrayNumberSlot(ref, index, val);
+              } else if (typeof val === "boolean") {
+                mem.updateArrayBooleanSlot(ref, index, val);
+              } else if (typeof val === "bigint") {
+                mem.updateArrayBigIntSlot(ref, index, val);
+              } else {
+                done = mem.updateArrayInlineStringSlot(
+                  ref,
+                  index,
+                  val as string,
+                );
+              }
+            } finally {
+              mem.endPlainWrite(cell0, cell);
+            }
+            if (done) return true;
+          }
+        }
+      }
       // In-place update: write only the affected array slot instead of
       // decoding and re-encoding the whole value. Serialize under the key's
       // lock stripe (see `writeLock`). The pending property and value travel
