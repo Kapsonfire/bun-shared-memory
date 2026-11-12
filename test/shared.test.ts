@@ -628,6 +628,25 @@ describe("Shared", () => {
     expect((o.p as { q: number }).q).toBe(9);
   });
 
+  test("index and length writes on an array that became a number leave the number", () => {
+    // The ref cached the slot type `array`; a whole write turned it into a
+    // number. Index writes went into the dead array block and `length = 0`
+    // replaced the number with an array made from its bits.
+    const a = Shared<unknown>("retyped-1", [1, 2, 3]) as any;
+    a[0] = 9; // caches the array slot
+    a.write(5);
+    expect(() => {
+      a[0] = 7;
+    }).toThrow(TypeError);
+    expect(() => {
+      a.length = 0;
+    }).toThrow(TypeError);
+    expect(a.read()).toBe(5);
+    a.write([4, 5]);
+    a[1] = 6;
+    expect(a.read()).toEqual([4, 6]);
+  });
+
   test("nested arrays and objects keep their proxy identity", () => {
     const grid = Shared("ident-1", [
       [1, 2],
