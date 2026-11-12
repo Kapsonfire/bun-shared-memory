@@ -887,6 +887,50 @@ export class SharedMemory {
     return this.withKeyWrite(index, fn);
   }
 
+  /**
+   * Closure-free start of a plain write, for hot paths that cannot allocate
+   * (see `RefTarget.write`): takes the key's stripe and the cell's WRITER bit
+   * like `withKeyWrite` does, and returns the version cell to hand to
+   * `endPlainWrite`, or -1 when the caller must use `withKeyWrite` instead (the
+   * thread is inside a global section, another write of this thread is in
+   * progress, or it holds a user-level lock on the object). Nothing is held
+   * after a -1. The caller must call `endPlainWrite` in a `finally` and must
+   * not allocate or throw a `BudgetExceededError` in between (no reclaim here).
+   */
+  beginPlainWrite(index: number): number {
+    if (this.globalDepth > 0 || this.writingTop !== -1) return -1;
+    const cell = versionCellIndex(index);
+    const stripe = this.stripes[index & (LOCK_STRIPES - 1)]!;
+    stripe.lock();
+    this.lockDepth++;
+    let began = false;
+    try {
+      began = this.beginCellWrite(cell);
+    } finally {
+      if (!began) {
+        this.lockDepth--;
+        stripe.unlock();
+      }
+    }
+    if (!began) return -1;
+    this.writingCells.push(cell);
+    this.writingTop = cell;
+    return cell;
+  }
+
+  /** Finish a write started by `beginPlainWrite`: bump the version, release. */
+  endPlainWrite(index: number, cell: number): void {
+    this.writingCells.pop();
+    this.writingTop =
+      this.writingCells.length === 0
+        ? -1
+        : this.writingCells[this.writingCells.length - 1]!;
+    // Version + 1 and clear the WRITER bit in one add.
+    Atomics.add(this.versionView, cell, VERSION_STEP - WRITER_BIT);
+    this.lockDepth--;
+    this.stripes[index & (LOCK_STRIPES - 1)]!.unlock();
+  }
+
   /** Set the WRITER bit of `cell`; true if this call set it (and must clear it). */
   private beginCellWrite(cell: number): boolean {
     const old = Atomics.or(this.versionView, cell, WRITER_BIT);
