@@ -1928,8 +1928,43 @@ function readPropMiss(st: PropState): unknown {
  * Proxy handler for array/primitive refs, shared by all keys (a handler object
  * with its own closures per key costs about a quarter of a kilobyte each).
  */
+/**
+ * `arr[i]` on a top-level array whose decoded value is in the read cache and
+ * whose element is a primitive: answered before the method-name checks of the
+ * `get` trap. `NOT_PRIMITIVE` sends everything else (a miss, a nested array or
+ * object, a non-array value) down the general path, which gives the same
+ * answer for these cases.
+ */
+function readIndexFast(t: RefTarget, prop: string): unknown {
+  const cached = readCache.get(t.key);
+  if (cached === undefined) return NOT_PRIMITIVE;
+  const raw = t.mem.versionView[cached.cell]!;
+  if (
+    (raw & VERSION_LOCK_MASK) !== 0 ||
+    cached.version !== raw >> VERSION_LOCK_SHIFT_BITS
+  ) {
+    return NOT_PRIMITIVE;
+  }
+  const value = cached.value;
+  if (!Array.isArray(value)) return NOT_PRIMITIVE;
+  const index = parseIndex(prop);
+  if (index < 0) return NOT_PRIMITIVE;
+  const element: unknown = value[index];
+  if (element !== null && typeof element === "object") return NOT_PRIMITIVE;
+  return element;
+}
+
 const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
   get(t, prop) {
+    // Index reads first: they are the hot path of an array ref, and every
+    // name check below would be paid on each of them.
+    if (typeof prop === "string") {
+      const digit = prop.charCodeAt(0) - 48;
+      if (digit >= 0 && digit <= 9) {
+        const element = readIndexFast(t, prop);
+        if (element !== NOT_PRIMITIVE) return element;
+      }
+    }
     // Every shared method (`this[TARGET]`) asks for this first.
     if (prop === TARGET) return t;
     if (prop === "read") {
