@@ -192,4 +192,94 @@ describe("number write fast path", () => {
     expect(a.read().slice(0, 2)).toEqual([11, 12]);
     mem.dispose();
   });
+
+  describe("array index bounds follow the live length", () => {
+    test("an index freed by pop() is out of bounds again", () => {
+      const mem = new SharedMemory();
+      const a = Shared<number[]>("len-pop", [1, 2, 3], {
+        memory: mem,
+        arrayCapacity: 8,
+      });
+      a[0] = 9; // warm the cached ArrayRef
+      a.pop();
+      expect(() => {
+        a[2] = 1;
+      }).toThrow(RangeError);
+      a[1] = 7;
+      expect(a.read()).toEqual([9, 7]);
+      mem.dispose();
+    });
+
+    test("an index added by push() inside the capacity is writable", () => {
+      const mem = new SharedMemory();
+      const a = Shared<number[]>("len-push", [1, 2, 3, 4], {
+        memory: mem,
+        arrayCapacity: 8,
+      });
+      a[0] = 9;
+      a[1] = 8; // warm the cached ArrayRef (count 4)
+      a.push(5);
+      a[4] = 55;
+      expect(a.read()).toEqual([9, 8, 3, 4, 55]);
+      a.push(6, 7);
+      a[6] = 77;
+      expect(a.read()).toEqual([9, 8, 3, 4, 55, 6, 77]);
+      mem.dispose();
+    });
+
+    test("shrinking and growing through length is followed", () => {
+      const mem = new SharedMemory();
+      const a = Shared<number[]>("len-length", [1, 2, 3, 4], {
+        memory: mem,
+        arrayCapacity: 8,
+      });
+      a[0] = 9;
+      a[1] = 8;
+      a.length = 2;
+      expect(() => {
+        a[3] = 7;
+      }).toThrow(RangeError);
+      a.length = 4;
+      a[3] = 7;
+      expect(a.read()[3]).toBe(7);
+      mem.dispose();
+    });
+
+    test("a push by another worker is seen by the next index write", async () => {
+      const mem = new SharedMemory();
+      const a = Shared<number[]>("len-worker", [1, 2, 3, 4], {
+        memory: mem,
+        arrayCapacity: 8,
+      });
+      a[0] = 9;
+      a[1] = 8; // warm
+      const code = `
+        import { Shared, SharedMemory } from ${JSON.stringify(
+          new URL("../src/index.ts", import.meta.url).href,
+        )};
+        self.onmessage = (e) => {
+          const mem = SharedMemory.fromBuffers(e.data);
+          const a = Shared("len-worker", undefined, { memory: mem });
+          a.push(5);
+          self.postMessage("pushed");
+        };
+      `;
+      const w = new Worker(
+        new URL(
+          "data:text/javascript," + encodeURIComponent(code),
+          import.meta.url,
+        ),
+        { type: "module" },
+      );
+      await new Promise<void>((resolve, reject) => {
+        w.onerror = (e) => reject(new Error(e.message));
+        w.onmessage = () => resolve();
+        w.postMessage(mem.exportBuffers());
+      });
+      w.terminate();
+      a[4] = 55;
+      expect(a.read()).toEqual([9, 8, 3, 4, 55]);
+      mem.dispose();
+    });
+  });
 });
