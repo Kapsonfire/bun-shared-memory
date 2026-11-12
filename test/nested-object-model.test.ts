@@ -34,73 +34,130 @@ function leaf(r: ReturnType<typeof prng>): unknown {
   return all[r.int(all.length)];
 }
 
-type Model = { p: { q: unknown; r: { s: unknown } }; n: unknown };
+function list(r: ReturnType<typeof prng>): unknown[] {
+  return Array.from({ length: r.int(5) }, () => leaf(r));
+}
+
+type Model = {
+  p: { q: unknown; r: { s: unknown }; t: unknown[] };
+  n: unknown;
+};
 
 function run(seed: number, steps: number): void {
   const r = prng(seed);
   const mem = new SharedMemory({ initialSize: 4096, maxByteLength: 1 << 24 });
   try {
-    const model: Model = { p: { q: 1, r: { s: "x" } }, n: 0 };
+    const model: Model = { p: { q: 1, r: { s: "x" }, t: [1, 2, 3] }, n: 0 };
     const o: any = Shared(`nested-${seed}`, structuredClone(model), {
       memory: mem,
     });
     Shared(`filler-${seed}`, { a: [1, 2, 3], b: "filler" }, { memory: mem });
     const heldP = o.p;
     const heldR = o.p.r;
+    const heldT = o.p.t;
+    const arr = (): unknown[] => (r.int(2) === 0 ? o.p.t : heldT);
     for (let step = 0; step < steps; step++) {
       let op = "";
-      const k = r.int(8);
-      const v = leaf(r);
-      if (k === 0) {
-        op = `o.p.q = ${String(v)}`;
-        o.p.q = v;
-        model.p.q = v;
-      } else if (k === 1) {
-        op = `held p.q = ${String(v)}`;
-        heldP.q = v;
-        model.p.q = v;
-      } else if (k === 2) {
-        op = `o.p.r.s = ${String(v)}`;
-        o.p.r.s = v;
-        model.p.r.s = v;
-      } else if (k === 3) {
-        op = `held r.s = ${String(v)}`;
-        heldR.s = v;
-        model.p.r.s = v;
-      } else if (k === 4) {
-        const next: Model = {
-          p: { q: leaf(r), r: { s: leaf(r) } },
-          n: leaf(r),
-        };
-        op = `o.write(${show(next)})`;
-        o.write(structuredClone(next));
-        model.p = next.p;
-        model.n = next.n;
-      } else if (k === 5) {
-        const p = { q: leaf(r), r: { s: leaf(r) } };
-        op = `o.p = ${show(p)}`;
-        o.p = structuredClone(p);
-        model.p = p;
-      } else if (k === 6) {
-        op = `o.n = ${String(v)}`;
-        o.n = v;
-        model.n = v;
-      } else {
-        op = "defragment";
-        mem.withLock(() => mem.defragment());
-      }
-      const where = `seed ${seed} step ${step}: ${op}`;
-      // Twice: the second read is the cached path.
-      for (let pass = 0; pass < 2; pass++) {
-        expect(show(o.read()), where).toBe(show(model));
-        expect(show(o.p.q), `${where} (o.p.q)`).toBe(show(model.p.q));
-        expect(o.p.r, `${where} (o.p.r)`).toBeDefined();
-        expect(show(o.p.r.s), `${where} (o.p.r.s)`).toBe(show(model.p.r.s));
-        expect(show(heldP.q), `${where} (held p.q)`).toBe(show(model.p.q));
-        expect(show(heldR.s), `${where} (held r.s)`).toBe(show(model.p.r.s));
-        expect(show(o.n), `${where} (o.n)`).toBe(show(model.n));
-        expect(heldP.missing, `${where} (missing)`).toBeUndefined();
-        expect(heldP.toString, `${where} (toString)`).toBeUndefined();
+      try {
+        const k = r.int(12);
+        const v = leaf(r);
+        if (k === 0) {
+          op = `o.p.q = ${String(v)}`;
+          o.p.q = v;
+          model.p.q = v;
+        } else if (k === 1) {
+          op = `held p.q = ${String(v)}`;
+          heldP.q = v;
+          model.p.q = v;
+        } else if (k === 2) {
+          op = `o.p.r.s = ${String(v)}`;
+          o.p.r.s = v;
+          model.p.r.s = v;
+        } else if (k === 3) {
+          op = `held r.s = ${String(v)}`;
+          heldR.s = v;
+          model.p.r.s = v;
+        } else if (k === 4) {
+          const next: Model = {
+            p: { q: leaf(r), r: { s: leaf(r) }, t: list(r) },
+            n: leaf(r),
+          };
+          op = `o.write(${show(next)})`;
+          o.write(structuredClone(next));
+          model.p = next.p;
+          model.n = next.n;
+        } else if (k === 5) {
+          const p = { q: leaf(r), r: { s: leaf(r) }, t: list(r) };
+          op = `o.p = ${show(p)}`;
+          o.p = structuredClone(p);
+          model.p = p;
+        } else if (k === 6) {
+          op = `o.n = ${String(v)}`;
+          o.n = v;
+          model.n = v;
+        } else if (k === 7) {
+          // An array inside the nested object, through a fresh or held proxy.
+          const i = r.int(6);
+          op = `p.t[${i}] = ${String(v)}`;
+          let threw = false;
+          try {
+            arr()[i] = v;
+          } catch (e) {
+            if (!(e instanceof RangeError)) throw e;
+            threw = true;
+          }
+          expect(threw, `seed ${seed} step ${step}: ${op}`).toBe(
+            i >= model.p.t.length,
+          );
+          if (!threw) model.p.t[i] = v;
+        } else if (k === 8) {
+          op = `p.t.push(${String(v)})`;
+          arr().push(v);
+          model.p.t.push(v);
+        } else if (k === 9) {
+          op = "p.t.pop()";
+          arr().pop();
+          model.p.t.pop();
+        } else if (k === 10) {
+          const n = r.int(model.p.t.length + 1);
+          op = `p.t.length = ${n}`;
+          arr().length = n;
+          model.p.t.length = n;
+        } else {
+          op = "defragment";
+          mem.withLock(() => mem.defragment());
+        }
+        const where = `seed ${seed} step ${step}: ${op}`;
+        // Twice: the second read is the cached path.
+        for (let pass = 0; pass < 2; pass++) {
+          expect(show(o.read()), where).toBe(show(model));
+          expect(show(o.p.q), `${where} (o.p.q)`).toBe(show(model.p.q));
+          expect(o.p.r, `${where} (o.p.r)`).toBeDefined();
+          expect(show(o.p.r.s), `${where} (o.p.r.s)`).toBe(show(model.p.r.s));
+          expect(show(heldP.q), `${where} (held p.q)`).toBe(show(model.p.q));
+          expect(show(heldR.s), `${where} (held r.s)`).toBe(show(model.p.r.s));
+          expect(show(o.n), `${where} (o.n)`).toBe(show(model.n));
+          for (const [name, t] of [
+            ["o.p.t", o.p.t],
+            ["held t", heldT],
+          ] as const) {
+            expect(t.length, `${where} (${name}.length)`).toBe(
+              model.p.t.length,
+            );
+            for (let i = 0; i <= model.p.t.length; i++) {
+              expect(show(t[i]), `${where} (${name}[${i}])`).toBe(
+                show(model.p.t[i]),
+              );
+            }
+          }
+          expect(heldP.missing, `${where} (missing)`).toBeUndefined();
+          expect(heldP.toString, `${where} (toString)`).toBeUndefined();
+        }
+      } catch (e) {
+        if (e instanceof Error && !e.message.startsWith("seed ")) {
+          e.message = `seed ${seed} step ${step}: ${op}: ${e.message}`;
+        }
+        throw e;
       }
     }
   } finally {

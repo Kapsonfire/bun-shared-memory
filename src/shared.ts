@@ -84,6 +84,9 @@ interface ChildProxies {
   objects: Map<string | number, unknown>;
 }
 
+/** The path of a top-level value (shared, never modified). */
+const NO_PATH: ArrayStep[] = [];
+
 function newChildProxies(): ChildProxies {
   return { arrays: new Map(), objects: new Map() };
 }
@@ -103,7 +106,8 @@ function topLevelChildren(key: string): ChildProxies {
 function childProxy(
   children: ChildProxies,
   mem: SharedMemory,
-  locator: ArrayLocator,
+  key: string,
+  path: ArrayStep[],
   step: "prop" | "index",
   id: string | number,
   isArray: boolean,
@@ -113,9 +117,9 @@ function childProxy(
   const known = map.get(id);
   if (known !== undefined) return known;
   const child: ArrayLocator = {
-    key: locator.key,
+    key,
     path: [
-      ...locator.path,
+      ...path,
       step === "prop"
         ? { kind: "prop", name: id as string }
         : { kind: "index", index: id as number },
@@ -892,7 +896,8 @@ function createNestedObjectProxy(
           value = childProxy(
             children,
             mem,
-            locator,
+            locator.key,
+            locator.path,
             "prop",
             prop,
             type === TYPE_ARRAY_REF,
@@ -1150,6 +1155,8 @@ onMemoryDisposed(() => {
   offsetCache.clear();
   layoutCache.clear();
   topLevelChildCache.clear();
+  nestedLayouts.clear();
+  nestedLayoutsVersion = -1;
   registry.clear();
   pendingLoads.clear();
 });
@@ -1324,7 +1331,8 @@ function readProp(
     return childProxy(
       topLevelChildren(key),
       mem,
-      { key, path: [] },
+      key,
+      NO_PATH,
       "prop",
       prop,
       Array.isArray(propValue),
@@ -2163,7 +2171,21 @@ function readIndexFast(t: RefTarget, prop: string): unknown {
   const index = parseIndex(prop);
   if (index < 0) return NOT_PRIMITIVE;
   const element: unknown = value[index];
-  if (element !== null && typeof element === "object") return NOT_PRIMITIVE;
+  if (element !== null && typeof element === "object") {
+    // A nested array or object: its cached child proxy (a live shared
+    // reference as it is), like `getTopLevelArrayMember` does.
+    if (sharedKeyMap.has(element)) return element;
+    return childProxy(
+      topLevelChildren(t.key),
+      t.mem,
+      t.key,
+      NO_PATH,
+      "index",
+      index,
+      Array.isArray(element),
+      t.arrayCapacity,
+    );
+  }
   return element;
 }
 
@@ -2695,17 +2717,50 @@ function mutateValue<T, R>(
 }
 
 /**
- * Find the DataTable offset of the array-ref slot for a key's array.
- *
- * `prop` is null for a top-level array value, or the property name for an
- * array property of an object. Returns null if the value is not an array.
+ * Layouts of nested object blocks, by DataTable offset. A block's layout never
+ * changes (fixed shape), a replaced sub-object gets a new block from the bump
+ * allocator, and only a defragmentation (which bumps the layout version) puts
+ * another block at a used offset, so an entry holds until the layout version
+ * changes. Spares the property-name decoding of `getObjectLayoutAtOffset` on
+ * every write through a nested object.
  */
+const nestedLayouts = new Map<number, ObjectLayout>();
+let nestedLayoutsVersion = -1;
+
+function nestedLayoutAt(
+  mem: SharedMemory,
+  offset: number,
+): ObjectLayout | null {
+  const lv = mem.getLayoutVersion();
+  if (lv !== nestedLayoutsVersion) {
+    nestedLayouts.clear();
+    nestedLayoutsVersion = lv;
+  }
+  let layout = nestedLayouts.get(offset);
+  if (layout === undefined) {
+    const fresh = mem.getObjectLayoutAtOffset(offset);
+    if (fresh === null) return null;
+    // Replaced sub-objects leave dead blocks behind; keep the map bounded.
+    if (nestedLayouts.size >= 1024) nestedLayouts.clear();
+    nestedLayouts.set(offset, fresh);
+    layout = fresh;
+  }
+  return layout;
+}
+
 /**
  * Resolve the array-ref slot for a locator, returning the current array-ref
  * ValueSlot and a `write` function that persists a new array-ref slot back to
- * its location (DataTable offset for a top-level array or object property,
- * ArrayTable slot for a nested array). Returns null if the value at the
- * locator is not an array.
+ * its location (a DataTable slot of an object, or of the top-level value, or
+ * an ArrayTable slot of an enclosing array). The path may run through objects
+ * and arrays in any order (`o.p.t`, `grid[0]`, `o.m[1]`, `o.list[2].tags`).
+ * Returns null if the value at the locator is not an array.
+ *
+ * `offset` (the slot's DataTable offset) is given only for a top-level array
+ * and an array property of the top-level object: those slots stay where they
+ * are until a defragmentation. Deeper slots live in a nested object block or
+ * an array that a write can replace by a new one without bumping the layout
+ * version, so callers must not cache them.
  */
 function resolveArrayRef(
   mem: SharedMemory,
@@ -2713,69 +2768,71 @@ function resolveArrayRef(
 ): {
   slot: ValueSlot;
   write: (s: ValueSlot) => void;
-  /** DataTable offset of the slot, when it lives there. */
+  /** DataTable offset of the slot, when it may be cached (see above). */
   offset?: number;
 } | null {
   const { key, path } = locator;
-  if (path.length === 0) {
-    const offset = getOffset(mem, key);
-    if (offset === null) return null;
-    const slot = mem.readValueSlot(offset);
-    if (slot.type !== TYPE_ARRAY_REF) return null;
-    return { slot, write: (s) => mem.updateValueSlot(offset, s), offset };
-  }
-  const first = path[0]!;
-  if (first.kind === "prop") {
-    const layout = getObjectLayout(mem, key);
-    if (layout === null) return null;
-    const slotOffset = layout.properties.get(first.name);
-    if (slotOffset === undefined) return null;
-    const slot = mem.readValueSlot(slotOffset);
-    if (slot.type !== TYPE_ARRAY_REF) return null;
-    if (path.length === 1) {
-      return {
-        slot,
-        write: (s) => mem.updateValueSlot(slotOffset, s),
-        offset: slotOffset,
-      };
-    }
-    return resolveNestedArrayRef(mem, slot, path.slice(1));
-  }
-  // First step is an index: the root must be a top-level array.
   const rootOffset = getOffset(mem, key);
   if (rootOffset === null) return null;
-  const rootSlot = mem.readValueSlot(rootOffset);
-  if (rootSlot.type !== TYPE_ARRAY_REF) return null;
-  return resolveNestedArrayRef(mem, rootSlot, path);
-}
-
-/**
- * Navigate into a nested array starting from a parent array-ref slot. `steps`
- * are all index steps. Returns the resolved array-ref slot and a writer, or
- * null if any step is not an array or is out of bounds.
- */
-function resolveNestedArrayRef(
-  mem: SharedMemory,
-  parentSlot: ValueSlot,
-  steps: ArrayStep[],
-): { slot: ValueSlot; write: (s: ValueSlot) => void } | null {
-  let ref: ArrayRef = {
-    offset: parentSlot.a,
-    count: parentSlot.b,
-    capacity: parentSlot.c,
-  };
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i]!;
-    if (step.kind !== "index") return null;
-    if (step.index >= ref.count) return null;
-    const slot = mem.readArraySlot(ref, step.index);
+  if (path.length === 0) {
+    const slot = mem.readValueSlot(rootOffset);
     if (slot.type !== TYPE_ARRAY_REF) return null;
-    if (i === steps.length - 1) {
-      const slotRef = ref;
+    return {
+      slot,
+      write: (s) => mem.updateValueSlot(rootOffset, s),
+      offset: rootOffset,
+    };
+  }
+  // The container the next step reads from: an object block (DataTable
+  // offset) or an array.
+  let objectAt: number | null = null;
+  let array: ArrayRef | null = null;
+  if (mem.dataTable.getInt32(rootOffset) === 5 /* TYPE_OBJECT */) {
+    objectAt = rootOffset;
+  } else {
+    const rootSlot = mem.readValueSlot(rootOffset);
+    if (rootSlot.type !== TYPE_ARRAY_REF) return null;
+    array = { offset: rootSlot.a, count: rootSlot.b, capacity: rootSlot.c };
+  }
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i]!;
+    const last = i === path.length - 1;
+    let slot: ValueSlot;
+    let write: (s: ValueSlot) => void;
+    let dataOffset: number | undefined;
+    if (step.kind === "prop") {
+      if (objectAt === null) return null;
+      const layout =
+        objectAt === rootOffset
+          ? getObjectLayout(mem, key)
+          : nestedLayoutAt(mem, objectAt);
+      const slotOffset = layout?.properties.get(step.name);
+      if (slotOffset === undefined) return null;
+      slot = mem.readValueSlot(slotOffset);
+      write = (s) => mem.updateValueSlot(slotOffset, s);
+      dataOffset = slotOffset;
+    } else {
+      if (array === null || step.index >= array.count) return null;
+      const ref = array;
       const index = step.index;
-      return { slot, write: (s) => mem.updateArraySlot(slotRef, index, s) };
+      slot = mem.readArraySlot(ref, index);
+      write = (s) => mem.updateArraySlot(ref, index, s);
     }
-    ref = { offset: slot.a, count: slot.b, capacity: slot.c };
+    if (last) {
+      if (slot.type !== TYPE_ARRAY_REF) return null;
+      return path.length === 1 && dataOffset !== undefined
+        ? { slot, write, offset: dataOffset }
+        : { slot, write };
+    }
+    if (slot.type === TYPE_OBJECT_REF) {
+      objectAt = slot.a;
+      array = null;
+    } else if (slot.type === TYPE_ARRAY_REF) {
+      array = { offset: slot.a, count: slot.b, capacity: slot.c };
+      objectAt = null;
+    } else {
+      return null;
+    }
   }
   return null;
 }
@@ -2981,7 +3038,8 @@ function getTopLevelArrayMember(
       return childProxy(
         topLevelChildren(key),
         mem,
-        { key, path: [] },
+        key,
+        NO_PATH,
         "index",
         index,
         Array.isArray(element),
@@ -3278,7 +3336,8 @@ function createArrayProxy(
           return childProxy(
             children,
             mem,
-            locator,
+            locator.key,
+            locator.path,
             "index",
             index,
             Array.isArray(element),
