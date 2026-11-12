@@ -807,7 +807,12 @@ function createNestedObjectProxy(
   locator: ArrayLocator,
   arrayCapacity?: number,
 ): Record<string | symbol, unknown> | null {
-  const anchor = resolveNestedObject(mem, locator);
+  // Under the key's lock: the walk reads table bytes, which a concurrent
+  // defragmentation could be moving (made once per place, so the lock is
+  // cheap; it is re-entrant when the caller already holds it).
+  const anchor = mem.withKeyLock(getIndex(mem, locator.key), () =>
+    resolveNestedObject(mem, locator),
+  );
   if (anchor === null) return null;
   if (anchor.kind === "shared") {
     return getNestedSharedRef(mem, anchor.key) as Record<
@@ -904,8 +909,12 @@ function createNestedObjectProxy(
     if ((rawIn & VERSION_LOCK_MASK) === 0) {
       const version = rawIn >> VERSION_LOCK_SHIFT_BITS;
       const entry = fields.get(prop);
-      if (entry === undefined) fields.set(prop, { version, value });
-      else {
+      if (entry === undefined) {
+        // Bounded: any name asked for gets an entry (also names the object
+        // does not have, such as `then` probed by `await`).
+        if (fields.size >= MAX_CHILD_PROXIES) fields.clear();
+        fields.set(prop, { version, value });
+      } else {
         entry.version = version;
         entry.value = value;
       }
@@ -1692,6 +1701,8 @@ class RefTarget<T = unknown> {
    * field each for `write`/`update` gained nothing and cost 128 B per key.)
    */
   __readFn: ((...args: never[]) => unknown) | undefined = undefined;
+  /** `write` as seen through a Proxy, like `__readFn` (one trap call instead of two). */
+  __writeFn: ((value: never) => void) | undefined = undefined;
   /**
    * The reference handed back to the caller (accessor object or proxy). Lock
    * callbacks receive it, not this target, so `self.prop = x` inside
@@ -1945,6 +1956,16 @@ function resolveSlot(st: PropState, lv: number): number {
   return st.slotOffset;
 }
 
+/*
+ * Note on the plain-write fast paths (`RefTarget.writeSmallPrimitive`,
+ * `writePropFast`, `writeIndexFast`, `writeElementFast` in `createArrayProxy`):
+ * each checks and stores the value types itself, on purpose. Shared helpers
+ * for the type check and the store collect JIT type feedback from all four
+ * call sites, turn polymorphic over number/boolean/bigint/string, and made the
+ * writes slower (measured: boolean write -20 %, string -14 %, bigint -6 %,
+ * array index writes -5 %). Keep the copies in sync by hand.
+ */
+
 /**
  * The setter's fast path for values that are stored in place without
  * allocating (a number, a boolean, an int64 bigint, a string that fits inline):
@@ -2068,23 +2089,33 @@ function readPropMiss(st: PropState): unknown {
   // every write. The slot's type tag decides whether the proxy still fits: a
   // write may have replaced the array or object with something else (the
   // array proxy used to be returned even after `o.arr = 5`).
-  if (st.arrayProxy !== undefined || st.objectProxy !== undefined) {
+  // The type tag is read without a lock, so it only counts while no
+  // defragmentation moves data under it (settled, unchanged layout version).
+  const lv0 = mem.getLayoutVersion();
+  if (
+    (st.arrayProxy !== undefined || st.objectProxy !== undefined) &&
+    SharedMemory.layoutSettled(lv0)
+  ) {
     const seen = mem.versionView[cell]!;
-    const type = mem.slotTypeAt(resolveSlot(st, mem.getLayoutVersion()));
+    let type = -1;
+    try {
+      type = mem.slotTypeAt(resolveSlot(st, lv0));
+    } catch {
+      // Unreadable layout: the general path below decides.
+    }
     const proxy =
       type === TYPE_ARRAY_REF
         ? st.arrayProxy
         : type === TYPE_OBJECT_REF
           ? st.objectProxy
           : undefined;
-    if (proxy !== undefined) {
+    // The add(…, 0) is a full barrier: the reads above happen before it.
+    const now = Atomics.add(mem.versionView, cell, 0);
+    if (proxy !== undefined && mem.getLayoutVersion() === lv0) {
       // Remember it for this version when no write overlapped the type check,
       // so the next accesses take the getter's hit path again (otherwise every
       // access after a write came back here).
-      if (
-        (seen & VERSION_LOCK_MASK) === 0 &&
-        Atomics.load(mem.versionView, cell) === seen
-      ) {
+      if ((seen & VERSION_LOCK_MASK) === 0 && now === seen) {
         st.version = seen >> VERSION_LOCK_SHIFT_BITS;
         st.value = proxy;
       }
@@ -2101,21 +2132,51 @@ function readPropMiss(st: PropState): unknown {
   // is a seqlock: a writer holds its WRITER bit while it writes and bumps the
   // version when done, so if the cell is not exactly what it was before the
   // read, decode again. The validating add(…, 0) is a full barrier, keeping
-  // the data reads before it.
+  // the data reads before it. A defragmentation moves data without touching
+  // the version cell, so the layout version is the second seqlock: it must be
+  // settled (even) before and unchanged after (it was not, and a string read
+  // while its bytes were moved came back as garbage).
   let value: unknown;
   for (let attempt = 0; ; attempt++) {
-    value = readObjectProp(
-      mem,
-      key,
-      name,
-      st,
-      raw >> VERSION_LOCK_SHIFT_BITS,
-      arrayCapacity,
-      resolveSlot(st, mem.getLayoutVersion()),
-    );
-    if (Atomics.add(mem.versionView, cell, 0) === raw) break;
-    if (attempt === 8) {
-      // Heavily written object: read once under the key's lock.
+    const lv = mem.getLayoutVersion();
+    if (attempt < 8 && SharedMemory.layoutSettled(lv)) {
+      let readable = true;
+      try {
+        value = readObjectProp(
+          mem,
+          key,
+          name,
+          st,
+          raw >> VERSION_LOCK_SHIFT_BITS,
+          arrayCapacity,
+          resolveSlot(st, lv),
+        );
+      } catch (error) {
+        // Bytes read while a defragmentation began can look like anything,
+        // a missing property included: only an error at an unchanged layout
+        // and version is real.
+        if (
+          Atomics.add(mem.versionView, cell, 0) === raw &&
+          mem.getLayoutVersion() === lv
+        ) {
+          throw error;
+        }
+        readable = false;
+      }
+      if (
+        readable &&
+        Atomics.add(mem.versionView, cell, 0) === raw &&
+        mem.getLayoutVersion() === lv
+      ) {
+        break;
+      }
+      raw = stableRaw(mem, cell);
+      continue;
+    }
+    {
+      // Heavily written object, or a defragmentation in progress: read once
+      // under the key's lock (which waits for the defragmentation, as that
+      // holds every stripe).
       const keyIndex = getIndex(mem, key);
       raw = stableRaw(mem, cell);
       value = mem.withKeyLock(keyIndex, () =>
@@ -2131,7 +2192,6 @@ function readPropMiss(st: PropState): unknown {
       );
       break;
     }
-    raw = stableRaw(mem, cell);
   }
   if (Array.isArray(value)) {
     st.arrayProxy = value;
@@ -2210,7 +2270,9 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
         return typeof v === "object" && v !== null ? copyValue(v) : v;
       });
     }
-    if (prop === "write") return REF_METHODS.write;
+    if (prop === "write") {
+      return (t.__writeFn ??= (value: unknown) => t.write(value));
+    }
     if (prop === "update") return REF_METHODS.update;
     if (prop === "withRWLock") return REF_METHODS.withRWLock;
     if (prop === "withWriteLock") return REF_METHODS.withWriteLock;
