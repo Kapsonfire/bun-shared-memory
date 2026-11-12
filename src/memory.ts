@@ -2196,11 +2196,13 @@ export class SharedMemory {
     const sortedData = [...liveDataOffsets].sort((a, b) => a - b);
     let newDataOffset = 0;
     for (const oldOffset of sortedData) {
-      const size =
-        this.dataTable.getInt32(oldOffset) === TYPE_OBJECT
-          ? OBJECT_HEADER +
-            this.dataTable.getInt32(oldOffset + 4) * (NAME_REF_SIZE + SLOT_SIZE)
-          : SLOT_SIZE;
+      // The kind comes from the mark phase, like in Phase 6 (the bytes here
+      // are still intact only because blocks are copied strictly downwards in
+      // ascending order).
+      const size = liveObjects.has(oldOffset)
+        ? OBJECT_HEADER +
+          this.dataTable.getInt32(oldOffset + 4) * (NAME_REF_SIZE + SLOT_SIZE)
+        : SLOT_SIZE;
       copyBytes(this.dataTable, newDataOffset, oldOffset, size);
       objectRemap.set(oldOffset, newDataOffset);
       newDataOffset += size;

@@ -84,6 +84,9 @@ interface ChildProxies {
   objects: Map<string | number, unknown>;
 }
 
+/** Child proxies remembered per proxy and kind (see `childProxy`). */
+const MAX_CHILD_PROXIES = 256;
+
 /** The path of a top-level value (shared, never modified). */
 const NO_PATH: ArrayStep[] = [];
 
@@ -130,7 +133,13 @@ function childProxy(
     : createNestedObjectProxy(mem, child, arrayCapacity);
   // `createNestedObjectProxy` hands out a live shared reference when the
   // place holds one by now: that is not this place's object proxy.
-  if (made !== null && !sharedKeyMap.has(made)) map.set(id, made);
+  if (made !== null && !sharedKeyMap.has(made)) {
+    // Bounded: walking a large array of objects once must not keep a proxy
+    // (with its caches) per element alive. Identity holds for recently used
+    // places; an evicted one gets a new, equally valid proxy.
+    if (map.size >= MAX_CHILD_PROXIES) map.clear();
+    map.set(id, made);
+  }
   return made;
 }
 
@@ -148,6 +157,10 @@ function childProxy(
  * Note: code holding a stripe (an `update()` callback, for example) that
  * writes to a *different* key takes that key's stripe too; two threads doing
  * so in opposite order can deadlock and fail with a `LockTimeoutError`.
+ * The same holds when that other key is held by another thread's
+ * `withReadLock`/`withWriteLock` whose callback reads past its cache: an
+ * ordinary write waits for such a lock without holding the stripe, but a
+ * stripe this thread already held before (here: the outer write's) stays held.
  */
 function writeLock<T>(
   mem: SharedMemory,
@@ -810,36 +823,14 @@ function createNestedObjectProxy(
   const children = newChildProxies();
   let setProp: string | symbol = "";
   let setVal: unknown;
-  // Layouts of the object blocks on this proxy's path, by block offset. A
-  // block's layout never changes; a replaced sub-object gets a new block, and
-  // only a defragmentation (which bumps the layout version) reuses offsets,
-  // so the map is emptied when the layout version changes.
-  const layouts = new Map<number, ObjectLayout>();
-  let layoutsVersion = -1;
-  const layoutAt = (offset: number, lv: number): ObjectLayout | null => {
-    if (lv !== layoutsVersion) {
-      layouts.clear();
-      layoutsVersion = lv;
-    }
-    let layout = layouts.get(offset);
-    if (layout === undefined) {
-      const fresh = mem.getObjectLayoutAtOffset(offset);
-      if (fresh === null) return null;
-      // Replaced sub-objects leave dead blocks behind; keep the map small.
-      if (layouts.size >= 32) layouts.clear();
-      layouts.set(offset, fresh);
-      layout = fresh;
-    }
-    return layout;
-  };
   // A path of property names only (`o.p`, `o.p.r`) is followed with the
-  // cached layouts and two slot reads per step; one through an array index
+  // cached layouts (`nestedLayoutAt`) and two slot reads per step; one through an array index
   // takes the general `resolveAnchorOffset`.
   const propPath = locator.path.every((step) => step.kind === "prop")
     ? locator.path.map((step) => (step as { name: string }).name)
     : null;
   /** DataTable offset of this proxy's object block; call under the key's lock. */
-  const blockOffset = (lv: number): number | null => {
+  const blockOffset = (): number | null => {
     if (propPath === null) return resolveAnchorOffset(mem, locator);
     let offset = getOffset(mem, locator.key);
     if (
@@ -849,7 +840,7 @@ function createNestedObjectProxy(
       return null;
     }
     for (const name of propPath) {
-      const slotOffset = layoutAt(offset, lv)?.properties.get(name);
+      const slotOffset = nestedLayoutAt(mem, offset)?.properties.get(name);
       if (slotOffset === undefined) return null;
       if (mem.dataTable.getInt32(slotOffset) !== TYPE_OBJECT_REF) return null;
       offset = mem.dataTable.getInt32(slotOffset + 4);
@@ -857,12 +848,11 @@ function createNestedObjectProxy(
     return offset;
   };
   const setBody = (): void => {
-    const lv = mem.layoutVersionInLock();
-    const offset = blockOffset(lv);
+    const offset = blockOffset();
     if (offset === null) {
       throw new TypeError("Value is not an object");
     }
-    const layout = layoutAt(offset, lv);
+    const layout = nestedLayoutAt(mem, offset);
     if (layout === null) {
       throw new TypeError("Value is not an object");
     }
@@ -885,11 +875,10 @@ function createNestedObjectProxy(
     // No ordinary writer of the key runs while its stripe is held, so the
     // version read here belongs to the slot read below.
     const rawIn = Atomics.load(mem.versionView, cell);
-    const lv = mem.layoutVersionInLock();
-    const offset = blockOffset(lv);
+    const offset = blockOffset();
     let value: unknown = undefined;
     if (offset !== null) {
-      const slotOffset = layoutAt(offset, lv)?.properties.get(prop);
+      const slotOffset = nestedLayoutAt(mem, offset)?.properties.get(prop);
       if (slotOffset !== undefined) {
         const type = mem.dataTable.getInt32(slotOffset);
         if (type === TYPE_ARRAY_REF || type === TYPE_OBJECT_REF) {
@@ -1558,13 +1547,12 @@ function writePropInner(
   if (offset === null) {
     throw new Error(`No shared value found for key "${key}"`);
   }
-  const slotType =
-    target !== undefined && target.__type !== undefined
-      ? target.__type
-      : mem.dataTable.getInt32(offset);
-  if (target !== undefined && target.__type === undefined) {
-    target.__type = slotType;
-  }
+  // The slot's type is read live: a whole-value write can turn an array into
+  // a number (or back) without touching the cached `__type`, and treating a
+  // number slot as an array ref wrote into a dead block or, for `length`,
+  // replaced the number with an array assembled from its bits.
+  const slotType = mem.slotTypeAt(offset);
+  if (target !== undefined) target.__type = slotType;
   const parsedIndex = slotType === TYPE_ARRAY_REF ? parseIndex(prop) : -1;
   if (parsedIndex >= 0) {
     const index = parsedIndex;
@@ -2081,12 +2069,26 @@ function readPropMiss(st: PropState): unknown {
   // write may have replaced the array or object with something else (the
   // array proxy used to be returned even after `o.arr = 5`).
   if (st.arrayProxy !== undefined || st.objectProxy !== undefined) {
+    const seen = mem.versionView[cell]!;
     const type = mem.slotTypeAt(resolveSlot(st, mem.getLayoutVersion()));
-    if (type === TYPE_ARRAY_REF && st.arrayProxy !== undefined) {
-      return st.arrayProxy;
-    }
-    if (type === TYPE_OBJECT_REF && st.objectProxy !== undefined) {
-      return st.objectProxy;
+    const proxy =
+      type === TYPE_ARRAY_REF
+        ? st.arrayProxy
+        : type === TYPE_OBJECT_REF
+          ? st.objectProxy
+          : undefined;
+    if (proxy !== undefined) {
+      // Remember it for this version when no write overlapped the type check,
+      // so the next accesses take the getter's hit path again (otherwise every
+      // access after a write came back here).
+      if (
+        (seen & VERSION_LOCK_MASK) === 0 &&
+        Atomics.load(mem.versionView, cell) === seen
+      ) {
+        st.version = seen >> VERSION_LOCK_SHIFT_BITS;
+        st.value = proxy;
+      }
+      return proxy;
     }
   }
   // Miss: wait until nobody is writing, then decode and validate.
