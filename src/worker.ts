@@ -148,54 +148,71 @@ function stopCoordinator(): void {
 
 // ---------------------------------------------------------------------------
 /** The main-thread worker listener, so it can be removed by `stopInit()`. */
-let mainListener:
-  | ((worker: {
-      postMessage: (msg: unknown) => void;
-      addEventListener: (
-        type: string,
-        fn: (e: { data: unknown }) => void,
-      ) => void;
-    }) => void)
-  | null = null;
+let mainListener: ((worker: HandshakeWorker) => void) | null = null;
 
 /** Live workers on the main thread, for broadcasting chunk updates. */
-const liveWorkers = new Set<{
+const liveWorkers = new Set<HandshakeWorker>();
+
+/** A worker as far as the handshake needs it (Bun and Web Workers). */
+type HandshakeWorker = {
   postMessage: (msg: unknown) => void;
   addEventListener?: (type: string, fn: (e: { data: unknown }) => void) => void;
   onmessage?: unknown;
-}>();
+};
 
-/** Main thread: answer each worker's buffer request. */
-function initMain(): void {
-  const listener = (worker: {
-    postMessage: (msg: unknown) => void;
-    addEventListener: (
-      type: string,
-      fn: (e: { data: unknown }) => void,
-    ) => void;
-  }) => {
-    liveWorkers.add(worker);
-    // Register with the coordinator so it can release the locks of a worker
-    // that dies.
-    const workerId = coordinator?.registerWorker(worker);
-    worker.addEventListener("message", (e) => {
-      const msg = e.data as
-        { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
-      if (
-        msg !== null &&
-        typeof msg === "object" &&
-        "__sharedMemoryRequest" in msg
-      ) {
-        if (workerId !== undefined && msg.threadId !== undefined) {
-          coordinator?.setWorkerThreadId(workerId, msg.threadId);
-        }
-        const mem = getDefaultMemory();
-        worker.postMessage({
-          __sharedMemoryInit: true,
-          buffers: mem.exportBuffers(),
-        });
+/**
+ * Workers whose shared-buffer request this thread answers, registered by
+ * `init()` (Bun: `process.on("worker")`) or by `acceptWorker()`. A worker is
+ * registered once, whichever comes first, so it never gets two replies.
+ */
+const registeredWorkers = new WeakSet<object>();
+
+/**
+ * Answer `worker`'s shared-buffer request (once per worker), track it for
+ * chunk updates and register it with the coordinator, which releases the
+ * locks of a worker that dies.
+ */
+function registerHandshake(worker: HandshakeWorker): void {
+  if (registeredWorkers.has(worker)) return;
+  registeredWorkers.add(worker);
+  liveWorkers.add(worker);
+  const workerId = coordinator?.registerWorker(worker);
+  const listener = (e: { data: unknown }) => {
+    const msg = e.data as
+      { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
+    if (
+      msg !== null &&
+      typeof msg === "object" &&
+      "__sharedMemoryRequest" in msg
+    ) {
+      if (workerId !== undefined && msg.threadId !== undefined) {
+        coordinator?.setWorkerThreadId(workerId, msg.threadId);
       }
-    });
+      const mem = getDefaultMemory();
+      worker.postMessage({
+        __sharedMemoryInit: true,
+        buffers: mem.exportBuffers(),
+      });
+    }
+  };
+  if (typeof worker.addEventListener === "function") {
+    // A listener of its own: an `onmessage` handler the caller set keeps
+    // receiving every message once (it is called by the worker itself).
+    worker.addEventListener("message", listener);
+  } else {
+    // No listener API: wrap the `onmessage` handler that is already set.
+    const prior = worker.onmessage;
+    worker.onmessage = (e: { data: unknown }) => {
+      listener(e);
+      if (typeof prior === "function") prior.call(worker, e);
+    };
+  }
+}
+
+/** Main thread (Bun): answer the buffer request of every new worker. */
+function initMain(): void {
+  const listener = (worker: HandshakeWorker) => {
+    registerHandshake(worker);
   };
   mainListener = listener;
   process.on("worker", listener);
@@ -227,65 +244,22 @@ function broadcastChunkUpdate(buffers: {
 
 /**
  * Register a worker on the main thread so its shared-buffer request is
- * answered.
+ * answered. The worker calls `await init()` itself to request the buffers.
  *
- * In Bun this is automatic (`process.on("worker", ...)`, see `init()`), so
- * this is a no-op there. On the browser main thread there is no way to
- * discover new workers, so each one must be registered explicitly — either by
- * calling this directly, or by using `spawnWorker()` which does it for you.
+ * Works in Bun and in the browser. In Bun, `init()` also registers every new
+ * worker automatically (`process.on("worker", ...)`); a worker that is
+ * already registered, by `init()` or an earlier call, is not registered
+ * again, so it never gets two replies. In the browser there is no way to
+ * discover new workers, so each one must be registered, by this function or
+ * by `spawnWorker()`.
  *
- * The worker calls `await init()` itself to request the shared buffers.
- *
- * Returns the same worker for chaining.
+ * A message handler already assigned to `worker.onmessage` keeps receiving
+ * every message once. Returns the same worker for chaining.
  */
-export function acceptWorker<
-  T extends {
-    postMessage: (msg: unknown) => void;
-    addEventListener?: (
-      type: string,
-      fn: (e: { data: unknown }) => void,
-    ) => void;
-    onmessage?: unknown;
-  },
->(worker: T): T {
-  if (!isMainThread || isBun) {
-    // Bun main thread already auto-registers workers via `init()`. In a
-    // worker context there is nothing to register.
-    return worker;
-  }
-  liveWorkers.add(worker);
-  // Register with the coordinator so it can release the locks of a worker that
-  // dies.
-  const workerId = coordinator?.registerWorker(worker);
-  const listener = (e: { data: unknown }) => {
-    const msg = e.data as
-      { __sharedMemoryRequest?: boolean; threadId?: number } | undefined;
-    if (
-      msg !== null &&
-      typeof msg === "object" &&
-      "__sharedMemoryRequest" in msg
-    ) {
-      if (workerId !== undefined && msg.threadId !== undefined) {
-        coordinator?.setWorkerThreadId(workerId, msg.threadId);
-      }
-      const mem = getDefaultMemory();
-      worker.postMessage({
-        __sharedMemoryInit: true,
-        buffers: mem.exportBuffers(),
-      });
-    }
-  };
-  // Preserve any user handler already assigned, and forward to it.
-  const prior = worker.onmessage;
-  const wrapped = (e: { data: unknown }) => {
-    listener(e);
-    if (prior) (prior as (e: { data: unknown }) => void).call(worker, e);
-  };
-  if (typeof worker.addEventListener === "function") {
-    worker.addEventListener("message", wrapped);
-  } else {
-    worker.onmessage = wrapped;
-  }
+export function acceptWorker<T extends HandshakeWorker>(worker: T): T {
+  // In a worker there is nothing to answer.
+  if (!isMainThread) return worker;
+  registerHandshake(worker);
   return worker;
 }
 
@@ -309,13 +283,9 @@ export interface SpawnWorkerOptions {
  * Spawn a worker and wire it up for shared memory automatically.
  *
  * The worker must call `await init()` at startup to receive the shared
- * buffers. On the main thread:
- *
- * - **Bun**: `init()` already auto-registers new workers, so this is just a
- *   thin wrapper around `new Worker(...)`.
- * - **Browser / Bundler (Node)**: there is no `process.on("worker")`, so the
- *   worker is automatically registered via `acceptWorker()`, which answers its
- *   buffer request.
+ * buffers. `spawnWorker()` is `new Worker(...)` followed by `acceptWorker()`,
+ * which answers the worker's buffer request, in Bun and in the browser alike
+ * (in Bun a worker that `init()` already registered is not registered twice).
  *
  * Requires cross-origin isolation (`COOP`/`COEP`) in the browser for
  * `SharedArrayBuffer` to be available.

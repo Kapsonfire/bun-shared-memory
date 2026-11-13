@@ -7,8 +7,8 @@ RUNTIME: Bun >= 1.4.0 (also works in Node.js and browser Web Workers)
 
 QUICK SUMMARY
 =============
-A TypeScript library for the Bun runtime that shares data between workers/threads
-using SharedArrayBuffer. Zero-copy, high-performance, with a Proxy-based API and
+A TypeScript library for Bun and the browser that shares data between
+workers/threads using SharedArrayBuffer. Zero-copy, high-performance, with a Proxy-based API and
 Atomics-based synchronization. Supports objects (fixed shape), arrays, primitives,
 bigints, and nested structures.
 
@@ -96,7 +96,9 @@ CORE API
      import { init, spawnWorker, acceptWorker, stopInit } from "bun-shared-memory";
      await init({ maxTotalBytes: 64 * 1024 * 1024 });  // starts the maintenance coordinator
      const worker = spawnWorker(new URL("./worker.ts", import.meta.url), { type: "module" });
-     // or acceptWorker(worker) for browser environments
+     // or acceptWorker(worker) for a worker you created yourself (Bun and
+     // browser; in Bun, init() also registers new workers automatically;
+     // a worker is never registered twice)
      stopInit();                     // cleanup
 
    Worker:

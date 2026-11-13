@@ -4,7 +4,7 @@ Guidelines for AI agents and contributors working in this repository.
 
 ## Project overview
 
-A TypeScript library for the Bun runtime that shares data between
+A TypeScript library for Bun and the browser that shares data between
 workers/threads using `SharedArrayBuffer`. It uses a 4-buffer architecture
 (Index Table, DataTable, append-only StringTable, ArrayTable), a Proxy-based
 getter/setter API, and Atomics-based synchronization (Mutex/Notifier).
