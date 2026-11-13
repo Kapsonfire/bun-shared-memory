@@ -1055,8 +1055,14 @@ function createNestedObjectProxy(
         const cell = mem.beginPlainWrite(keyIndex);
         if (cell >= 0) {
           let done = false;
+          let lv = -1;
+          let slot = -1;
+          let before = -1;
           try {
-            const slot = plainSlotOffset(prop, mem.layoutVersionInLock());
+            lv = mem.layoutVersionInLock();
+            slot = plainSlotOffset(prop, lv);
+            // The cell holds our WRITER bit, so nobody else changes it.
+            before = mem.versionView[cell]! - WRITER_BIT;
             if (slot >= 0) {
               done = true;
               if (typeof val === "number") mem.updateNumberSlot(slot, val);
@@ -1071,7 +1077,17 @@ function createNestedObjectProxy(
           } finally {
             mem.endPlainWrite(keyIndex, cell);
           }
-          if (done) return true;
+          if (done) {
+            // Recorded for `readPropMiss` (see `ownCell`): the parent getters
+            // of this key stay cached across this write.
+            ownMem = mem;
+            ownCell = cell;
+            ownRawBefore = before;
+            ownRawAfter = before + VERSION_STEP;
+            ownSlot = slot;
+            ownLv = lv;
+            return true;
+          }
         }
       }
       // Under the key's write lock like every other write (stripe, WRITER
@@ -2122,11 +2138,47 @@ function makeWriteBody(st: PropState): () => void {
   };
 }
 
+/*
+ * This thread's last plain write through a nested proxy: the key's
+ * memory and version cell, the cell's raw value just before and just after
+ * it, the slot it stored into and the layout version that slot offset belongs
+ * to. A write bumps the key's version, so every cached property of the key
+ * misses afterwards, although only one slot changed. `readPropMiss` keeps a
+ * cached property current when it was current right before this write, no
+ * other write followed (the cell still holds `ownRawAfter`: any later write,
+ * of this thread or another, bumps it), and its slot is another one.
+ * Measured, `o.sub.x = v` 19.0 → 24.0 M ops/s: the getter of `sub` after the
+ * write no longer takes the miss path. Not recorded by the top-level accessor
+ * setter: there the record made number and string writes 15–18 % slower.
+ */
+let ownMem: SharedMemory | undefined;
+let ownCell = -1;
+let ownRawBefore = -1;
+let ownRawAfter = -1;
+let ownSlot = -1;
+let ownLv = -1;
+
 /**
  * The getter's miss path, kept out of the getter itself so the hot hit path
  * stays small enough for the JIT to inline.
  */
 function readPropMiss(st: PropState): unknown {
+  // A write of this thread to another slot of the key since the cache was
+  // filled (see `ownCell`): the cached value is still current. The cell is
+  // read plainly, as in the getter's hit test.
+  if (
+    st.cell === ownCell &&
+    st.raw === ownRawBefore &&
+    st.slotOffset !== ownSlot &&
+    st.slotLayoutVersion === ownLv &&
+    st.slotOffset !== undefined &&
+    st.t.mem === ownMem &&
+    ownMem.versionView[ownCell] === ownRawAfter
+  ) {
+    st.raw = ownRawAfter;
+    st.version = ownRawAfter >> VERSION_LOCK_SHIFT_BITS;
+    return st.value;
+  }
   const { mem, key, arrayCapacity } = st.t;
   const name = st.name;
   if (!st.cellResolved) {

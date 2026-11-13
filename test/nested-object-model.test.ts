@@ -290,3 +290,98 @@ describe("nested proxy: plain-write fast path", () => {
     }).toThrow(TypeError);
   });
 });
+
+/**
+ * A plain write through a nested proxy keeps the parent's other cached
+ * properties current (they were current right before it, and it changed
+ * another slot). Any other write must still make them read fresh values.
+ */
+describe("nested proxy: parent getters across own writes", () => {
+  test("getters stay right across nested writes and every other write", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{
+      id: number;
+      name: string;
+      address: { zip: number };
+      tags: number[];
+    }>(
+      "nest-own",
+      { id: 1, name: "a", address: { zip: 1 }, tags: [1, 2] },
+      { memory: mem },
+    );
+    const a = o.address;
+    const t = o.tags;
+    expect(o.id).toBe(1);
+    expect(o.name).toBe("a");
+
+    for (let i = 0; i < 3; i++) {
+      o.address.zip = 10 + i; // nested plain write, recorded
+      expect(o.address).toBe(a);
+      expect(o.address.zip).toBe(10 + i);
+      expect(o.id).toBe(1);
+      expect(o.name).toBe("a");
+      expect(o.tags).toBe(t);
+    }
+
+    o.id = 2; // top-level write after the recorded one
+    expect(o.id).toBe(2);
+    o.address.zip = 20;
+    expect(o.id).toBe(2);
+
+    o.address.zip = 21;
+    o.address = { zip: 30 }; // replaces the slot the getter caches
+    expect(o.address.zip).toBe(30);
+
+    o.address.zip = 31;
+    o.tags[0] = 9; // array element write
+    expect(o.tags[0]).toBe(9);
+    expect(o.address.zip).toBe(31);
+
+    o.address.zip = 32;
+    o.write({ id: 3, name: "b", address: { zip: 40 }, tags: [5] });
+    expect(o.id).toBe(3);
+    expect(o.name).toBe("b");
+    expect(o.address.zip).toBe(40);
+    expect(o.tags.length).toBe(1);
+
+    o.address.zip = 41;
+    o.name = "c"; // the getter's own slot
+    expect(o.name).toBe("c");
+
+    o.address.zip = 42;
+    mem.withLock(() => mem.defragment()); // layout version bumps
+    expect(o.id).toBe(3);
+    expect(o.address.zip).toBe(42);
+  });
+
+  test("a recorded write of a disposed memory never answers a getter", () => {
+    // Same layout in both memories: same cell numbers and versions.
+    type O = { id: number; address: { zip: number } };
+    const m1 = new SharedMemory();
+    const o1 = Shared<O>(
+      "nest-mm",
+      { id: 1, address: { zip: 1 } },
+      {
+        memory: m1,
+      },
+    );
+    expect(o1.id).toBe(1);
+    o1.address.zip = 2; // recorded in m1
+    m1.dispose();
+
+    const m2 = new SharedMemory();
+    const o2 = Shared<O>(
+      "nest-mm",
+      { id: 1, address: { zip: 1 } },
+      {
+        memory: m2,
+      },
+    );
+    expect(o2.id).toBe(1);
+    o2.id = 5; // general write in m2
+    expect(o2.id).toBe(5);
+    o2.address.zip = 3;
+    expect(o2.id).toBe(5);
+    expect(o2.address.zip).toBe(3);
+  });
+});
