@@ -1257,9 +1257,17 @@ async function loadShared<T>(
 function registerInitial(
   mem: SharedMemory,
   key: string,
-  ref: { write(value: unknown): void },
+  ref: unknown,
   value: unknown,
 ): void {
+  // Written through the target, not `ref.write`: through a proxy, that creates
+  // the ref's `write` wrapper, and a ref that has one reads more slowly, even
+  // if it never writes again (measured: `shared.read()` of a number 640 →
+  // 775 M ops/s without it; the cause in the JIT is not known, wherever the
+  // wrapper was kept, on the target, in a holder or in a WeakMap, made no
+  // difference). So a ref that is only read keeps the fast reads, and a key
+  // costs no wrapper closure until its first `write`.
+  const target = (ref as Record<symbol, RefTarget>)[TARGET]!;
   // The budget may run out while creating the key; reclaim dead space (with no
   // lock held) and retry once rather than failing.
   mem.withReclaim(() =>
@@ -1268,7 +1276,7 @@ function registerInitial(
       // main thread or a racing worker), don't overwrite it with the initial
       // value.
       if (getOffset(mem, key) === null) {
-        ref.write(value);
+        target.write(value);
       }
     }),
   );
