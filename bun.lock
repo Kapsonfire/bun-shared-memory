@@ -6,7 +6,6 @@
       "name": "shared-memory",
       "devDependencies": {
         "@types/bun": "latest",
-        "cofusion": "^0.0.6",
         "elysia": "^1.4.30",
         "typescript": "latest",
       },
@@ -66,8 +65,6 @@
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
 
     "bun-types": ["bun-types@1.4.4", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-yjrJh5oGX7mMPKGd19YXyIjmEuj4G4zNC30bs7PM9Az7NQ3ndF3j6hbeRdvJTRQEhJ/FYQwW0a2moweEi2hMxQ=="],
-
-    "cofusion": ["cofusion@0.0.6", "", {}, "sha512-R+aonx/V81ccHzcASIryYCbl+98j6TkAqZs1Re9WLBEExKSEw4XLey0h20c0jTQHcCvPhVdl9s/Gkt10InPSoA=="],
 
     "cookie": ["cookie@1.1.1", "", {}, "sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ=="],
 
