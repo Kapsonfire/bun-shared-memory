@@ -430,3 +430,56 @@ describe(">4 GiB shared memory", () => {
     expect(mem.arrayTable.getInt32(offset)).toBe(123456789);
   });
 });
+
+describe("MaintenanceCoordinator worker registration", () => {
+  test("autoRegister registers new workers until it is removed", async () => {
+    const mem = new SharedMemory();
+    const coord = new MaintenanceCoordinator(mem, { autoMaintenance: false });
+    // `process.on("worker")` reports every Worker of the process (a worker
+    // of an earlier test may still be starting), so check for these ones.
+    const isRegistered = (w: Worker) =>
+      [
+        ...(
+          coord as unknown as { workerById: Map<number, unknown> }
+        ).workerById.values(),
+      ].includes(w);
+    const spawn = () =>
+      new Worker(
+        new URL(
+          "data:text/javascript," +
+            encodeURIComponent(`self.postMessage("up");`),
+        ),
+        { type: "module" },
+      );
+    const up = (w: Worker) =>
+      new Promise<void>((resolve) => {
+        w.onmessage = () => resolve();
+      });
+
+    const stop = coord.autoRegister();
+    const first = spawn();
+    await up(first);
+    expect(isRegistered(first)).toBe(true);
+    stop();
+    const second = spawn();
+    await up(second);
+    expect(isRegistered(second)).toBe(false); // no longer listening
+    first.terminate();
+    second.terminate();
+    mem.dispose();
+  });
+
+  test("unregisterWorker finds a worker that is not the first registered", () => {
+    const mem = new SharedMemory();
+    const coord = new MaintenanceCoordinator(mem, { autoMaintenance: false });
+    const a = { onclose: null as (() => void) | null };
+    const b = { onclose: null as (() => void) | null };
+    coord.registerWorker(a);
+    coord.registerWorker(b);
+    coord.unregisterWorker(b);
+    const ids = (coord as unknown as { workerById: Map<number, unknown> })
+      .workerById;
+    expect([...ids.values()]).toEqual([a]);
+    mem.dispose();
+  });
+});
