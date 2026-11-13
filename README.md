@@ -15,9 +15,10 @@
 
 [![Bun](https://img.shields.io/badge/Bun-%E2%89%A51.4.0-black?style=for-the-badge&logo=bun&color=14151a)](https://bun.sh)
 [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?style=for-the-badge&logo=typescript&color=3178c6)](https://www.typescriptlang.org)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=for-the-badge&logo=checkmarx)](https://github.com/Kapsonfire/bun-shared-memory/actions)
+[![Tests](https://img.shields.io/github/actions/workflow/status/Kapsonfire/bun-shared-memory/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=tests)](https://github.com/Kapsonfire/bun-shared-memory/actions/workflows/ci.yml)
 
 [![Quality Gate](https://img.shields.io/sonar/quality_gate/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+[![Coverage](https://img.shields.io/sonar/coverage/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/component_measures?id=bun-shared-memory&metric=coverage)
 [![Bugs](https://img.shields.io/sonar/bugs/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
 [![Vulnerabilities](https://img.shields.io/sonar/vulnerabilities/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
 [![Code Smells](https://img.shields.io/sonar/code_smells/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
