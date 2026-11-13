@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-13
+
+### Fixed
+
+- **Wrong property values after a defragmentation.** The cached layout of an
+  object (its slot offsets) could be stored under the layout version of a
+  defragmentation that ran right after it was computed. Every later access
+  at that version then read the wrong slots: an `Unknown slot type 5` error,
+  or a property returning another property's value. The version is now read
+  under the same lock as the layout. The window is short; it showed only on
+  slower machines (CI runners), with workers writing during a
+  defragmentation.
+- **`acceptWorker()` / `spawnWorker()` did nothing in Bun.** A worker could
+  only get the shared buffers through `init()`'s automatic registration. Both
+  now register in Bun as in the browser, and a worker is registered once: one
+  that `init()` already registered, or that is accepted twice, never gets a
+  second reply.
+- **Messages delivered twice.** An `onmessage` handler set before
+  `acceptWorker()` received every message twice (for every worker with
+  `addEventListener`, i.e. every real Worker).
+
+### Changed
+
+- The user-level lock state (`withWriteLock`/`withReadLock`) is kept per
+  `SharedMemory` instead of in module-wide maps. No change in behaviour.
+- Internal cleanups from SonarCloud findings that cost no performance (each
+  measured); `GrowableBuffer` takes its optional settings as an options
+  object. `setDefaultLockTimeout` rejects `NaN` explicitly (as before).
+- Docs: the README no longer describes a Bun-only library. It runs in Bun and
+  in browsers; Bun >= 1.4.0 is needed for `init()`'s automatic worker
+  discovery, and workers can always be registered by hand.
+
+### Added
+
+- CI: a GitHub Actions workflow runs the typecheck, the tests with coverage
+  and the SonarCloud analysis on every push to `main` and every pull request.
+- Tests for `GrowableBuffer`, `SharedBudget`, `Notifier`, RWLock re-entry and
+  hand-off, coordinator auto-registration, `acceptWorker` in Bun, and a
+  deterministic test for the layout cache race. Line coverage of `src/`
+  89.1 % -> 91.8 %.
+
 ## [1.2.0] - 2026-11-13
 
 ### Fixed
@@ -878,6 +919,7 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[1.2.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.0...v1.1.1
