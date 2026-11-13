@@ -2,7 +2,7 @@
 
 # 🧠 bun-shared-memory
 
-**Share data between Bun workers/threads using `SharedArrayBuffer`** — zero-copy, 4-buffer architecture, Atomics-based synchronization.
+**Share data between workers/threads using `SharedArrayBuffer`, in Bun and in the browser** — zero-copy, 4-buffer architecture, Atomics-based synchronization.
 
 [![npm version](https://img.shields.io/npm/v/bun-shared-memory?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)
 [![npm downloads](https://img.shields.io/npm/dm/bun-shared-memory?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)
@@ -24,12 +24,16 @@
 
 ---
 
-A TypeScript library for the **Bun** runtime that enables sharing data between workers/threads using `SharedArrayBuffer`.
+A TypeScript library that shares data between workers/threads using
+`SharedArrayBuffer`. It runs in **Bun** and in **browsers** (Web Workers); the
+core needs nothing but `SharedArrayBuffer` and `Atomics`.
 
-> **Requires Bun ≥ 1.4.0.** The worker integration (M4) relies on the
-> `process.on("worker")` handshake, which only works reliably from Bun 1.4.0
+> **Bun ≥ 1.4.0** for the automatic worker integration: `init()` discovers new
+> workers via `process.on("worker")`, which only works reliably from Bun 1.4.0
 > onward. Core shared-memory operations (including `SharedArrayBuffer.grow()`)
-> work on earlier versions, but the automatic worker buffer-sharing does not.
+> work on earlier versions, and workers can always be registered by hand with
+> `acceptWorker()`. **Browsers** need cross-origin isolation for
+> `SharedArrayBuffer` (see [Browser & Web Workers](#browser--web-workers)).
 
 ## 📈 Real-world benchmark
 
@@ -67,7 +71,7 @@ containers are networked; treat them as an order of magnitude, not a constant.
 - ⚡ **Read & offset caches** — lock-free fast path, cross-worker invalidation via version cells
 - 🧹 **Defragmentation** — automatic reclamation of dead space
 - 🪄 **Proxy-based API** — `Shared()` with direct getter/setter access
-- 🧵 **Automatic worker integration** — no manual buffer serialization
+- 🧵 **Worker integration** — no manual buffer serialization; workers are registered automatically in Bun, or by hand with `acceptWorker()` / `spawnWorker()` (Bun and browser)
 
 ## 📦 Install
 
@@ -394,10 +398,16 @@ onMessage((e) => {
 });
 ```
 
-`init()` is safe to call on both sides: in the main thread it registers the
-buffer-request listener and starts the maintenance coordinator (auto-defrag and
-worker auto-registration), and in a worker it performs the request/response
-handshake and reconstructs the shared buffers. `Shared()` never overwrites a value
+`init()` is safe to call on both sides: in the main thread it starts the
+maintenance coordinator (auto-defrag) and, in Bun, registers every new worker
+automatically; in a worker it performs the request/response handshake and
+reconstructs the shared buffers.
+
+Workers can also be registered by hand, in Bun as in the browser:
+`acceptWorker(worker)` answers that worker's buffer request, and
+`spawnWorker(url, options)` creates a worker and accepts it. A worker is
+registered once: accepting a worker that `init()` already registered (or
+accepting it twice) does not send it a second reply. `Shared()` never overwrites a value
 that already exists in shared memory, so a worker reading a key created by the
 main thread gets the existing value rather than its own initial value.
 
@@ -416,9 +426,9 @@ A complete runnable example is in [`examples/worker/`](examples/worker/).
 
 The core (`SharedArrayBuffer`/`Atomics`) runs identically in modern browsers,
 so `Shared`/`SharedMemory`/`Mutex`/`Notifier` work there out of the box. Only
-the worker handshake differs: Bun auto-discovers workers via
+the worker handshake differs: in Bun, `init()` can discover workers via
 `process.on("worker", ...)`, but browsers have no equivalent — each Web Worker
-must be registered explicitly.
+must be registered explicitly (as it can be in Bun, too).
 
 Two differences to keep in mind:
 
@@ -454,10 +464,12 @@ onMessage(async (e) => {
 });
 ```
 
-`spawnWorker()` is a thin cross-platform wrapper over `new Worker()` that
-automatically calls `acceptWorker()` on the browser main thread (and is a no-op
-overhead in Bun, where workers are auto-registered). If you prefer to build the
-`Worker` yourself, call `acceptWorker(worker)` after constructing it.
+`spawnWorker()` is a thin cross-platform wrapper over `new Worker()` that calls
+`acceptWorker()` for you, in the browser and in Bun alike (in Bun, a worker that
+`init()` already registered is not registered twice). If you prefer to build the
+`Worker` yourself, call `acceptWorker(worker)` after constructing it. A
+message handler already assigned to `worker.onmessage` keeps receiving every
+message once.
 
 > **Note on worker lifecycle.** In Bun, the coordinator learns about new
 > workers via `process.on("worker", ...)` and detects a dead worker via its

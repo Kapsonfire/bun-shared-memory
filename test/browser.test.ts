@@ -127,3 +127,95 @@ describe("Browser / environment compatibility", () => {
     expect(getDefaultMemory()).toBe(getDefaultMemory());
   });
 });
+
+describe("acceptWorker in Bun", () => {
+  const SRC = JSON.stringify(new URL("../src/index.ts", import.meta.url).href);
+  // The worker counts the handshake replies it receives (a listener added
+  // before init() sees every message), then reports the count and a value.
+  const workerCode = `
+    import { Shared, init, onMessage } from ${SRC};
+    let replies = 0;
+    self.addEventListener("message", (e) => {
+      if (e.data && e.data.__sharedMemoryInit) replies++;
+    });
+    await init();
+    onMessage((e) => {
+      if (e.data === "report") {
+        setTimeout(() => {
+          self.postMessage({
+            replies,
+            value: Shared("accept-bun", { n: 0 }).read(),
+          });
+        }, 50);
+      }
+    });
+    self.postMessage("ping");
+  `;
+  const spawn = () =>
+    new Worker(
+      new URL("data:text/javascript," + encodeURIComponent(workerCode)),
+      { type: "module" },
+    );
+  const freshMemory = () => {
+    SharedMemory.current()?.dispose();
+    return new SharedMemory();
+  };
+  const report = (worker: Worker) =>
+    new Promise<{ replies: number; value: { n: number } }>((resolve) => {
+      worker.addEventListener("message", (e) => {
+        if (e.data && typeof e.data === "object" && "replies" in e.data) {
+          resolve(e.data);
+        }
+      });
+      worker.postMessage("report");
+    });
+
+  test("registers a worker manually, without init()'s auto-registration", async () => {
+    const mem = freshMemory();
+    Shared("accept-bun", { n: 7 });
+    const worker = acceptWorker(spawn());
+    const got = await report(worker);
+    worker.terminate();
+    expect(got).toEqual({ replies: 1, value: { n: 7 } });
+    mem.dispose();
+  });
+
+  test("a worker that init() registered gets one reply, however often it is accepted", async () => {
+    const mem = freshMemory();
+    await init();
+    try {
+      Shared("accept-bun", { n: 8 });
+      const worker = spawn();
+      expect(acceptWorker(worker)).toBe(worker);
+      acceptWorker(worker);
+      const got = await report(worker);
+      worker.terminate();
+      expect(got).toEqual({ replies: 1, value: { n: 8 } });
+    } finally {
+      stopInit();
+      mem.dispose();
+    }
+  });
+
+  test("an onmessage handler set before acceptWorker gets each message once", async () => {
+    const mem = freshMemory();
+    Shared("accept-bun", { n: 9 });
+    const worker = spawn();
+    let pings = 0;
+    const pinged = new Promise<void>((resolve) => {
+      worker.onmessage = (e) => {
+        if (e.data === "ping") {
+          pings++;
+          resolve();
+        }
+      };
+    });
+    acceptWorker(worker);
+    await pinged;
+    const got = await report(worker); // also waits a little for duplicates
+    worker.terminate();
+    expect(pings).toBe(1);
+    expect(got.value).toEqual({ n: 9 });
+    mem.dispose();
+  });
+});
