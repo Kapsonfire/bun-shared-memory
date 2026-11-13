@@ -3041,22 +3041,6 @@ function readPathValue(
   return current;
 }
 
-/** Returned by `peekCached` when the whole-value cache cannot serve a read. */
-const CACHE_MISS: unique symbol = Symbol("cache-miss");
-
-/**
- * The cached whole value of `key` when its cache entry is current (lock bits
- * clear, version matching), else `CACHE_MISS`. The single lookup of the hit
- * path, shared by callers that want to try something cheaper than a full
- * decode before falling back to `readValue`.
- */
-function peekCached(mem: SharedMemory, key: string): unknown {
-  const cached = readCache.get(key);
-  if (cached === undefined) return CACHE_MISS;
-  if (mem.versionView[cached.cell] === cached.raw) return cached.value;
-  return CACHE_MISS;
-}
-
 /**
  * A read of one array element that missed the whole-value cache (it follows a
  * write): read just that element's slot, without decoding the whole root value
@@ -3354,26 +3338,36 @@ function createArrayProxy(
   let apVal: unknown;
   const arraySetBody = (): boolean => writeArrayProp(apProp, apVal);
 
+  // The read-cache entry of the key and the array at the end of the locator's
+  // path in its value, remembered by the last index read: while the entry is
+  // current (the version cell still equals its `raw`), an index read is one
+  // comparison and an array access, without the Map lookup and the path walk.
+  // The entry's value is never changed (a write makes a new entry), so the
+  // array found in it stays valid as long as the entry does.
+  let hitEntry: { raw: number; cell: number; value: unknown } | undefined;
+  let hitArray: unknown[] = [];
+
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
-      // push/pop on the array: operate directly on the array ref without
-      // decoding the whole value (O(1) amortized).
-      if (arrProp === "push" || arrProp === "pop") {
-        const resolved = resolveArrayRef(mem, locator);
-        if (resolved !== null) {
-          return (...args: unknown[]) =>
-            mutateArrayRef(mem, locator, arrProp, args);
-        }
-      }
-      if (arrProp === "length") {
-        // Use the read cache (version-checked), so an in-place `push` that
-        // grew the array is reflected (the version bump invalidates the cache).
-        return readArrayValue(mem, locator).length;
-      }
+      // Index reads first: they are the hot path, and every name check below
+      // would be paid on each of them (as in `REF_PROXY_HANDLER.get`).
       const index = parseIndex(arrProp);
       if (index >= 0) {
-        let root = peekCached(mem, key);
-        if (root === CACHE_MISS) {
+        if (
+          hitEntry !== undefined &&
+          mem.versionView[hitEntry.cell] === hitEntry.raw
+        ) {
+          const element = hitArray[index];
+          if (element === null || typeof element !== "object") return element;
+        }
+        let root: unknown;
+        const cached = readCache.get(key);
+        if (
+          cached !== undefined &&
+          mem.versionView[cached.cell] === cached.raw
+        ) {
+          root = cached.value;
+        } else {
           // Miss (typically right after a write). For a one-step path to an
           // array property, read just the element instead of decoding the
           // whole root object.
@@ -3390,6 +3384,13 @@ function createArrayProxy(
         if (!Array.isArray(rootArray)) {
           throw new TypeError("Value is not an array");
         }
+        // Remember the entry this array came from (`readValue` stored a new
+        // one on a miss), for the next index read.
+        const entry = readCache.get(key);
+        if (entry !== undefined && entry.value === root) {
+          hitEntry = entry;
+          hitArray = rootArray;
+        }
         const element = rootArray[index];
         if (element !== null && typeof element === "object") {
           if (sharedKeyMap.has(element)) return element;
@@ -3405,6 +3406,20 @@ function createArrayProxy(
           );
         }
         return element;
+      }
+      // push/pop on the array: operate directly on the array ref without
+      // decoding the whole value (O(1) amortized).
+      if (arrProp === "push" || arrProp === "pop") {
+        const resolved = resolveArrayRef(mem, locator);
+        if (resolved !== null) {
+          return (...args: unknown[]) =>
+            mutateArrayRef(mem, locator, arrProp, args);
+        }
+      }
+      if (arrProp === "length") {
+        // Use the read cache (version-checked), so an in-place `push` that
+        // grew the array is reflected (the version bump invalidates the cache).
+        return readArrayValue(mem, locator).length;
       }
       if (typeof arrProp === "symbol") {
         const arr = readArrayValue(mem, locator);
