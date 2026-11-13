@@ -690,8 +690,17 @@ function getObjectLayout(
   if (cached?.version === version) {
     return cached.layout;
   }
-  const layout = mem.withLock(() => mem.getObjectLayout(key));
-  layoutCache.set(key, { layout, version: mem.getLayoutVersion() });
+  // The version is read under the same lock as the layout, so it is the
+  // version the layout belongs to. Read after the lock (as before), a
+  // defragmentation in between had the old layout cached under the new
+  // version: every later access at that version used wrong slot offsets
+  // ("Unknown slot type 5", a property read returning another property).
+  let lockedVersion = 0;
+  const layout = mem.withLock(() => {
+    lockedVersion = mem.layoutVersionInLock();
+    return mem.getObjectLayout(key);
+  });
+  layoutCache.set(key, { layout, version: lockedVersion });
   return layout;
 }
 
