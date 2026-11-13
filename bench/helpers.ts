@@ -190,13 +190,17 @@ async function writeLogFile(groups: {
   lines.push("");
   lines.push("## Results");
   lines.push("");
-  lines.push("| Name | Native ops/s | Shared ops/s | Ratio |");
-  lines.push("|------|--------------|--------------|-------|");
-  for (const r of results) {
-    lines.push(
-      `| ${r.name} | ${r.nativeOps} | ${r.sharedOps} | ${r.ratio.toFixed(2)}× |`,
-    );
-  }
+  lines.push(
+    ...markdownTable(
+      ["Name", "Native ops/s", "Shared ops/s", "Ratio"],
+      results.map((r) => [
+        r.name,
+        String(r.nativeOps),
+        String(r.sharedOps),
+        `${r.ratio.toFixed(2)}×`,
+      ]),
+    ),
+  );
   lines.push("");
   lines.push("## Summary");
   lines.push("");
@@ -207,6 +211,24 @@ async function writeLogFile(groups: {
 
   await Bun.write(file, lines.join("\n") + "\n");
   console.log(`\nWrote benchmark log to benchlogs/${name}`);
+}
+
+/**
+ * A Markdown table laid out the way `bun fmt` lays it out (every column padded
+ * to its widest cell, the separator as wide), so `bun fmt` leaves the log as
+ * written.
+ */
+function markdownTable(header: string[], rows: string[][]): string[] {
+  const widths = header.map((h, i) =>
+    Math.max(h.length, ...rows.map((row) => row[i]!.length)),
+  );
+  const line = (cells: string[]) =>
+    `| ${cells.map((c, i) => c.padEnd(widths[i]!)).join(" | ")} |`;
+  return [
+    line(header),
+    line(widths.map((w) => "-".repeat(w))),
+    ...rows.map(line),
+  ];
 }
 
 /**
