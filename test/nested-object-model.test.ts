@@ -170,3 +170,72 @@ describe("nested objects follow a plain JS model", () => {
     for (let seed = 1; seed <= 40; seed++) run(seed, 60);
   });
 });
+
+/**
+ * The nested proxy remembers the cache entry of the property read last, so a
+ * repeated read of one property skips the per-name Map. Every kind of write
+ * and the switch between properties must still give the current value.
+ */
+describe("nested proxy: last-read property", () => {
+  test("repeated reads stay current across every kind of write", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ id: number; address: Record<string, unknown> }>(
+      "nest-last",
+      { id: 0, address: { city: "Berlin", zip: 10115, n: 3 } },
+      { memory: mem },
+    );
+    const a = o.address;
+    expect(a.zip).toBe(10115);
+    expect(a.zip).toBe(10115);
+
+    a.zip = 1; // through the held proxy
+    expect(a.zip).toBe(1);
+    expect(a.zip).toBe(1);
+
+    o.address.zip = 2; // through a fresh access
+    expect(a.zip).toBe(2);
+    expect(a.zip).toBe(2);
+
+    o.id = 5; // another property of the key: version bump, same value
+    expect(a.zip).toBe(2);
+
+    o.address = { city: "Hamburg", zip: 20095, n: 4 }; // sub-object replaced
+    expect(a.zip).toBe(20095);
+    expect(a.zip).toBe(20095);
+
+    o.write({ id: 6, address: { city: "Köln", zip: 50667, n: 5 } }); // whole value
+    expect(a.zip).toBe(50667);
+    expect(a.zip).toBe(50667);
+
+    // Switching between properties.
+    for (let i = 0; i < 3; i++) {
+      expect(a.city).toBe("Köln");
+      expect(a.zip).toBe(50667);
+      expect(a.n).toBe(5);
+    }
+    a.n = 9;
+    expect(a.zip).toBe(50667);
+    expect(a.n).toBe(9);
+    expect(a.n).toBe(9);
+  });
+
+  test("still current after the per-name cache was cleared", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ address: Record<string, unknown> }>(
+      "nest-clear",
+      { address: { zip: 1 } },
+      { memory: mem },
+    );
+    const a = o.address;
+    expect(a.zip).toBe(1);
+    expect(a.zip).toBe(1);
+    // Names the object does not have also get entries; enough of them clear
+    // the per-name cache while `zip` stays the remembered entry.
+    for (let i = 0; i < 300; i++) expect(a[`missing${i}`]).toBeUndefined();
+    expect(a.zip).toBe(1);
+    expect(a.zip).toBe(1);
+    a.zip = 2;
+    expect(a.zip).toBe(2);
+    expect(a.zip).toBe(2);
+  });
+});
