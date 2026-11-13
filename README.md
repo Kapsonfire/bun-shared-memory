@@ -40,19 +40,19 @@ Measured on Linux (Core Ultra 7 265K, Bun 1.4.4, 100,000 requests per
 methodology, sorted by speed; MySQL/Redis ran in Docker, once over TCP and once
 over a Unix socket; each methodology is the minimum over several runs × samples
 to filter CPU-contention noise; the full log is
-`benchlogs/1794424149-9bbbd34-real.md`):
+`benchlogs/1794567539-5e5bc3f-real.md`):
 
 | Methodology | Transport | Requests | Elapsed (ms) | req/s     | vs. shared   |
 | ----------- | --------- | -------- | ------------ | --------- | ------------ |
-| `shared`    | —         | 100,000  | 15           | 6,762,549 | —            |
-| `sqlite`    | —         | 100,000  | 75           | 1,329,665 | 5.1× slower  |
-| `redis`     | socket    | 100,000  | 267          | 374,813   | 18.0× slower |
-| `mysql`     | socket    | 100,000  | 394          | 254,053   | 26.6× slower |
-| `redis`     | tcp       | 100,000  | 634          | 157,773   | 42.9× slower |
-| `mysql`     | tcp       | 100,000  | 950          | 105,244   | 64.3× slower |
+| `shared`    | —         | 100,000  | 14           | 6,986,960 | —            |
+| `sqlite`    | —         | 100,000  | 75           | 1,330,677 | 5.3× slower  |
+| `redis`     | socket    | 100,000  | 266          | 375,684   | 18.6× slower |
+| `mysql`     | socket    | 100,000  | 413          | 242,213   | 28.8× slower |
+| `redis`     | tcp       | 100,000  | 620          | 161,404   | 43.3× slower |
+| `mysql`     | tcp       | 100,000  | 985          | 101,543   | 68.8× slower |
 
 Shared memory is the fastest by a wide margin: ~5× faster than a live SQLite
-read, ~18–27× faster than MySQL/Redis over a Unix socket and ~40–65× faster over
+read, ~19–29× faster than MySQL/Redis over a Unix socket and ~43–69× faster over
 TCP. The database numbers depend heavily on the machine and on how the
 containers are networked; treat them as an order of magnitude, not a constant.
 
