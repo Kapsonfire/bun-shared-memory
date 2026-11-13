@@ -872,6 +872,63 @@ function createNestedObjectProxy(
     writeObjectSlot(mem, locator.key, slotOffset, setVal, arrayCapacity);
   };
 
+  // State of the plain-write fast path (see `set`): the key's index, and per
+  // step of `propPath` the block the step's slot was resolved in and that
+  // slot, plus the last written property's block and slot. Valid at layout
+  // version `walkLv`: a block's layout never changes, a replaced sub-object
+  // gets a new block (so the parent check below sees it), and only a
+  // defragmentation, which bumps the layout version, reuses offsets.
+  let keyIndex = -1;
+  let walkLv = -1;
+  const stepBlock: number[] = [];
+  const stepSlot: number[] = [];
+  let lastSetName = "";
+  let lastSetBlock = -1;
+  let lastSetSlot = -1;
+  /**
+   * DataTable offset of property `name`'s slot in this proxy's object block,
+   * or -1 when it cannot be resolved here (not an object any more, a missing
+   * property): the general path then decides. Only for a `propPath`; call
+   * with the key's stripe held, `lv` its layout version.
+   */
+  const plainSlotOffset = (name: string, lv: number): number => {
+    if (walkLv !== lv) {
+      stepBlock.length = 0;
+      stepSlot.length = 0;
+      lastSetBlock = -1;
+      walkLv = lv;
+    }
+    let offset = mem.lookupByIndex(keyIndex);
+    if (
+      offset === null ||
+      mem.dataTable.getInt32(offset) !== 5 /* TYPE_OBJECT */
+    ) {
+      return -1;
+    }
+    const steps = propPath!;
+    for (let i = 0; i < steps.length; i++) {
+      let slot: number;
+      if (stepBlock[i] === offset) {
+        slot = stepSlot[i]!;
+      } else {
+        const so = nestedLayoutAt(mem, offset)?.properties.get(steps[i]!);
+        if (so === undefined) return -1;
+        stepBlock[i] = offset;
+        stepSlot[i] = so;
+        slot = so;
+      }
+      if (mem.dataTable.getInt32(slot) !== TYPE_OBJECT_REF) return -1;
+      offset = mem.dataTable.getInt32(slot + 4);
+    }
+    if (lastSetBlock === offset && lastSetName === name) return lastSetSlot;
+    const so = nestedLayoutAt(mem, offset)?.properties.get(name);
+    if (so === undefined) return -1;
+    lastSetName = name;
+    lastSetBlock = offset;
+    lastSetSlot = so;
+    return so;
+  };
+
   // Per-property read cache of this proxy: value and the key version it was
   // read at. Filled under the key's lock by `readFieldBody`.
   let cell = -1;
@@ -979,6 +1036,44 @@ function createNestedObjectProxy(
       return readFieldMiss(prop);
     },
     set(_t, prop, val) {
+      // Plain-write fast path for a value stored in place without allocating
+      // (a number, a boolean, an int64 bigint, a string that may fit inline)
+      // through a path of property names: the same stripe, WRITER bit and
+      // version bump as `writeLock`, via `beginPlainWrite`/`endPlainWrite`,
+      // with the slot from the cached walk. Anything else, or a write that
+      // cannot start (global section, nested write, user-level lock), takes
+      // the general path below.
+      if (
+        propPath !== null &&
+        typeof prop === "string" &&
+        (typeof val === "number" ||
+          typeof val === "boolean" ||
+          (typeof val === "string" && val.length <= 11) ||
+          (typeof val === "bigint" && val >= MIN_INT64 && val <= MAX_INT64))
+      ) {
+        if (keyIndex < 0) keyIndex = getIndex(mem, locator.key);
+        const cell = mem.beginPlainWrite(keyIndex);
+        if (cell >= 0) {
+          let done = false;
+          try {
+            const slot = plainSlotOffset(prop, mem.layoutVersionInLock());
+            if (slot >= 0) {
+              done = true;
+              if (typeof val === "number") mem.updateNumberSlot(slot, val);
+              else if (typeof val === "boolean") {
+                mem.updateBooleanSlot(slot, val);
+              } else if (typeof val === "bigint") {
+                mem.updateBigIntSlot(slot, val);
+              } else {
+                done = mem.updateInlineStringSlot(slot, val as string);
+              }
+            }
+          } finally {
+            mem.endPlainWrite(keyIndex, cell);
+          }
+          if (done) return true;
+        }
+      }
       // Under the key's write lock like every other write (stripe, WRITER
       // bit, version bump): readers see the value whole, and neither a
       // defragmentation nor another writer of the key can run between

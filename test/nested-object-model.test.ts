@@ -239,3 +239,54 @@ describe("nested proxy: last-read property", () => {
     expect(a.zip).toBe(2);
   });
 });
+
+/**
+ * Plain writes through a nested proxy reuse the slot offsets of their last
+ * walk from the root. A replaced sub-object (new block), a whole-value write
+ * and a defragmentation (moved blocks) must make the next write land in the
+ * current block.
+ */
+describe("nested proxy: plain-write fast path", () => {
+  test("writes follow replaced blocks and defragmentation", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ id: number; a: { b: { x: unknown; y: unknown } } }>(
+      "nest-fastw",
+      { id: 0, a: { b: { x: 1, y: "s" } } },
+      { memory: mem },
+    );
+    const b = o.a.b;
+    b.x = 2;
+    b.x = 3;
+    b.y = true;
+    expect(o.read().a.b).toEqual({ x: 3, y: true });
+
+    o.a = { b: { x: 10, y: 11 } }; // new blocks for a and b
+    b.x = 12;
+    expect(o.read().a.b).toEqual({ x: 12, y: 11 });
+
+    o.a.b = { x: 20, y: 21 }; // new block for b only
+    b.y = 22n;
+    expect(o.read().a.b).toEqual({ x: 20, y: 22n });
+
+    o.write({ id: 1, a: { b: { x: 30, y: 31 } } }); // whole value
+    b.x = "short";
+    expect(o.read()).toEqual({ id: 1, a: { b: { x: "short", y: 31 } } });
+
+    mem.withLock(() => mem.defragment()); // blocks move, layout version bumps
+    b.x = 40;
+    b.y = false;
+    expect(o.read()).toEqual({ id: 1, a: { b: { x: 40, y: false } } });
+
+    // Values that leave the fast path still work and mix with it.
+    b.y = "a string that is longer than eleven bytes";
+    b.x = { not: "plain" } as unknown;
+    b.x = 41;
+    expect(o.read().a.b).toEqual({
+      x: 41,
+      y: "a string that is longer than eleven bytes",
+    });
+    expect(() => {
+      (b as Record<string, unknown>).z = 1;
+    }).toThrow(TypeError);
+  });
+});
