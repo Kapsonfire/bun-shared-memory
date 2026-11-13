@@ -338,3 +338,16 @@ describe("nested user-level locks on one key", () => {
     }
   });
 });
+
+describe("setDefaultLockTimeout", () => {
+  test("rejects zero, negative and NaN timeouts and keeps the old one", () => {
+    const saved = getDefaultLockTimeout();
+    for (const bad of [0, -1, Number.NaN]) {
+      expect(() => setDefaultLockTimeout(bad)).toThrow(RangeError);
+    }
+    expect(getDefaultLockTimeout()).toBe(saved);
+    setDefaultLockTimeout(Infinity); // allowed: wait forever
+    expect(getDefaultLockTimeout()).toBe(Infinity);
+    setDefaultLockTimeout(saved);
+  });
+});

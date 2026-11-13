@@ -1,6 +1,7 @@
 import {
   BudgetExceededError,
   GrowableBuffer,
+  type GrowableBufferOptions,
   MIN_BLOCK_SIZE,
   SharedBudget,
   nextPowerOfTwo,
@@ -422,35 +423,9 @@ function makeBuffer(
   buf: SharedArrayBuffer | SharedArrayBuffer[] | undefined,
   initial: number,
   maxByteLength: number,
-  budget?: SharedBudget,
-  chunkSize?: number,
-  singleBuffer = false,
-  chargeInitial = true,
-  cursorBuffer?: SharedArrayBuffer,
-  freeListBuffer?: SharedArrayBuffer,
+  options: GrowableBufferOptions,
 ): GrowableBuffer {
-  if (buf === undefined) {
-    return new GrowableBuffer(
-      initial,
-      maxByteLength,
-      budget,
-      chunkSize,
-      singleBuffer,
-      chargeInitial,
-      cursorBuffer,
-      freeListBuffer,
-    );
-  }
-  return new GrowableBuffer(
-    buf,
-    maxByteLength,
-    budget,
-    chunkSize,
-    singleBuffer,
-    chargeInitial,
-    cursorBuffer,
-    freeListBuffer,
-  );
+  return new GrowableBuffer(buf ?? initial, maxByteLength, options);
 }
 
 /** The one live SharedMemory of this thread (each worker has its own module). */
@@ -586,49 +561,33 @@ export class SharedMemory {
     this.indexTableMaxByteLength = indexTableMax;
     this.maxTotalBytes = budgetMax ?? null;
     this.budgetBuffer = budget?.buffer ?? null;
-    this.indexTable = makeBuffer(
-      buffers?.indexTable,
-      initial,
-      indexTableMax,
-      undefined,
+    this.indexTable = makeBuffer(buffers?.indexTable, initial, indexTableMax, {
       chunkSize,
-      true,
-      true,
-      buffers?.cursors?.indexTable,
-    );
-    this.dataTable = makeBuffer(
-      buffers?.dataTable,
-      initial,
-      perBufferMax,
+      singleBuffer: true,
+      chargeInitial: true,
+      cursorBuffer: buffers?.cursors?.indexTable,
+    });
+    this.dataTable = makeBuffer(buffers?.dataTable, initial, perBufferMax, {
       budget,
       chunkSize,
-      false,
       chargeInitial,
-      buffers?.cursors?.dataTable,
-      buffers?.freeLists?.dataTable,
-    );
-    this.stringTable = makeBuffer(
-      buffers?.stringTable,
-      initial,
-      perBufferMax,
+      cursorBuffer: buffers?.cursors?.dataTable,
+      freeListBuffer: buffers?.freeLists?.dataTable,
+    });
+    this.stringTable = makeBuffer(buffers?.stringTable, initial, perBufferMax, {
       budget,
       chunkSize,
-      false,
       chargeInitial,
-      buffers?.cursors?.stringTable,
-      buffers?.freeLists?.stringTable,
-    );
-    this.arrayTable = makeBuffer(
-      buffers?.arrayTable,
-      initial,
-      perBufferMax,
+      cursorBuffer: buffers?.cursors?.stringTable,
+      freeListBuffer: buffers?.freeLists?.stringTable,
+    });
+    this.arrayTable = makeBuffer(buffers?.arrayTable, initial, perBufferMax, {
       budget,
       chunkSize,
-      false,
       chargeInitial,
-      buffers?.cursors?.arrayTable,
-      buffers?.freeLists?.arrayTable,
-    );
+      cursorBuffer: buffers?.cursors?.arrayTable,
+      freeListBuffer: buffers?.freeLists?.arrayTable,
+    });
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
     this.layoutVersion = new Int32Array(
       buffers?.layoutVersion ??
@@ -910,10 +869,7 @@ export class SharedMemory {
     } finally {
       if (began) {
         this.writingCells.pop();
-        this.writingTop =
-          this.writingCells.length === 0
-            ? -1
-            : this.writingCells[this.writingCells.length - 1]!;
+        this.writingTop = this.writingCells.at(-1) ?? -1;
         // Version + 1 and clear the WRITER bit in one add.
         Atomics.add(this.versionView, cell, VERSION_STEP - WRITER_BIT);
       }
@@ -1314,7 +1270,7 @@ export class SharedMemory {
     // blocks. This also covers the shrink-then-grow case: a block that was
     // reserved for a longer string but currently holds a shorter one can be
     // grown back into its own reserved tail.
-    if (oldRef !== undefined && oldRef.reserved !== undefined) {
+    if (oldRef?.reserved !== undefined) {
       const reservedEnd = oldRef.offset + oldRef.reserved;
       if (this.arrayTable.growInPlace(reservedEnd, size - oldRef.reserved)) {
         this.arrayTable.writeBytes(oldRef.offset + ARRAY_HEADER, bytes);
@@ -1346,7 +1302,9 @@ export class SharedMemory {
     // TextDecoder; fall back to UTF-8 decoding at the first byte >= 128.
     let text = "";
     for (let i = 0; i < length; i++) {
-      const word = i < 4 ? a : i < 8 ? b : c;
+      let word = c;
+      if (i < 4) word = a;
+      else if (i < 8) word = b;
       const byte = (word >>> ((i & 3) << 3)) & 0xff;
       if (byte > 127) return this.readInlineStringUtf8(a, b, c);
       text += String.fromCharCode(byte);
@@ -1359,7 +1317,9 @@ export class SharedMemory {
     const length = c >>> 28;
     const bytes = new Uint8Array(length);
     for (let i = 0; i < length; i++) {
-      const word = i < 4 ? a : i < 8 ? b : c;
+      let word = c;
+      if (i < 4) word = a;
+      else if (i < 8) word = b;
       bytes[i] = (word >>> ((i % 4) * 8)) & 0xff;
     }
     return this.decoder.decode(bytes);
@@ -2280,7 +2240,7 @@ export class SharedMemory {
     let newStringOffset = 0;
     for (const oldOffset of sortedStrings) {
       const next = sortedStrings[sortedStrings.indexOf(oldOffset) + 1];
-      const end = next !== undefined ? next : this.stringTable.byteLength;
+      const end = next ?? this.stringTable.byteLength;
       const length = end - oldOffset;
       copyBytes(this.stringTable, newStringOffset, oldOffset, length);
       stringRemap.set(oldOffset, newStringOffset);
