@@ -162,3 +162,179 @@ describe("ordinary writes vs lock-free reads (seqlock)", () => {
     expect(spins).toBeGreaterThan(0);
   }, 20000);
 });
+
+/**
+ * Plain writes inside the thread's own `withWriteLock` take the fast path
+ * under the lock's bit (no bit of their own, one version bump each). The
+ * thread's own reads must see them at once, other threads only all of them.
+ */
+describe("plain writes inside the thread's own write lock", () => {
+  test("own reads see each write; nesting, re-entry and exceptions", () => {
+    const saved = getDefaultLockTimeout();
+    setDefaultLockTimeout(1500); // a stuck bit fails fast instead of hanging
+    try {
+      const mem = new SharedMemory();
+      const o = Shared(
+        "own-lock",
+        { n: 0, s: "a", b: false, sub: { x: 0 }, arr: [0, 0] },
+        { memory: mem },
+      );
+      const p = Shared("own-lock-p", { m: 0 }, { memory: mem });
+      const arr = Shared("own-lock-arr", [0, 0, 0], { memory: mem });
+      expect(o.n).toBe(0); // fill the caches
+      expect(o.sub.x).toBe(0);
+
+      o.withWriteLock((self) => {
+        for (let i = 1; i <= 3; i++) {
+          self.n = i;
+          expect(self.n).toBe(i);
+          self.s = `s${i}`;
+          expect(self.s).toBe(`s${i}`);
+          self.b = i % 2 === 1;
+          expect(self.b).toBe(i % 2 === 1);
+          self.sub.x = i * 10;
+          expect(self.sub.x).toBe(i * 10);
+          self.arr[1] = i;
+          expect(self.arr[1]).toBe(i);
+        }
+        // Another key's lock inside, and a write to this key while it is held.
+        p.withWriteLock((q) => {
+          q.m = 5;
+          self.n = 4;
+          expect(q.m).toBe(5);
+          expect(self.n).toBe(4);
+        });
+        self.n = 5; // after the inner lock: own lock again
+        // Re-entry on the same key.
+        o.withWriteLock((again) => {
+          again.n = 6;
+        });
+        expect(self.n).toBe(6);
+        self.n = 7;
+      });
+      expect(o.read()).toEqual({
+        n: 7,
+        s: "s3",
+        b: true,
+        sub: { x: 30 },
+        arr: [0, 3],
+      });
+      expect(p.m).toBe(5);
+
+      // Top-level array and primitive refs inside their locks.
+      arr.withWriteLock((a) => {
+        a[0] = 1;
+        a[2] = 3;
+        expect(a[0]).toBe(1);
+      });
+      expect(arr.read()).toEqual([1, 0, 3]);
+
+      // An exception inside the callback releases the lock and its state.
+      expect(() =>
+        o.withWriteLock((self) => {
+          self.n = 8;
+          throw new Error("boom");
+        }),
+      ).toThrow("boom");
+      expect(o.n).toBe(8);
+      o.n = 9; // plain write after the lock: its own bit again
+      expect(o.n).toBe(9);
+      o.withReadLock((self) => {
+        expect(self.n).toBe(9);
+      });
+    } finally {
+      setDefaultLockTimeout(saved);
+    }
+  });
+
+  test("another thread sees the writes of one lock all or none", async () => {
+    const mem = new SharedMemory();
+    const o = Shared(
+      "own-lock-atomic",
+      { a: 0, b: 0, s: "0", sub: { c: 0 } },
+      { memory: mem },
+    );
+    const code = `
+      import { SharedMemory, Shared } from ${JSON.stringify(SRC)};
+      self.onmessage = (e) => {
+        const mem = SharedMemory.fromBuffers(e.data);
+        const o = Shared("own-lock-atomic", {}, { memory: mem });
+        const end = performance.now() + 1500;
+        let reads = 0;
+        let bad = 0;
+        let last = 0;
+        while (performance.now() < end) {
+          const v = o.withReadLock((s) => [s.a, s.b, s.s, s.sub.c]);
+          if (v[0] !== v[1] || v[2] !== String(v[0]) || v[3] !== v[0]) bad++;
+          if (v[0] < last) bad++;
+          last = v[0];
+          reads++;
+        }
+        self.postMessage({ reads, bad });
+      };
+    `;
+    const worker = spawn(code);
+    let result: { reads: number; bad: number } | undefined;
+    worker.onmessage = (e) => {
+      result = e.data;
+    };
+    worker.postMessage(mem.exportBuffers());
+    let i = 0;
+    while (result === undefined) {
+      for (let k = 0; k < 2000; k++) {
+        i++;
+        o.withWriteLock((self) => {
+          self.a = i;
+          self.s = String(i);
+          self.sub.c = i;
+          self.b = i;
+        });
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    worker.terminate();
+    expect(result.reads).toBeGreaterThan(1000);
+    expect(result.bad).toBe(0);
+    expect(o.read()).toEqual({ a: i, b: i, s: String(i), sub: { c: i } });
+  }, 30000);
+});
+
+describe("nested user-level locks on one key", () => {
+  test("every combination works and leaves no lock bit behind", () => {
+    const saved = getDefaultLockTimeout();
+    setDefaultLockTimeout(1000); // waiting for itself fails fast
+    try {
+      const mem = new SharedMemory();
+      const o = Shared("nested-locks", { n: 0 }, { memory: mem });
+      const bits = () =>
+        Atomics.load(
+          mem.versionView,
+          mem.getVersionCellIndex(mem.lookupIndex("nested-locks")!),
+        ) & 3;
+      o.withWriteLock(() => o.withWriteLock((s) => (s.n = 1)));
+      expect(bits()).toBe(0);
+      o.withReadLock(() => o.withReadLock((s) => s.n));
+      expect(bits()).toBe(0);
+      expect(o.withWriteLock(() => o.withReadLock((s) => s.n))).toBe(1);
+      expect(bits()).toBe(0);
+      o.withReadLock(() => o.withWriteLock((s) => (s.n = 2)));
+      expect(bits()).toBe(0);
+      expect(o.n).toBe(2);
+      // Three levels, and an exception from the innermost.
+      expect(() =>
+        o.withWriteLock(() =>
+          o.withReadLock(() =>
+            o.withWriteLock(() => {
+              throw new Error("inner");
+            }),
+          ),
+        ),
+      ).toThrow("inner");
+      expect(bits()).toBe(0);
+      o.n = 3;
+      expect(o.n).toBe(3);
+    } finally {
+      setDefaultLockTimeout(saved);
+    }
+  });
+});
