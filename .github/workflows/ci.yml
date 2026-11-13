@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, tests with coverage, SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      # Empty for pull requests from forks (no secrets there): the analysis
+      # step is skipped then, typecheck and tests still run.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: SonarCloud needs it for blame and new-code detection.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      # Writes coverage/lcov.info, which sonar-project.properties points to.
+      - run: bun run test:coverage
+
+      - name: SonarCloud analysis
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v5
