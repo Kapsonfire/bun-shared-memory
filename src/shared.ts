@@ -878,6 +878,14 @@ function createNestedObjectProxy(
   // Entries hold the version cell's raw value they were read at (lock bits
   // clear), so a hit is one comparison with the cell.
   const fields = new Map<string, { raw: number; value: unknown }>();
+  // The entry of the property read last, so repeated reads of one property
+  // skip the Map lookup. `lastEntry.raw` starts as -1 (both lock bits set,
+  // a value a version cell never has), so the empty entry never matches.
+  let lastProp: string | symbol = "";
+  let lastEntry: { raw: number; value: unknown } = {
+    raw: -1,
+    value: undefined,
+  };
   let fieldProp = "";
   const readFieldBody = (): unknown => {
     const prop = fieldProp;
@@ -925,36 +933,50 @@ function createNestedObjectProxy(
     return value;
   };
 
+  /**
+   * A property read the cache could not answer: read just this property's
+   * slot under the key's lock (not the whole root value: decoding all of a
+   * large value for one property after each write made such reads cost the
+   * whole value). Out of the `get` trap, so the trap's hit path stays small.
+   */
+  const readFieldMiss = (prop: string): unknown => {
+    if (cell < 0) {
+      cell = mem.getVersionCellIndex(getIndex(mem, locator.key));
+    }
+    // Wait out a user-level lock held elsewhere first, like `readValue`.
+    stableRaw(mem, cell);
+    const sProp = fieldProp;
+    fieldProp = prop;
+    try {
+      return mem.withKeyLock(getIndex(mem, locator.key), readFieldBody);
+    } finally {
+      fieldProp = sProp;
+    }
+  };
+
   const proxy = new Proxy({} as Record<string | symbol, unknown>, {
     get(_t, prop) {
+      // This proxy's per-property cache first, valid while the key's version
+      // is unchanged and no lock bit is set (the same check as everywhere): it
+      // is the hot path, and the name checks below would be paid on each hit.
+      // An entry exists only after a miss of a string property other than the
+      // names below (they return before), which resolved `cell`.
+      if (prop === lastProp && mem.versionView[cell] === lastEntry.raw) {
+        return lastEntry.value;
+      }
+      const hit = fields.get(prop as string);
+      if (hit !== undefined && mem.versionView[cell] === hit.raw) {
+        lastProp = prop;
+        lastEntry = hit;
+        return hit.value;
+      }
       if (prop === "read") {
         return () => copyValue(readValueAtLocator(mem, locator));
       }
       if (prop === "key") return locator.key;
       if (prop === "buffer") return mem.dataTable.buffers[0];
       if (typeof prop !== "string") return undefined;
-      // This proxy's per-property cache, valid while the key's version is
-      // unchanged and no lock bit is set (the same check as everywhere). An
-      // entry exists only after a miss, which resolved `cell` below.
-      const hit = fields.get(prop);
-      if (hit !== undefined && mem.versionView[cell] === hit.raw) {
-        return hit.value;
-      }
-      if (cell < 0) {
-        cell = mem.getVersionCellIndex(getIndex(mem, locator.key));
-      }
-      // Miss: read just this property's slot under the key's lock (not the
-      // whole root value: decoding all of a large value for one property
-      // after each write made such reads cost the whole value). Wait out a
-      // user-level lock held elsewhere first, like `readValue`.
-      stableRaw(mem, cell);
-      const sProp = fieldProp;
-      fieldProp = prop;
-      try {
-        return mem.withKeyLock(getIndex(mem, locator.key), readFieldBody);
-      } finally {
-        fieldProp = sProp;
-      }
+      return readFieldMiss(prop);
     },
     set(_t, prop, val) {
       // Under the key's write lock like every other write (stripe, WRITER

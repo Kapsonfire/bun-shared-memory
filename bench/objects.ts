@@ -77,3 +77,34 @@ const makeUser = (): User => ({
     () => (shared.tags[1] = "x"),
   );
 }
+
+// ---------------------------------------------------------------------------
+// object · nested object property access (`o.sub.x`)
+// ---------------------------------------------------------------------------
+{
+  interface Profile {
+    id: number;
+    address: { city: string; zip: number };
+  }
+  const makeProfile = (): Profile => ({
+    id: 1,
+    address: { city: "Berlin", zip: 10115 },
+  });
+  const native = makeProfile();
+  const shared = Shared<Profile>(
+    nextKey("objnest"),
+    makeProfile(),
+    benchOptions,
+  );
+
+  benchPair(
+    "object · read nested prop",
+    () => native.address.zip,
+    () => shared.address.zip,
+  );
+  benchPair(
+    "object · write nested prop",
+    () => (native.address.zip = 2),
+    () => (shared.address.zip = 2),
+  );
+}
