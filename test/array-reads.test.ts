@@ -220,3 +220,28 @@ describe("array proxy index-read cache", () => {
     expect([...tags]).toEqual([1, 2]);
   });
 });
+
+describe("top-level array index reads from the cache", () => {
+  test("multi-digit indices, digit-led names and out of bounds", () => {
+    const mem = new SharedMemory();
+    const values = Array.from({ length: 150 }, (_, i) => i * 2);
+    const arr = Shared<number[]>("tl-idx", values, { memory: mem });
+    arr.read(); // fill the whole-value cache
+    for (const i of [0, 7, 10, 42, 99, 100, 123, 149]) {
+      // Twice: the second read is a cache hit.
+      expect(arr[i]).toBe(i * 2);
+      expect(arr[i]).toBe(i * 2);
+    }
+    expect(arr[150]).toBeUndefined();
+    expect(arr[1000]).toBeUndefined();
+    const named = arr as unknown as Record<string, unknown>;
+    expect(named["1a"]).toBeUndefined();
+    expect(named["12x"]).toBeUndefined();
+    expect(arr.length).toBe(150);
+
+    arr[123] = 7;
+    expect(arr[123]).toBe(7);
+    expect(arr[123]).toBe(7);
+    expect(arr[122]).toBe(244);
+  });
+});
