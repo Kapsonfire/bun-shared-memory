@@ -5,6 +5,82 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-13
+
+### Fixed
+
+- **Index writes after a whole-value write lost data.** A whole `write()` of
+  an array stores a new array block, but the cached array reference of every
+  wrapper kept pointing at the old one: `a.write([7, 7, 7]); a[0] = 5` left
+  the array unchanged, without an error. The same happened for an array
+  property after `o.write({...})`. Index writes now refresh the reference from
+  the array's slot under the key's lock.
+- **Array bounds used a stale length.** After `a.push(x)`, `a[a.length - 1] =
+  v` threw a `RangeError`; after `a.length = 2` (or a `pop`, also from another
+  worker) a write beyond the end went through. The bounds check now reads the
+  live length.
+- **Defragmentation corrupted nested objects.** Phase 6 decided whether a
+  moved block is an object by reading the type at its _old_ offset, where
+  Phase 2 had already moved another block. References to nested objects were
+  then left pointing at unused space (`o.p.r` → `undefined`, or a "fixed
+  shape" `TypeError` on `o.p`, after a whole write and a defragmentation).
+- **Writes into nested objects were unlocked.** `o.p.q = v` resolved the slot
+  and stored without the key's lock, WRITER bit or seqlock: readers in other
+  workers could see a string mixed from two writes, and a defragmentation or
+  another writer could run in between. It now runs under the key's write lock.
+- **Arrays inside nested objects could not be written.** `o.p.t[i] = v`,
+  `push`, `pop` and `length` threw `TypeError: Value is not an array`.
+- **Stale array proxy.** After `o.tags = 5`, `o.tags` still returned the old
+  array proxy.
+- **Index and `length` writes on a value that became a number.** After
+  `a.write(5)` on a former array, `a[0] = 7` was stored into the dead array
+  block and `a.length = 0` replaced the number with an array built from its
+  bits. Such writes now throw a `TypeError`, like an assignment to a
+  primitive.
+- **Deadlock between `withReadLock` and plain writes.** A writer took the key's
+  lock stripe and then waited for another thread's read-lock bit, while that
+  reader, missing its cache, waited for the stripe. The writer now waits
+  without holding the stripe. (A thread that already holds the stripe, e.g.
+  inside `update()`, can still deadlock this way; see `writeLock`.)
+- **Lock-free reads during a defragmentation.** A property read after a write
+  validated only the key's version, which a defragmentation does not change
+  while it moves data; a reader could decode a string mid-move. The layout
+  version is now a second seqlock (odd while a defragmentation runs).
+
+### Changed
+
+- **Faster writes.** Numbers, booleans, int64 bigints and short strings are
+  stored by a lock-and-store fast path at each entry point (`ref.write`,
+  property setters, `arr[i] = v`), without callbacks or global state. Per
+  write on macOS arm64: `o.n = i` 20 → 11.6 ns, `ref.write(number)` 31.8 →
+  12.7 ns. Independent writers scale better (8 workers on their own keys:
+  365 → 633 M writes/s in `bench:contention`).
+- **Faster reads.** Cache hits are a single comparison, the property getter
+  has no branch, array index reads are answered before the proxy's method
+  checks. Property reads 477 → 589 M ops/s, `arr[i]` reads about +20 %.
+- **Nested values.** Nested object properties are read from a per-proxy cache
+  instead of under the global mutex (`o.p.q` 302 → 5 ns); nested arrays and
+  objects keep one proxy per place, so `grid[0] === grid[0]` now holds.
+- **`read()` copies faster.** Arrays are copied with `slice()` and objects with
+  `Object.assign`; only nested values are copied again (1000 numbers 3.2 →
+  0.9 µs).
+- **Contended locks spin longer.** A waiter now spins up to about 40 µs with a
+  doubling pause before it sleeps (before: the first waiter, 128 loads). Two
+  writers on one key: about 16 → 43-68 M writes/s. A waiting thread uses CPU
+  for that time instead of sleeping.
+- **Layout version steps by 2.** `defragment()` makes it odd while it runs;
+  `SharedMemory.layoutSettled(lv)` tells lock-free readers whether data may be
+  moving.
+
+### Added
+
+- `SharedMemory.layoutSettled(lv)`, `refreshArrayRef`, `slotTypeAt`,
+  `beginPlainWrite`/`endPlainWrite` (internal building blocks of the fast
+  paths, public on `SharedMemory`).
+- Tests: a differential test of arrays and nested objects against a plain JS
+  model, concurrent writers in several workers, defragmentation while workers
+  write.
+
 ## [1.1.1] - 2026-11-11
 
 ### Changed
