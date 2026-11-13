@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   property after `o.write({...})`. Index writes now refresh the reference from
   the array's slot under the key's lock.
 - **Array bounds used a stale length.** After `a.push(x)`, `a[a.length - 1] =
-  v` threw a `RangeError`; after `a.length = 2` (or a `pop`, also from another
+v` threw a `RangeError`; after `a.length = 2` (or a `pop`, also from another
   worker) a write beyond the end went through. The bounds check now reads the
   live length.
 - **Defragmentation corrupted nested objects.** Phase 6 decided whether a
