@@ -155,13 +155,16 @@ describe("concurrency with locks and defragmentation", () => {
       defrags++;
       await new Promise((r) => setTimeout(r, 0));
     }
-    for (let w = 0; w < W; w++) {
-      const v = refs[w].read();
-      expect(v.n).toBe(n);
-      check(w, v, "final");
-    }
+    const finals = refs.map((ref) => ref.read());
     stop();
     mem.dispose();
+    // Problems first (a worker error, a torn read): they explain a final
+    // value that falls short, which would otherwise hide them.
+    expect(problems).toEqual([]);
+    finals.forEach((v, w) => {
+      expect(v.n).toBe(n);
+      check(w, v, "final");
+    });
     expect(problems).toEqual([]);
     expect(defrags).toBeGreaterThan(1);
   });

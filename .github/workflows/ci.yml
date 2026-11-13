@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# Actions are pinned to full commit SHAs (the tag in the comment), so a moved
+# tag cannot change what runs with the SONAR_TOKEN secret.
+
+jobs:
+  test:
+    name: Typecheck, tests with coverage, SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      # Only whether the token exists: pull requests from forks get no
+      # secrets, the analysis step is skipped then (typecheck and tests still
+      # run). The token itself goes to the analysis step alone.
+      HAS_SONAR_TOKEN: ${{ secrets.SONAR_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: SonarCloud needs it for blame and new-code detection.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      # No lifecycle scripts: the project and its dev dependencies need none,
+      # and a compromised dependency could otherwise run code at install time.
+      - run: bun install --frozen-lockfile --ignore-scripts
+
+      - run: bun run typecheck
+
+      # Writes coverage/lcov.info, which sonar-project.properties points to.
+      - run: bun run test:coverage
+
+      - name: SonarCloud analysis
+        if: env.HAS_SONAR_TOKEN == 'true'
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
