@@ -33,8 +33,6 @@ import {
   type ValueSlot,
   NOT_PRIMITIVE,
   onMemoryDisposed,
-  readCellDepths,
-  writeCellDepths,
 } from "./memory.ts";
 import { getDefaultMemory } from "./worker.ts";
 
@@ -481,13 +479,12 @@ function acquireCellLock(
   mem: SharedMemory,
   cell: number,
   bit: number,
-  depths: Map<number, number>,
 ): boolean {
   // This thread holds a user-level lock on the object already, of either
   // kind: nothing to acquire, and only the outermost lock releases. (Counting
   // the re-entry here while the caller skipped its release left the bit set
   // for good; a lock of the other kind waited for its own bit.)
-  if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return false;
+  if (mem.holdsUserLock(cell)) return false;
   // This thread is itself in the middle of an ordinary write of the object
   // (the lock is requested from inside `update()` for example): nothing to
   // acquire, and waiting for the bit would wait for ourselves.
@@ -515,7 +512,7 @@ function acquireCellLock(
     const next = raw | bit;
     const taken = Atomics.compareExchange(mem.versionView, cell, raw, next);
     if (taken === raw) {
-      depths.set(cell, 1); // held; the entry is removed on release
+      mem.markUserLock(cell, bit);
       return true;
     }
     raw = taken;
@@ -530,13 +527,8 @@ function acquireCellLock(
  * clearing the READLOCK bit leaves the version untouched (a read changes
  * nothing).
  */
-function releaseCellLock(
-  mem: SharedMemory,
-  cell: number,
-  bit: number,
-  depths: Map<number, number>,
-): void {
-  depths.delete(cell);
+function releaseCellLock(mem: SharedMemory, cell: number, bit: number): void {
+  mem.clearUserLock(cell, bit);
   // WRITER: version+1 and clear bit 0x1 in one add ((v<<2)|1 + 3 = (v+1)<<2).
   // READLOCK: clear bit 0x2 only (add -2 leaves the version unchanged).
   const delta = bit === WRITER_BIT ? VERSION_STEP - WRITER_BIT : -READLOCK_BIT;
@@ -1952,14 +1944,13 @@ class RefTarget<T = unknown> {
     // wait while any other worker holds read/write), run the callback, then
     // release in a single add that also bumps the version.
     const mem = this.mem;
-    const cell = mem.getVersionCellIndex(
-      (this.__index ??= getIndex(mem, this.key)),
-    );
-    const acquired = acquireCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+    this.__index ??= getIndex(mem, this.key);
+    const cell = mem.getVersionCellIndex(this.__index);
+    const acquired = acquireCellLock(mem, cell, WRITER_BIT);
     try {
       return fn((this.publicRef ?? this) as SharedRef<T>);
     } finally {
-      if (acquired) releaseCellLock(mem, cell, WRITER_BIT, writeCellDepths);
+      if (acquired) releaseCellLock(mem, cell, WRITER_BIT);
     }
   }
 
@@ -1967,14 +1958,13 @@ class RefTarget<T = unknown> {
     // Acquire the READLOCK bit so other readers/writers on this object wait,
     // run the callback, then release (version untouched).
     const mem = this.mem;
-    const cell = mem.getVersionCellIndex(
-      (this.__index ??= getIndex(mem, this.key)),
-    );
-    const acquired = acquireCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+    this.__index ??= getIndex(mem, this.key);
+    const cell = mem.getVersionCellIndex(this.__index);
+    const acquired = acquireCellLock(mem, cell, READLOCK_BIT);
     try {
       return fn((this.publicRef ?? this) as SharedRef<T>);
     } finally {
-      if (acquired) releaseCellLock(mem, cell, READLOCK_BIT, readCellDepths);
+      if (acquired) releaseCellLock(mem, cell, READLOCK_BIT);
     }
   }
 }

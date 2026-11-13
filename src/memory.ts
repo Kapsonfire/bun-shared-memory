@@ -111,20 +111,10 @@ export function versionFromCell(raw: number): number {
 export function isVersionCellLocked(raw: number): boolean {
   return (raw & VERSION_LOCK_MASK) !== 0;
 }
-/**
- * The version cells whose user-level write lock (`withWriteLock`/`withRWLock`)
- * this thread holds (value always 1: a re-entry acquires nothing and only the
- * outermost lock releases). Per thread: a lock is only held across a
- * synchronous call stack.
- */
-export const writeCellDepths = new Map<number, number>();
-
 /** Results of `SharedMemory.tryBeginCellWrite`. */
 const CELL_BEGAN = 0;
 const CELL_OWN = 1;
 const CELL_BUSY = 2;
-/** Same for the user-level read locks (`withReadLock`) this thread holds. */
-export const readCellDepths = new Map<number, number>();
 
 const MAX_INDEX_TABLE_BYTES = 4 * 1024 * 1024 * 1024;
 
@@ -807,6 +797,35 @@ export class SharedMemory {
   private readonly writingCells: number[] = [];
   private writingTop = -1;
 
+  /**
+   * The version cells whose user-level lock this thread holds in this memory:
+   * write locks (`withWriteLock`/`withRWLock`) and read locks
+   * (`withReadLock`). A re-entry acquires nothing and only the outermost lock
+   * releases, so a set is enough. Kept per memory (a lock is only held across
+   * a synchronous call stack of one thread), so no entry outlives it.
+   */
+  private readonly writeLockedCells = new Set<number>();
+  private readonly readLockedCells = new Set<number>();
+
+  /** Whether this thread holds a user-level lock of either kind on `cell`. */
+  holdsUserLock(cell: number): boolean {
+    return this.writeLockedCells.has(cell) || this.readLockedCells.has(cell);
+  }
+
+  /** Record that this thread acquired a user-level lock on `cell` (`bit`). */
+  markUserLock(cell: number, bit: number): void {
+    (bit === WRITER_BIT ? this.writeLockedCells : this.readLockedCells).add(
+      cell,
+    );
+  }
+
+  /** Record that this thread released its user-level lock on `cell`. */
+  clearUserLock(cell: number, bit: number): void {
+    (bit === WRITER_BIT ? this.writeLockedCells : this.readLockedCells).delete(
+      cell,
+    );
+  }
+
   /** Whether this thread is in the middle of an ordinary write of `cell`'s object. */
   isWritingCell(cell: number): boolean {
     return (
@@ -824,8 +843,7 @@ export class SharedMemory {
     return (
       this.writingTop === cell ||
       (this.writingCells.length > 1 && this.writingCells.includes(cell)) ||
-      writeCellDepths.has(cell) ||
-      readCellDepths.has(cell)
+      this.holdsUserLock(cell)
     );
   }
 
@@ -976,7 +994,7 @@ export class SharedMemory {
     if ((old & WRITER_BIT) === 0) {
       Atomics.and(this.versionView, cell, ~WRITER_BIT);
     }
-    if (writeCellDepths.has(cell) || readCellDepths.has(cell)) return CELL_OWN;
+    if (this.holdsUserLock(cell)) return CELL_OWN;
     return CELL_BUSY;
   }
 

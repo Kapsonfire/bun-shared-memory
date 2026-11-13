@@ -337,11 +337,13 @@ bits 2.. (0xFFFFFFFC) VERSION     logical version, bumped by 4 on each write
   then releases with `Atomics.add(cell, -2)` (clears the bit, version
   untouched). While held, readers that have to decode and ordinary writes on
   this object wait.
-- **Re-entrancy** (same thread): tracked via the `writeCellDepths` /
-  `readCellDepths` maps (user-level locks) and the list of cells this thread is
-  writing, all keyed by cell index. A thread never waits for lock bits it set
-  itself (read-inside-write, a write inside its own lock, a lock requested from
-  inside `update()`).
+- **Re-entrancy** (same thread): tracked per `SharedMemory` via the sets of
+  cells whose user-level write or read lock this thread holds, and the list of
+  cells this thread is writing, all keyed by cell index. A thread never waits
+  for lock bits it set itself (read-inside-write, a write inside its own lock,
+  a lock of either kind nested in its own lock, a lock requested from inside
+  `update()`); a nested lock acquires nothing and only the outermost lock
+  releases.
 
 The old `SharedOptions.rwLock` field was removed because the cell-embedded
 Seqlock makes a separate lock buffer unnecessary for `with*` methods. The
