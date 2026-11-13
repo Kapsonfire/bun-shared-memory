@@ -17,6 +17,12 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?style=for-the-badge&logo=typescript&color=3178c6)](https://www.typescriptlang.org)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen?style=for-the-badge&logo=checkmarx)](https://github.com/Kapsonfire/bun-shared-memory/actions)
 
+[![Quality Gate](https://img.shields.io/sonar/quality_gate/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+[![Bugs](https://img.shields.io/sonar/bugs/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+[![Vulnerabilities](https://img.shields.io/sonar/vulnerabilities/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+[![Code Smells](https://img.shields.io/sonar/code_smells/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+[![Duplicated Lines](https://img.shields.io/sonar/duplicated_lines_density/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
+
 </div>
 
 ---
