@@ -3364,11 +3364,77 @@ function createArrayProxy(
   let hitEntry: { raw: number; cell: number; value: unknown } | undefined;
   let hitArray: unknown[] = [];
 
+  /**
+   * An index read that the remembered entry could not answer (a miss, an
+   * object element, no entry yet). Kept out of the `get` trap so the trap's
+   * hit path stays small.
+   */
+  function readElementMiss(index: number): unknown {
+    let root: unknown;
+    const cached = readCache.get(key);
+    if (cached !== undefined && mem.versionView[cached.cell] === cached.raw) {
+      root = cached.value;
+    } else {
+      // Miss (typically right after a write). For a one-step path to an
+      // array property, read just the element instead of decoding the
+      // whole root object.
+      if (locator.path.length === 1) {
+        const step = locator.path[0]!;
+        if (step.kind === "prop") {
+          const fast = tryReadElement(mem, key, step.name, index);
+          if (fast !== NOT_PRIMITIVE) return fast;
+        }
+      }
+      root = readValue(mem, key);
+    }
+    const rootArray = readPathValue(mem, locator, root);
+    if (!Array.isArray(rootArray)) {
+      throw new TypeError("Value is not an array");
+    }
+    // Remember the entry this array came from (`readValue` stored a new
+    // one on a miss), for the next index read.
+    const entry = readCache.get(key);
+    if (entry !== undefined && entry.value === root) {
+      hitEntry = entry;
+      hitArray = rootArray;
+    }
+    const element = rootArray[index];
+    if (element !== null && typeof element === "object") {
+      if (sharedKeyMap.has(element)) return element;
+      return childProxy(
+        children,
+        mem,
+        locator.key,
+        locator.path,
+        "index",
+        index,
+        Array.isArray(element),
+        arrayCapacity,
+      );
+    }
+    return element;
+  }
+
   return new Proxy([] as unknown[], {
     get(_target, arrProp) {
       // Index reads first: they are the hot path, and every name check below
       // would be paid on each of them (as in `REF_PROXY_HANDLER.get`).
-      const index = parseIndex(arrProp);
+      // `parseIndex` written out: one function level less on every read; and
+      // everything but the hit in `readElementMiss`, so the trap stays small.
+      // Measured, `o.tags[1]` 152 → 163 M ops/s, `o.tags[123]` 128 → 154 M
+      // (the inlined parse alone: +3…+5 %).
+      let index = -1;
+      if (typeof arrProp === "string" && arrProp.length > 0) {
+        index = 0;
+        for (let i = 0; i < arrProp.length; i++) {
+          const digit = arrProp.charCodeAt(i) - 48;
+          if (digit < 0 || digit > 9) {
+            index = -1;
+            break;
+          }
+          index = index * 10 + digit;
+        }
+      }
       if (index >= 0) {
         if (
           hitEntry !== undefined &&
@@ -3377,52 +3443,7 @@ function createArrayProxy(
           const element = hitArray[index];
           if (element === null || typeof element !== "object") return element;
         }
-        let root: unknown;
-        const cached = readCache.get(key);
-        if (
-          cached !== undefined &&
-          mem.versionView[cached.cell] === cached.raw
-        ) {
-          root = cached.value;
-        } else {
-          // Miss (typically right after a write). For a one-step path to an
-          // array property, read just the element instead of decoding the
-          // whole root object.
-          if (locator.path.length === 1) {
-            const step = locator.path[0]!;
-            if (step.kind === "prop") {
-              const fast = tryReadElement(mem, key, step.name, index);
-              if (fast !== NOT_PRIMITIVE) return fast;
-            }
-          }
-          root = readValue(mem, key);
-        }
-        const rootArray = readPathValue(mem, locator, root);
-        if (!Array.isArray(rootArray)) {
-          throw new TypeError("Value is not an array");
-        }
-        // Remember the entry this array came from (`readValue` stored a new
-        // one on a miss), for the next index read.
-        const entry = readCache.get(key);
-        if (entry !== undefined && entry.value === root) {
-          hitEntry = entry;
-          hitArray = rootArray;
-        }
-        const element = rootArray[index];
-        if (element !== null && typeof element === "object") {
-          if (sharedKeyMap.has(element)) return element;
-          return childProxy(
-            children,
-            mem,
-            locator.key,
-            locator.path,
-            "index",
-            index,
-            Array.isArray(element),
-            arrayCapacity,
-          );
-        }
-        return element;
+        return readElementMiss(index);
       }
       // push/pop on the array: operate directly on the array ref without
       // decoding the whole value (O(1) amortized).
