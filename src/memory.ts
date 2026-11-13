@@ -112,9 +112,10 @@ export function isVersionCellLocked(raw: number): boolean {
   return (raw & VERSION_LOCK_MASK) !== 0;
 }
 /**
- * Re-entrancy depth, per version cell, of the user-level write locks
- * (`withWriteLock`/`withRWLock`) this thread holds. Per thread: a lock is only
- * held across a synchronous call stack.
+ * The version cells whose user-level write lock (`withWriteLock`/`withRWLock`)
+ * this thread holds (value always 1: a re-entry acquires nothing and only the
+ * outermost lock releases). Per thread: a lock is only held across a
+ * synchronous call stack.
  */
 export const writeCellDepths = new Map<number, number>();
 
