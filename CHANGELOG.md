@@ -5,6 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-13
+
+### Fixed
+
+- **Nested user-level locks on one key.** A `withWriteLock` nested in a
+  `withWriteLock` of the same key (or `withReadLock` in `withReadLock`) left
+  the lock bit set for good: every other thread then timed out on the key with
+  a `LockTimeoutError`. A lock of the other kind nested in the thread's own
+  lock (`withReadLock` inside `withWriteLock` and vice versa) waited for its
+  own bit and timed out. And a lock entry leaked this way made a later lock on
+  the same cell of a new `SharedMemory` skip its bit, so another thread could
+  see the writes of that lock half done. A thread that already holds a lock of
+  either kind on an object now acquires nothing, and only the outermost lock
+  releases.
+
+### Changed
+
+Measured on Linux (Core Ultra 7 265K, Bun 1.4.4) against 1.1.2 on the same
+machine; see `BENCH.md` for every row and its log.
+
+- **Faster primitive reads.** A new key's initial value is written through the
+  target instead of `ref.write` through the proxy, which created the ref's
+  `write` wrapper; a ref with that wrapper reads more slowly even if it never
+  writes again. `shared.read()` of a number, string, boolean or bigint +20 %
+  (number 646 → 775 M ops/s). A ref that also calls `write()` still reads at
+  the old speed.
+- **Faster array index reads.** Top-level arrays: the proxy trap passes the
+  first digit it reads anyway and the rest of the index is parsed without
+  another call, +35 to +40 % (`arr[3]` 136 → 191 M ops/s, `arr[123]` +26 %).
+  Array properties and nested arrays (`o.tags[i]`): the proxy remembers the
+  cache entry of its last index read and keeps its miss path out of the trap,
+  92 → 146 M ops/s.
+- **Faster nested object reads.** A nested proxy (`o.sub.x`) remembers the
+  property read last and checks its cache before its name checks:
+  132 → 242 M ops/s.
+- **Faster nested object writes.** `o.sub.x = v` (numbers, booleans, int64
+  bigints, short strings, a path of property names) uses the plain-write fast
+  path with slot offsets cached per path step, and the parent getters stay
+  cached across the thread's own nested writes: 13.3 → 24.0 M ops/s.
+- **Cheaper `withWriteLock`/`withReadLock`.** The lock's deadline is only
+  computed when it has to wait, acquire and release do one Map operation
+  instead of three: a lock around one write 107 → 84 ns. Writes inside a lock
+  still take the ordinary path; a lock is for all-or-none visibility, not
+  speed.
+- **Benchmark logs name their machine** (CPU, RAM, OS, kernel, architecture,
+  Bun), runs on uncommitted changes are marked `-dirty`, and a second run of
+  the same state no longer overwrites the first log. New benchmark cases for
+  nested object reads and writes.
+
+### Added
+
+- Tests: nested user-level lock combinations, plain writes and reads inside a
+  thread's own lock, a worker that must see the writes of one `withWriteLock`
+  all or none, nested writes after replaced sub-objects and defragmentation,
+  cached index and property reads across every kind of write.
+
 ## [1.1.2] - 2026-11-13
 
 ### Fixed
@@ -822,6 +878,9 @@ require-corp`) for `SharedArrayBuffer` in the browser. See the README.
 - O(1) in-place `push`/`pop` with capacity-based array growth.
 - Benchmarks for all data types vs native.
 
+[1.2.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.2...v1.2.0
+[1.1.2]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Kapsonfire/bun-shared-memory/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Kapsonfire/bun-shared-memory/compare/v0.2.3...v1.0.0
