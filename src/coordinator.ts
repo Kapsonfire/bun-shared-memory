@@ -118,7 +118,7 @@ export class MaintenanceCoordinator {
    * yourself when you know a worker was terminated (Bun does not fire `close`
    * for `worker.terminate()`).
    */
-  unregisterWorker(worker: unknown | number): void {
+  unregisterWorker(worker: unknown): void {
     const id = typeof worker === "number" ? worker : this.idForWorker(worker);
     if (id === undefined || !this.workerById.has(id)) return;
     this.workerById.delete(id);

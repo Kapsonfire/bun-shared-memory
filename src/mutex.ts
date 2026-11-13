@@ -53,10 +53,10 @@ const FULL_BYTES = 8;
 
 /**
  * Bit 31 of the state cell: at least one thread is waiting for the lock.
- * `| 0` makes it the *signed* int32 value (-2147483648), matching what
- * `Atomics` operations read back from an Int32Array.
+ * Written as the *signed* int32 value (-2147483648, i.e. `0x80000000 | 0`),
+ * matching what `Atomics` operations read back from an Int32Array.
  */
-const WAITERS_BIT = 0x80000000 | 0;
+const WAITERS_BIT = -0x80000000;
 /** Mask selecting the owner id in the state cell (0 = free). */
 const OWNER_MASK = 0x7fffffff;
 /**
@@ -166,7 +166,7 @@ export class Mutex {
       if ((Atomics.load(cell, 0) & OWNER_MASK) === 0) break;
       // Waiting without touching the shared line. The loop writes a
       // module-level variable so the JIT cannot drop it as dead code.
-      for (let i = 0; i < pause; i++) spinSink = (spinSink + i) | 0;
+      for (let i = 0; i < pause; i++) spinSink = (spinSink + i) & 0x7fffffff;
       if (pause < SPIN_MAX_PAUSE) pause <<= 1;
     }
     while (true) {

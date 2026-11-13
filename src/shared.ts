@@ -283,7 +283,7 @@ function encodeValue(
         }
         // A plain nested object: store it as a nested object block.
         assertPlainObject(value as object);
-        if (visited === undefined) visited = new Set<object>();
+        visited ??= new Set<object>();
         if (visited.has(value as object)) {
           throw new TypeError(
             `Cannot store cyclic plain object: it is already being written`,
@@ -602,8 +602,8 @@ interface WriteTarget {
   __offset?: number;
   __layoutVersion: number;
   __type?: number;
-  __arrayRef?: { offset: number; count: number; capacity: number } | undefined;
-  __index?: number | undefined;
+  __arrayRef?: { offset: number; count: number; capacity: number };
+  __index?: number;
 }
 
 /**
@@ -618,7 +618,7 @@ function getCachedOffset(
   target?: WriteTarget,
   lv?: number,
 ): number | null {
-  if (target !== undefined && target.__offset !== undefined) {
+  if (target?.__offset !== undefined) {
     if (target.__layoutVersion === (lv ?? mem.getLayoutVersion())) {
       return target.__offset;
     }
@@ -687,7 +687,7 @@ function getObjectLayout(
 ): ObjectLayout | null {
   const version = layoutVersion ?? mem.getLayoutVersion();
   const cached = layoutCache.get(key);
-  if (cached !== undefined && cached.version === version) {
+  if (cached?.version === version) {
     return cached.layout;
   }
   const layout = mem.withLock(() => mem.getObjectLayout(key));
@@ -2197,12 +2197,9 @@ function readPropMiss(st: PropState): unknown {
     } catch {
       // Unreadable layout: the general path below decides.
     }
-    const proxy =
-      type === TYPE_ARRAY_REF
-        ? st.arrayProxy
-        : type === TYPE_OBJECT_REF
-          ? st.objectProxy
-          : undefined;
+    let proxy: unknown;
+    if (type === TYPE_ARRAY_REF) proxy = st.arrayProxy;
+    else if (type === TYPE_OBJECT_REF) proxy = st.objectProxy;
     // The add(…, 0) is a full barrier: the reads above happen before it.
     const now = Atomics.add(mem.versionView, cell, 0);
     if (proxy !== undefined && mem.getLayoutVersion() === lv0) {
@@ -2961,7 +2958,7 @@ function bumpTarget(
   key: string,
   target?: WriteTarget,
 ): void {
-  if (target !== undefined && target.__index !== undefined) {
+  if (target?.__index !== undefined) {
     mem.bumpVersion(target.__index);
     return;
   }
@@ -3373,9 +3370,7 @@ function createArrayProxy(
 
   /** Bump the key's version cell using the cached index (resolved lazily). */
   function bumpCached(): void {
-    if (cachedIndex === undefined) {
-      cachedIndex = getIndex(mem, key);
-    }
+    cachedIndex ??= getIndex(mem, key);
     mem.bumpVersion(cachedIndex);
   }
 

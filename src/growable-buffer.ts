@@ -124,6 +124,22 @@ const MIN_BLOCK_SIZE = 8;
 
 export { MIN_BLOCK_SIZE };
 
+/** Optional settings of a `GrowableBuffer` (see its constructor). */
+export interface GrowableBufferOptions {
+  /** Shared byte budget charged for growth (none: unlimited). */
+  budget?: SharedBudget;
+  /** Bytes per chunk (default 32 MiB). */
+  chunkSize?: number;
+  /** Keep one buffer that grows in place instead of chunks. */
+  singleBuffer?: boolean;
+  /** Charge the initial size against the budget (default true). */
+  chargeInitial?: boolean;
+  /** Existing cursor buffer to attach to (a worker reusing shared state). */
+  cursorBuffer?: SharedArrayBuffer;
+  /** Existing free-list head buffer to attach to. */
+  freeListBuffer?: SharedArrayBuffer;
+}
+
 export class GrowableBuffer {
   private chunks: Chunk[] = [];
   private readonly maxByteLength: number;
@@ -164,13 +180,16 @@ export class GrowableBuffer {
   constructor(
     initialSizeOrBuffer: number | SharedArrayBuffer | SharedArrayBuffer[],
     maxByteLength: number,
-    budget?: SharedBudget,
-    chunkSize = 32 * 1024 * 1024, // 32 MiB per chunk
-    singleBuffer = false,
-    chargeInitial = true,
-    cursorBuffer?: SharedArrayBuffer,
-    freeListBuffer?: SharedArrayBuffer,
+    options: GrowableBufferOptions = {},
   ) {
+    const {
+      budget,
+      chunkSize = 32 * 1024 * 1024, // 32 MiB per chunk
+      singleBuffer = false,
+      chargeInitial = true,
+      cursorBuffer,
+      freeListBuffer,
+    } = options;
     this.singleBuffer = singleBuffer;
     this.budget = budget;
     this.cursor = new BigInt64Array(
@@ -712,7 +731,7 @@ export class GrowableBuffer {
     if (this.singleBuffer) return this.chunks[0]!.view;
     const index = offset >>> this.chunkShift;
     const chunk = this.chunks[index];
-    if (chunk !== undefined && chunk.active) return chunk.view;
+    if (chunk?.active) return chunk.view;
     this.activate(index);
     return this.chunks[index]!.view;
   }

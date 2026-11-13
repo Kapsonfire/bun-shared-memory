@@ -24,7 +24,10 @@ let defaultLockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS;
  * instance, so call it in every thread that should use a non-default value.
  */
 export function setDefaultLockTimeout(ms: number): void {
-  if (!(ms > 0)) throw new RangeError("lock timeout must be > 0");
+  // NaN is rejected too (`ms <= 0` alone would let it through).
+  if (Number.isNaN(ms) || ms <= 0) {
+    throw new RangeError("lock timeout must be > 0");
+  }
   defaultLockTimeoutMs = ms;
 }
 
@@ -60,7 +63,8 @@ declare const document: unknown;
  * workers may block.
  */
 export const canBlock: boolean = !(
-  typeof window !== "undefined" && typeof document !== "undefined"
+  (globalThis as { window?: unknown }).window !== undefined &&
+  (globalThis as { document?: unknown }).document !== undefined
 );
 
 /** Absolute deadline (ms, `performance.now()` clock) for a timeout. */
