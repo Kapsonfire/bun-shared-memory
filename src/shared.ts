@@ -2154,7 +2154,7 @@ function readPropMiss(st: PropState): unknown {
  * object, a non-array value) down the general path, which gives the same
  * answer for these cases.
  */
-function readIndexFast(t: RefTarget, prop: string): unknown {
+function readIndexFast(t: RefTarget, prop: string, first: number): unknown {
   // The entry is remembered on the target, so a hit skips the Map lookup.
   let cached = t.__cache;
   if (cached === undefined || t.mem.versionView[cached.cell] !== cached.raw) {
@@ -2165,8 +2165,17 @@ function readIndexFast(t: RefTarget, prop: string): unknown {
   }
   const value = cached.value;
   if (!Array.isArray(value)) return NOT_PRIMITIVE;
-  const index = parseIndex(prop);
-  if (index < 0) return NOT_PRIMITIVE;
+  // `parseIndex` written out, from the second character on: the trap has
+  // checked the first one and passes its digit (`first`). Measured, index
+  // reads +39 % (`arr[3]`), +28 % (`arr[42]`), +26 % (`arr[123]`). Not
+  // tried again: this hit path written out in the trap itself was slower
+  // than this call (`arr[3]` 186 → 163 M ops/s).
+  let index = first;
+  for (let i = 1; i < prop.length; i++) {
+    const digit = prop.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return NOT_PRIMITIVE;
+    index = index * 10 + digit;
+  }
   const element: unknown = value[index];
   if (element !== null && typeof element === "object") {
     // A nested array or object: its cached child proxy (a live shared
@@ -2193,7 +2202,7 @@ const REF_PROXY_HANDLER: ProxyHandler<RefTarget> = {
     if (typeof prop === "string") {
       const digit = prop.charCodeAt(0) - 48;
       if (digit >= 0 && digit <= 9) {
-        const element = readIndexFast(t, prop);
+        const element = readIndexFast(t, prop, digit);
         if (element !== NOT_PRIMITIVE) return element;
       }
     }
