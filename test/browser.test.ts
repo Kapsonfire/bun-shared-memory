@@ -197,6 +197,37 @@ describe("acceptWorker in Bun", () => {
     }
   });
 
+  test("a worker object without addEventListener: onmessage is wrapped", () => {
+    const mem = freshMemory();
+    const sent: { __sharedMemoryInit?: boolean }[] = [];
+    const seen: unknown[] = [];
+    const withHandler = {
+      postMessage: (m: unknown) =>
+        sent.push(m as { __sharedMemoryInit?: boolean }),
+      onmessage: (e: { data: unknown }) => seen.push(e.data) as unknown,
+    };
+    acceptWorker(withHandler);
+    acceptWorker(withHandler); // registered once
+    const deliver = (w: { onmessage?: unknown }, data: unknown) =>
+      (w.onmessage as (e: { data: unknown }) => void)({ data });
+    deliver(withHandler, { __sharedMemoryRequest: true });
+    deliver(withHandler, "hello");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.__sharedMemoryInit).toBe(true);
+    // The handler that was set keeps getting every message, once.
+    expect(seen).toEqual([{ __sharedMemoryRequest: true }, "hello"]);
+
+    // Without a handler set before: the request is still answered.
+    const bare: { postMessage: (m: unknown) => void; onmessage?: unknown } = {
+      postMessage: (m: unknown) =>
+        sent.push(m as { __sharedMemoryInit?: boolean }),
+    };
+    acceptWorker(bare);
+    deliver(bare, { __sharedMemoryRequest: true, threadId: 3 });
+    expect(sent).toHaveLength(2);
+    mem.dispose();
+  });
+
   test("an onmessage handler set before acceptWorker gets each message once", async () => {
     const mem = freshMemory();
     Shared("accept-bun", { n: 9 });
