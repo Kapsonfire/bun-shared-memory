@@ -64,8 +64,14 @@ async function startWorkers(
       });
       self.postMessage("ready");
       Atomics.wait(new Int32Array(d.start), 0, 0);
-      body(d.w, d.n, o);
-      self.postMessage("done");
+      try {
+        body(d.w, d.n, o);
+        self.postMessage("done");
+      } catch (err) {
+        // The whole error with its stack (an ErrorEvent only carries a code
+        // frame), and the progress, so a failure can be traced.
+        self.postMessage({ error: String(err && err.stack || err) });
+      }
     };`;
   const url = new URL(
     "data:text/javascript," + encodeURIComponent(code),
@@ -88,7 +94,10 @@ async function startWorkers(
   let done = 0;
   const finished = new Promise<void>((resolve) => {
     for (const wk of pool) {
-      wk.onmessage = () => {
+      wk.onmessage = (e) => {
+        if (e.data && e.data.error) {
+          fail(`worker error: ${e.data.error}`);
+        }
         if (++done === pool.length) resolve();
       };
       wk.onerror = (e) => {
