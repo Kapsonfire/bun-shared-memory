@@ -582,3 +582,15 @@ describe("Worker integration (M4)", () => {
     stopInit();
   });
 });
+
+describe("setDefaultMemory", () => {
+  test("rejects a memory that is not the thread's live one", () => {
+    const old = new SharedMemory();
+    old.dispose();
+    const live = new SharedMemory();
+    expect(() => setDefaultMemory(old)).toThrow(/single live SharedMemory/);
+    setDefaultMemory(live); // the live one is accepted
+    expect(getDefaultMemory()).toBe(live);
+    live.dispose();
+  });
+});

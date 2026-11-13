@@ -319,3 +319,62 @@ describe("RWLock integration with Shared", () => {
     expect(Atomics.load(control, 0)).toBe(99);
   });
 });
+
+describe("RWLock write re-entry and hand-off", () => {
+  const writerBit = (lock: RWLock) => new Int32Array(lock.buffer)[0]! & 1;
+
+  test("a nested write lock keeps the lock until the outermost unlock", () => {
+    const lock = new RWLock();
+    lock.writeLock();
+    lock.writeLock();
+    lock.writeUnlock();
+    expect(writerBit(lock)).toBe(1); // still held by the outer lock
+    lock.writeUnlock();
+    expect(writerBit(lock)).toBe(0);
+  });
+
+  test("withWriteLock returns the result and releases on exceptions", () => {
+    const lock = new RWLock();
+    expect(lock.withWriteLock(() => lock.withWriteLock(() => 7))).toBe(7);
+    expect(writerBit(lock)).toBe(0);
+    expect(() =>
+      lock.withWriteLock(() => {
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(writerBit(lock)).toBe(0);
+    lock.withReadLock(() => undefined); // free again
+  });
+
+  test("a waiting writer takes over when the holder in another worker releases", async () => {
+    const lock = new RWLock();
+    const code = `
+      import { RWLock } from ${JSON.stringify(
+        new URL("../src/index.ts", import.meta.url).href,
+      )};
+      self.onmessage = (e) => {
+        const lock = new RWLock(e.data);
+        lock.writeLock();
+        self.postMessage("locked");
+        const end = performance.now() + 150;
+        while (performance.now() < end) {}
+        lock.writeUnlock();
+      };`;
+    const worker = new Worker(
+      new URL("data:text/javascript," + encodeURIComponent(code)),
+      { type: "module" },
+    );
+    await new Promise<void>((resolve) => {
+      worker.onmessage = () => resolve();
+      worker.postMessage(lock.buffer);
+    });
+    const started = performance.now();
+    lock.writeLock(); // queues behind the worker, then takes over
+    const waited = performance.now() - started;
+    expect(writerBit(lock)).toBe(1);
+    lock.writeUnlock();
+    worker.terminate();
+    expect(waited).toBeGreaterThan(50);
+    expect(new Int32Array(lock.buffer)[0]).toBe(0);
+  });
+});
