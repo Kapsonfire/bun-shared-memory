@@ -6,15 +6,11 @@
 
 [![npm version](https://img.shields.io/npm/v/bun-shared-memory?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)
 [![npm downloads](https://img.shields.io/npm/dm/bun-shared-memory?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)
-[![npm bundle size](https://img.shields.io/bundlephobia/minzip/bun-shared-memory?style=for-the-badge&color=blueviolet)](https://bundlephobia.com/package/bun-shared-memory)
 
 [![GitHub stars](https://img.shields.io/github/stars/Kapsonfire/bun-shared-memory?style=for-the-badge&logo=github&color=181717)](https://github.com/Kapsonfire/bun-shared-memory)
-[![GitHub forks](https://img.shields.io/github/forks/Kapsonfire/bun-shared-memory?style=for-the-badge&logo=github&color=181717)](https://github.com/Kapsonfire/bun-shared-memory)
 [![GitHub issues](https://img.shields.io/github/issues/Kapsonfire/bun-shared-memory?style=for-the-badge&logo=github&color=181717)](https://github.com/Kapsonfire/bun-shared-memory/issues)
 [![GitHub license](https://img.shields.io/github/license/Kapsonfire/bun-shared-memory?style=for-the-badge&color=green)](https://github.com/Kapsonfire/bun-shared-memory/blob/main/LICENSE)
 
-[![Bun](https://img.shields.io/badge/Bun-%E2%89%A51.4.0-black?style=for-the-badge&logo=bun&color=14151a)](https://bun.sh)
-[![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?style=for-the-badge&logo=typescript&color=3178c6)](https://www.typescriptlang.org)
 [![Tests](https://img.shields.io/github/actions/workflow/status/Kapsonfire/bun-shared-memory/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=tests)](https://github.com/Kapsonfire/bun-shared-memory/actions/workflows/ci.yml)
 
 [![Quality Gate](https://img.shields.io/sonar/quality_gate/bun-shared-memory?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/summary/overall?id=bun-shared-memory)
@@ -88,11 +84,9 @@ See [SPEC.md](./SPEC.md) for the full specification.
 | **Version**           | [![npm version](https://img.shields.io/npm/v/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)                                      |
 | **Downloads / month** | [![npm downloads](https://img.shields.io/npm/dm/bun-shared-memory?color=cb3837)](https://www.npmjs.com/package/bun-shared-memory)                                   |
 | **Stars**             | [![GitHub stars](https://img.shields.io/github/stars/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory)                   |
-| **Forks**             | [![GitHub forks](https://img.shields.io/github/forks/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory)                   |
 | **Open issues**       | [![GitHub issues](https://img.shields.io/github/issues/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/issues)          |
 | **Open PRs**          | [![GitHub pull requests](https://img.shields.io/github/issues-pr/Kapsonfire/bun-shared-memory?color=181717)](https://github.com/Kapsonfire/bun-shared-memory/pulls) |
 | **License**           | [![License](https://img.shields.io/github/license/Kapsonfire/bun-shared-memory?color=green)](https://github.com/Kapsonfire/bun-shared-memory/blob/main/LICENSE)     |
-| **Language**          | [![TypeScript](https://img.shields.io/badge/TypeScript-7-blue?color=3178c6)](https://www.typescriptlang.org)                                                        |
 
 ## Data Types
 
