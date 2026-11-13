@@ -483,3 +483,49 @@ describe("MaintenanceCoordinator worker registration", () => {
     mem.dispose();
   });
 });
+
+describe("layout cache and defragmentation", () => {
+  test("a layout computed just before a defragmentation is not cached under the new version", () => {
+    SharedMemory.current()?.dispose();
+    const mem = new SharedMemory();
+    // A nested block of an earlier key, made dead below, lies before the
+    // object of `o`, so a defragmentation moves that object.
+    const before = Shared("layout-race-0", { sub: { x: 1 } }, { memory: mem });
+    const o = Shared(
+      "layout-race",
+      { n: 1, s: "a string longer than eleven bytes", p: { c: 2 } },
+      { memory: mem },
+    );
+    expect(o.n).toBe(1);
+    mem.reclaimInPlace(); // the cached layout of `o` is outdated now
+    before.sub = { x: 2 }; // the old `sub` block is dead space
+
+    // Run one defragmentation right after the next layout computation, in
+    // the window between releasing the lock and caching the result.
+    const withLock = mem.withLock.bind(mem);
+    let armed = true;
+    (mem as { withLock: typeof mem.withLock }).withLock = <T>(
+      fn: () => T,
+    ): T => {
+      const result = withLock(fn);
+      if (armed) {
+        armed = false;
+        mem.reclaimInPlace();
+      }
+      return result;
+    };
+
+    // The reads resolve the layout again; with the layout cached under the
+    // wrong version they read other slots (wrong values or a decode error).
+    expect(o.n).toBe(1);
+    expect(o.s).toBe("a string longer than eleven bytes");
+    expect(o.p.c).toBe(2);
+    expect(armed).toBe(false); // the defragmentation did run
+    expect(o.read()).toEqual({
+      n: 1,
+      s: "a string longer than eleven bytes",
+      p: { c: 2 },
+    });
+    mem.dispose();
+  });
+});
