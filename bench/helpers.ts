@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import * as os from "node:os";
 import { Shared } from "../src/index.ts";
 
 interface BenchResult {
@@ -164,24 +166,41 @@ async function writeLogFile(groups: {
   fmt: (rs: BenchResult[]) => string;
 }): Promise<void> {
   const { reads, arrayReads, writes, arrayWrites, fmt } = groups;
-  const { commit, timestamp } = currentCommit();
+  const { commit, timestamp, dirty } = currentCommit();
   const dir = new URL("../benchlogs/", import.meta.url);
-  const file = new URL(`${timestamp}-${commit}.md`, dir);
+  // A run on uncommitted changes is marked as such, and a second run of the
+  // same state gets a numbered name instead of overwriting the first log.
+  const base = `${timestamp}-${commit}${dirty ? "-dirty" : ""}`;
+  let name = `${base}.md`;
+  for (let n = 2; await Bun.file(new URL(name, dir)).exists(); n++) {
+    name = `${base}-${n}.md`;
+  }
+  const file = new URL(name, dir);
 
   const lines: string[] = [];
-  lines.push(`# Benchmark ${commit}`);
+  lines.push(`# Benchmark ${commit}${dirty ? " (uncommitted changes)" : ""}`);
   lines.push("");
   lines.push(`Date: ${new Date().toISOString()}`);
   lines.push("");
+  lines.push("## Machine");
+  lines.push("");
+  for (const [label, value] of machineInfo()) {
+    lines.push(`- ${label}: ${value}`);
+  }
+  lines.push("");
   lines.push("## Results");
   lines.push("");
-  lines.push("| Name | Native ops/s | Shared ops/s | Ratio |");
-  lines.push("|------|--------------|--------------|-------|");
-  for (const r of results) {
-    lines.push(
-      `| ${r.name} | ${r.nativeOps} | ${r.sharedOps} | ${r.ratio.toFixed(2)}× |`,
-    );
-  }
+  lines.push(
+    ...markdownTable(
+      ["Name", "Native ops/s", "Shared ops/s", "Ratio"],
+      results.map((r) => [
+        r.name,
+        String(r.nativeOps),
+        String(r.sharedOps),
+        `${r.ratio.toFixed(2)}×`,
+      ]),
+    ),
+  );
   lines.push("");
   lines.push("## Summary");
   lines.push("");
@@ -191,14 +210,77 @@ async function writeLogFile(groups: {
   lines.push(`- Array writes: ${fmt(arrayWrites)}`);
 
   await Bun.write(file, lines.join("\n") + "\n");
-  console.log(`\nWrote benchmark log to benchlogs/${timestamp}-${commit}.md`);
+  console.log(`\nWrote benchmark log to benchlogs/${name}`);
 }
 
 /**
- * Resolve the current git commit hash (short form) and its committer date as
- * a Unix timestamp, or "unknown"/0 if git is unavailable.
+ * A Markdown table laid out the way `bun fmt` lays it out (every column padded
+ * to its widest cell, the separator as wide), so `bun fmt` leaves the log as
+ * written.
  */
-function currentCommit(): { commit: string; timestamp: number } {
+function markdownTable(header: string[], rows: string[][]): string[] {
+  const widths = header.map((h, i) =>
+    Math.max(h.length, ...rows.map((row) => row[i]!.length)),
+  );
+  const line = (cells: string[]) =>
+    `| ${cells.map((c, i) => c.padEnd(widths[i]!)).join(" | ")} |`;
+  return [
+    line(header),
+    line(widths.map((w) => "-".repeat(w))),
+    ...rows.map(line),
+  ];
+}
+
+/**
+ * The machine the benchmark ran on: CPU, RAM, OS, kernel, architecture and Bun
+ * version. Results from different machines are not comparable, so every log
+ * names its machine.
+ */
+function machineInfo(): Array<[string, string]> {
+  const cpus = os.cpus();
+  const models = [...new Set(cpus.map((c) => c.model.trim()))];
+  const gib = (os.totalmem() / 1024 ** 3).toFixed(1);
+  return [
+    [
+      "CPU",
+      `${models.join(" + ") || "unknown"} (${cpus.length} logical cores)`,
+    ],
+    ["RAM", `${gib} GiB`],
+    ["OS", osName()],
+    ["Kernel", `${os.type()} ${os.release()}`],
+    ["Architecture", `${process.arch}`],
+    ["Bun", `${Bun.version} (${Bun.revision.slice(0, 9)})`],
+  ];
+}
+
+/** A readable OS name: the distribution on Linux, the product version on macOS. */
+function osName(): string {
+  try {
+    if (process.platform === "linux") {
+      const text = readFileSync("/etc/os-release", "utf8");
+      const match = /^PRETTY_NAME="?([^"\n]*)"?$/m.exec(text);
+      if (match) return match[1]!;
+    } else if (process.platform === "darwin") {
+      const out = Bun.spawnSync({ cmd: ["sw_vers", "-productVersion"] });
+      const version = out.stdout.toString().trim();
+      if (version) return `macOS ${version}`;
+    }
+  } catch {
+    // Fall through to the generic name.
+  }
+  return `${os.type()} (${process.platform})`;
+}
+
+/**
+ * Resolve the current git commit hash (short form), its committer date as a
+ * Unix timestamp and whether the working tree differs from it (tracked files),
+ * or "unknown"/0 if git is unavailable.
+ */
+function currentCommit(): {
+  commit: string;
+  timestamp: number;
+  dirty: boolean;
+} {
   try {
     const hashOut = Bun.spawnSync({
       cmd: ["git", "rev-parse", "--short", "HEAD"],
@@ -212,9 +294,15 @@ function currentCommit(): { commit: string; timestamp: number } {
       stderr: "pipe",
     });
     const timestamp = Number(tsOut.stdout.toString().trim()) || 0;
-    return { commit, timestamp };
+    const statusOut = Bun.spawnSync({
+      cmd: ["git", "status", "--porcelain", "--untracked-files=no"],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const dirty = statusOut.stdout.toString().trim() !== "";
+    return { commit, timestamp, dirty };
   } catch {
-    return { commit: "unknown", timestamp: 0 };
+    return { commit: "unknown", timestamp: 0, dirty: false };
   }
 }
 

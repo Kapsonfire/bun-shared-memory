@@ -129,3 +129,94 @@ describe("array element reads after a write", () => {
     expect(arr[1]).toBe(0);
   });
 });
+
+/**
+ * An array proxy remembers the read-cache entry of its last index read and
+ * answers further index reads from it while the key's version is unchanged.
+ * Every kind of write must make it read the new value.
+ */
+describe("array proxy index-read cache", () => {
+  test("array property: element writes, whole writes, push/pop, sibling writes", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ n: number; tags: unknown[] }>(
+      "apc-prop",
+      { n: 0, tags: [1, 2, 3] },
+      { memory: mem },
+    );
+    const tags = o.tags;
+    // Warm: two reads at the same version, the second from the proxy's entry.
+    expect(tags[0]).toBe(1);
+    expect(tags[0]).toBe(1);
+    expect(tags[1]).toBe(2);
+
+    tags[1] = "x";
+    expect(tags[1]).toBe("x");
+    expect(tags[1]).toBe("x");
+
+    o.tags = [7, 8, 9, 10];
+    expect(tags[3]).toBe(10);
+    expect(tags[0]).toBe(7);
+    expect(tags[0]).toBe(7);
+
+    tags.push(11);
+    expect(tags[4]).toBe(11);
+    expect(tags[4]).toBe(11);
+    tags.pop();
+    expect(tags[4]).toBeUndefined();
+    expect(tags[4]).toBeUndefined();
+
+    // A write to another property bumps the same key's version.
+    o.n = 5;
+    expect(tags[0]).toBe(7);
+    tags[0] = 70;
+    o.n = 6;
+    expect(tags[0]).toBe(70);
+    expect(tags[0]).toBe(70);
+  });
+
+  test("nested array in an array, object elements and out of bounds", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ grid: unknown[][] }>(
+      "apc-nested",
+      {
+        grid: [
+          [1, { x: 1 }],
+          [3, 4],
+        ],
+      },
+      { memory: mem },
+    );
+    const row = o.grid[0]!;
+    expect(row[0]).toBe(1);
+    expect(row[0]).toBe(1);
+    // Object elements still come back as live child proxies.
+    expect((row[1] as { x: number }).x).toBe(1);
+    expect((row[1] as { x: number }).x).toBe(1);
+    expect(row[9]).toBeUndefined();
+
+    row[0] = 2;
+    expect(row[0]).toBe(2);
+    expect(row[0]).toBe(2);
+    (row[1] as { x: number }).x = 5;
+    expect((row[1] as { x: number }).x).toBe(5);
+    expect(o.read().grid).toEqual([
+      [2, { x: 5 }],
+      [3, 4],
+    ]);
+  });
+
+  test("non-index names that start with a digit still reach the array", () => {
+    const mem = new SharedMemory();
+    const o = Shared<{ tags: number[] }>(
+      "apc-names",
+      { tags: [1, 2] },
+      { memory: mem },
+    );
+    const tags = o.tags;
+    expect(tags[0]).toBe(1);
+    expect((tags as unknown as Record<string, unknown>)["1a"]).toBeUndefined();
+    expect(tags.length).toBe(2);
+    expect(tags.includes(2)).toBe(true);
+    expect([...tags]).toEqual([1, 2]);
+  });
+});

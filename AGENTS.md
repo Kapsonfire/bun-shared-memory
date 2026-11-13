@@ -61,6 +61,11 @@ benchmark itself — it asks the human to run them.
 - The benchmark automatically writes a full log to
   `benchlogs/<unix-timestamp>-<commit-hash>.md` (one file per run, named after
   the commit it was measured on, timestamp-prefixed for chronological sorting).
+  A run on uncommitted changes gets `-dirty` in its name, and a second run of
+  the same state a number (`-2`, `-3`, …) instead of overwriting the first.
+  Each log lists the machine (CPU, RAM, OS, kernel, architecture, Bun):
+  results from different machines are not comparable, so compare only logs of
+  the same machine, and re-measure the previous commit when there is none.
 - Add a new row to the table in `BENCH.md` with:
   - a date/commit reference,
   - a short description of the change,
