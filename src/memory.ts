@@ -36,6 +36,7 @@ import { Mutex, StripeLock } from "./mutex.ts";
  *                 too large for 64 bits, stored as their decimal string
  *   string-ref -> [4..7]=offset, [8..11]=length (into StringTable)
  *   array-ref  -> [4..7]=offset, [8..11]=count (into ArrayTable)
+ *   date       -> ms timestamp float64 in [4..11] (same layout as a number)
  *
  * Object block layout in DataTable:
  *   [0..3]   type = OBJECT (5)
@@ -82,6 +83,18 @@ export const TYPE_KEY_REF = 10;
  * the entire value. `undefined` is intentionally still not representable.
  */
 export const TYPE_NULL = 11;
+/**
+ * A `Date` value stored compactly as its millisecond timestamp (a float64 in
+ * a/b, the same layout as `TYPE_NUMBER`). The timestamp may be negative. Read
+ * back as `new Date(timestamp)`.
+ */
+export const TYPE_DATE = 12;
+/**
+ * An invalid `Date` (`getTime()` → `NaN`). A `Date` with an NaN timestamp has
+ * no representable number, so it is stored as a distinct type with no payload.
+ * Read back as `new Date(NaN)`.
+ */
+export const TYPE_INVALID_DATE = 13;
 
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
@@ -245,6 +258,14 @@ function readPrimitiveIn(
           length: v.getInt32(o + 8, true),
         }),
       );
+    case TYPE_DATE:
+    case TYPE_INVALID_DATE:
+      return decodeDateSlot({
+        type: v.getInt32(o, true),
+        a: v.getInt32(o + 4, true),
+        b: v.getInt32(o + 8, true),
+        c: 0,
+      });
     default:
       return NOT_PRIMITIVE;
   }
@@ -382,6 +403,34 @@ export function nullSlot(): ValueSlot {
   return { type: TYPE_NULL, a: 0, b: 0, c: 0 };
 }
 
+/**
+ * Encode a `Date`'s millisecond timestamp (a float64, same payload layout as a
+ * number) into a ValueSlot. `NaN` timestamps are encoded as TYPE_INVALID_DATE.
+ */
+export function dateSlot(timestamp: number): ValueSlot {
+  if (Number.isNaN(timestamp)) {
+    return { type: TYPE_INVALID_DATE, a: 0, b: 0, c: 0 };
+  }
+  slotView.setFloat64(0, timestamp, true);
+  return {
+    type: TYPE_DATE,
+    a: slotView.getInt32(0, true),
+    b: slotView.getInt32(4, true),
+    c: 0,
+  };
+}
+
+/**
+ * Decode a `Date` slot into a `Date`. `TYPE_DATE` carries the millisecond
+ * timestamp; `TYPE_INVALID_DATE` carries no payload and yields `new Date(NaN)`.
+ */
+export function decodeDateSlot(slot: ValueSlot): Date {
+  if (slot.type === TYPE_INVALID_DATE) return new Date(Number.NaN);
+  slotView.setInt32(0, slot.a, true);
+  slotView.setInt32(4, slot.b, true);
+  return new Date(slotView.getFloat64(0, true));
+}
+
 /** Decode a ValueSlot into a JS value (primitives) or a ref object. */
 export function decodeSlot(slot: ValueSlot): unknown {
   switch (slot.type) {
@@ -403,6 +452,9 @@ export function decodeSlot(slot: ValueSlot): unknown {
       return { offset: slot.a, length: slot.b };
     case TYPE_NULL:
       return null;
+    case TYPE_DATE:
+    case TYPE_INVALID_DATE:
+      return decodeDateSlot(slot);
     case TYPE_ARRAY_REF:
       return { offset: slot.a, count: slot.b, capacity: slot.c };
     case TYPE_OBJECT_REF:

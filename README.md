@@ -94,13 +94,14 @@ See [SPEC.md](./SPEC.md) for the full specification.
 
 ## Data Types
 
-- **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, and arrays of these (mixed arrays allowed).
+- **Allowed**: primitives (`number`, `string`, `boolean`), `bigint`, `Date`, and arrays of these (mixed arrays allowed).
 - **BigInts** of any size are supported: values that fit in 64 bits are stored as a fast int64 slot; larger values are stored as their decimal string in the StringTable.
+- **Dates** are stored natively and compactly as their millisecond timestamp (`date.getTime()`, a float64 in the slot) and read back as a `new Date(timestamp)`: the same value is preserved across `read()`/`write()` and property access. An invalid `Date` (`getTime()` → `NaN`) is stored as a distinct type and read back as `new Date(NaN)`.
 - **Objects** have a **fixed shape**: once created, properties may not be added or removed — only their values can change.
 - **Nested objects and arrays** are supported: an object or array can contain other plain objects and arrays (read lazily, mutated in place).
 - **Nested `Shared` references**: a `Shared` object can be stored inside another object or array as a _live reference_ — both stay in sync (mutating either updates the same shared value). Self-references and mutual references are supported as long as the property exists in the object's initial fixed shape.
 - **`null` is allowed** as a value (top-level, object property, or array element).
-- **Not allowed** (a `TypeError` is thrown, nothing is stored): `undefined`, functions, symbols, sparse arrays, and objects that are not plain data — `Date`, `Map`, `Set`, `RegExp`, typed arrays, `Error`, ... Convert them first (`date.getTime()`, `Object.fromEntries(map)`, `[...set]`).
+- **Not allowed** (a `TypeError` is thrown, nothing is stored): `undefined`, functions, symbols, sparse arrays, and objects that are not plain data — `Map`, `Set`, `RegExp`, typed arrays, `Error`, ... Convert them first (`Object.fromEntries(map)`, `[...set]`).
 
 ## Usage
 

@@ -46,8 +46,7 @@ describe("Shared(key, loader)", () => {
 });
 
 describe("unsupported value types", () => {
-  test("Date, Map, Set, RegExp are rejected instead of becoming {}", () => {
-    expect(() => Shared("ty-date", new Date())).toThrow(/Date/);
+  test("Map, Set, RegExp are rejected instead of becoming {}", () => {
     const holder = Shared("ty-holder", { inner: { a: 1 }, n: 1 });
     expect(() => holder.write({ inner: new Map() as never, n: 1 })).toThrow(
       /Map/,
@@ -60,9 +59,15 @@ describe("unsupported value types", () => {
     expect(holder.read()).toEqual({ inner: { a: 1 }, n: 1 });
   });
 
-  test("a Date nested in an array is rejected", () => {
-    const list = Shared<unknown[]>("ty-list", [1]);
-    expect(() => list.write([new Date()])).toThrow(/Date/);
+  test("dates are stored natively (as a timestamp), not rejected", () => {
+    const ts = 1700000000000;
+    const ref = Shared("ty-date", new Date(ts));
+    expect(ref.read()).toBeInstanceOf(Date);
+    expect((ref.read() as Date).getTime()).toBe(ts);
+
+    const arr = Shared<unknown[]>("ty-arr-date", [1]);
+    expect(() => arr.write([new Date(ts)])).not.toThrow();
+    expect((arr.read()[0] as Date).getTime()).toBe(ts);
   });
 
   test("sparse arrays are rejected with a clear message", () => {

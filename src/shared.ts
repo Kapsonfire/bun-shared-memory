@@ -8,7 +8,9 @@ import {
   SharedMemory,
   TYPE_ARRAY_REF,
   TYPE_BIGINT_STR,
+  TYPE_DATE,
   TYPE_INLINE_STRING,
+  TYPE_INVALID_DATE,
   TYPE_KEY_REF,
   TYPE_OBJECT_REF,
   TYPE_STRING_REF,
@@ -22,7 +24,9 @@ import {
   bigintSlot,
   bigintStrSlot,
   booleanSlot,
+  decodeDateSlot,
   decodeSlot,
+  dateSlot,
   keyRefSlot,
   nullSlot,
   numberSlot,
@@ -190,7 +194,7 @@ function assertPlainObject(value: object): void {
   const tag = Object.prototype.toString.call(value);
   if (tag !== "[object Object]") {
     throw new TypeError(
-      `Cannot store ${tag.slice(8, -1)}: only primitives, bigints, arrays and plain objects are allowed (convert it first, e.g. Date -> number, Map -> Object.fromEntries)`,
+      `Cannot store ${tag.slice(8, -1)}: only primitives, bigints, dates, arrays and plain objects are allowed (convert it first, e.g. Map -> Object.fromEntries)`,
     );
   }
 }
@@ -249,6 +253,12 @@ function encodeValue(
         // `null` is a supported value (stored as TYPE_NULL). `undefined` is
         // intentionally still rejected below.
         return nullSlot();
+      }
+      if (value instanceof Date) {
+        // Dates are stored compactly as their millisecond timestamp (float64),
+        // avoiding the object block that `assertPlainObject` would otherwise
+        // build and populate with nothing.
+        return dateSlot(value.getTime());
       }
       if (Array.isArray(value)) {
         // Nested arrays are stored as array-refs in the parent array's slots
@@ -330,6 +340,10 @@ function decodeValue(mem: SharedMemory, slot: ValueSlot): unknown {
       }
       return obj;
     }
+    case TYPE_DATE:
+    case TYPE_INVALID_DATE:
+      // Dates are stored as their millisecond timestamp; decode back to a Date.
+      return decodeDateSlot(slot);
     case TYPE_KEY_REF: {
       // Live reference to another shared key: return a live wrapper so the
       // two stay in sync. Resolving to a reference (not its contents) is what
@@ -1141,6 +1155,12 @@ function readValueAtLocator(mem: SharedMemory, locator: ArrayLocator): unknown {
  * re-checked `Array.isArray` on every property.
  */
 function copyValue(value: unknown, seen?: Map<object, unknown>): unknown {
+  if (value instanceof Date) {
+    // Dates are values, not plain data: copying via Object.assign would turn
+    // them into an empty `{}`. Preserve them as Dates (they are immutable, so
+    // the same instance can be shared).
+    return value;
+  }
   if (Array.isArray(value)) {
     // `slice` copies the primitives in one native call; only nested arrays and
     // objects need a copy of their own.
@@ -1485,6 +1505,7 @@ function readProp(
   if (
     propValue !== null &&
     typeof propValue === "object" &&
+    !(propValue instanceof Date) &&
     typeof prop === "string" &&
     Object.hasOwn(value as object, prop)
   ) {
@@ -2373,9 +2394,15 @@ function readIndexFast(t: RefTarget, prop: string, first: number): unknown {
     index = index * 10 + digit;
   }
   const element: unknown = value[index];
-  if (element !== null && typeof element === "object") {
+  if (
+    element !== null &&
+    typeof element === "object" &&
+    !(element instanceof Date)
+  ) {
     // A nested array or object: its cached child proxy (a live shared
-    // reference as it is), like `getTopLevelArrayMember` does.
+    // reference as it is), like `getTopLevelArrayMember` does. Dates are leaf
+    // values and are returned as-is (they are immutable and hold no shared
+    // state, so no live proxy is needed).
     if (sharedKeyMap.has(element)) return element;
     return childProxy(
       topLevelChildren(t.key),
@@ -2950,6 +2977,21 @@ function writeValueInner(
     return;
   }
 
+  if (value instanceof Date) {
+    // A bare Date value: stored as its millisecond timestamp.
+    const offset = mem.storeValueSlot(dateSlot(value.getTime()));
+    mem.insert(key, offset);
+    const lv = mem.getLayoutVersion();
+    offsetCache.set(key, { offset, layoutVersion: lv });
+    if (target !== undefined) {
+      target.__offset = offset;
+      target.__layoutVersion = lv;
+      target.__type = undefined;
+      target.__arrayRef = undefined;
+    }
+    return;
+  }
+
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     // Create a new object.
     assertPlainObject(value);
@@ -3336,7 +3378,13 @@ function getTopLevelArrayMember(
   const index = parseIndex(prop);
   if (index >= 0) {
     const element = value[index];
-    if (element !== null && typeof element === "object") {
+    if (
+      element !== null &&
+      typeof element === "object" &&
+      !(element instanceof Date)
+    ) {
+      // A nested array or object gets a child proxy; Dates are leaf values and
+      // are returned as-is.
       if (sharedKeyMap.has(element)) return element;
       return childProxy(
         topLevelChildren(key),
@@ -3593,7 +3641,11 @@ function createArrayProxy(
       hitArray = rootArray;
     }
     const element = rootArray[index];
-    if (element !== null && typeof element === "object") {
+    if (
+      element !== null &&
+      typeof element === "object" &&
+      !(element instanceof Date)
+    ) {
       if (sharedKeyMap.has(element)) return element;
       return childProxy(
         children,
@@ -3635,7 +3687,9 @@ function createArrayProxy(
           mem.versionView[hitEntry.cell] === hitEntry.raw
         ) {
           const element = hitArray[index];
-          if (element === null || typeof element !== "object") return element;
+          if (element === null || typeof element !== "object")
+            return element;
+          if (element instanceof Date) return element;
         }
         return readElementMiss(index);
       }
