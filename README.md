@@ -335,6 +335,37 @@ A write that runs out of budget also reclaims dead space immediately
 (`memory.reclaimHook`), without waiting for the timer. See
 [DESIGN.md](./DESIGN.md) for the details.
 
+### When a value block is reclaimed
+
+Each key's index entry carries a **holder mask** — a 64-bit bitmap (two `Int32`
+halves) tracking which threads hold a live wrapper for the key: bit 0 is the
+main thread, bits 1..63 are coordinator-registered workers. Creating a wrapper
+sets the creating thread's bit; dropping it (the garbage collector collects the
+wrapper) clears it. A defragmentation reclaims a key's value block only when
+the mask is **zero**, i.e. no thread can still be reading it.
+
+```ts
+import { Shared, SharedMemory } from "bun-shared-memory";
+
+const mem = new SharedMemory();
+// A wrapper created inside a block; once the block ends it is unreachable and
+// the GC may collect it, which clears the creating thread's holder bit.
+(() => {
+  const u = Shared("user-1", { name: "Alice" }, { memory: mem });
+  u.name = "Bob";
+})();
+const index = mem.lookupIndex("user-1")!;
+// Once the GC has collected the wrapper, bit 0 is cleared; if no other thread
+// still holds the key, its value block is eligible for reclamation.
+mem.hasNoHolders(index); // false only if a worker still holds the key
+```
+
+The mask is also manipulated directly where you need explicit control —
+`mem.addHolder(index, shift)`, `mem.removeHolder(index, shift)` (defaults to the
+main thread's bit), `mem.holderMask(index)`, `mem.hasNoHolders(index)`,
+`mem.clearAllHolders(index)`, and `mem.clearWorkerHolders(workerId)` to release
+every key a worker held (e.g. on worker exit).
+
 ## Memory use per thread
 
 The values live in the shared buffers (about 40 bytes of index entry, key name

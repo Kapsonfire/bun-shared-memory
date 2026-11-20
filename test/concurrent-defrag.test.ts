@@ -59,8 +59,11 @@ async function startWorkers(
     const body = ${body.toString()};
     self.onmessage = (e) => {
       const d = e.data;
+      // Bit 0 belongs to the main thread (its refs keep the keys held);
+      // each worker gets its own holder bit so the two never share a bit and
+      // a dropped wrapper on either side never clears the other's holder.
       const o = Shared(d.key, undefined, {
-        memory: SharedMemory.fromBuffers(d.buffers),
+        memory: SharedMemory.fromBuffers({ ...d.buffers, holderShift: d.w + 1 }),
       });
       self.postMessage("ready");
       Atomics.wait(new Int32Array(d.start), 0, 0);

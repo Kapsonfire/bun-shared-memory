@@ -29,3 +29,8 @@ coverage/
 # Environment
 .env
 .env.local
+
+
+graphify-out/
+
+.claude/settings.json

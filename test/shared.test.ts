@@ -770,7 +770,7 @@ describe("SharedMemory total memory budget", () => {
   test("keeps the Index Table in one growable SharedArrayBuffer", () => {
     const mem = new SharedMemory({
       initialSize: 4,
-      maxByteLength: 4096,
+      maxByteLength: 8192,
       chunkSize: 16,
     });
     const exported = mem.exportBuffers();
@@ -779,12 +779,14 @@ describe("SharedMemory total memory budget", () => {
     mem.dispose();
     const workerMem = SharedMemory.fromBuffers(exported);
 
+    // 200 entries × 24 bytes + 4-byte count header = 4804 bytes, so the Index
+    // Table needs 8 KiB to hold them all in a single buffer.
     for (let i = 0; i < 200; i++) {
       mem.insert(`index-key-${i}`, i);
     }
 
     expect(mem.indexTable.buffers).toHaveLength(1);
-    expect(mem.indexTable.buffers[0]!.maxByteLength).toBe(4096);
+    expect(mem.indexTable.buffers[0]!.maxByteLength).toBe(8192);
     expect(mem.indexTable.buffers[0]!.byteLength).toBeGreaterThan(16);
     expect(workerMem.lookupIndex("index-key-199")).toBe(199);
 
