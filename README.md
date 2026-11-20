@@ -594,6 +594,19 @@ bun fmt            # format code
 bun run bench      # run benchmarks
 ```
 
+### Graphify (knowledge graph)
+
+This repository uses graphify to maintain a queryable knowledge graph of the
+codebase (`graphify-out/`). The Claude Code hooks in `.claude/settings.json`
+call `graphify hook-guard …`, and `.gitattributes` merges
+`graphify-out/graph.json` with the graphify merge driver — so the `graphify`
+CLI must be on your `PATH`:
+
+```bash
+uv tool install graphifyy    # or: pipx install graphifyy
+graphify hook install        # sets up git hooks + merge driver
+```
+
 ## Benchmarks
 
 `bun run bench` compares shared-memory access against native JS access for
