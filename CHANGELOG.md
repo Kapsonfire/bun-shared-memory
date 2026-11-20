@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-20
+
+### Added
+
+- **Key reclamation via holder masks.** Each key's index entry now carries a
+  64-bit holder mask (two `Int32` halves) tracking which threads hold a live
+  wrapper for it: bit 0 is the main thread, bits 1..63 are
+  coordinator-registered workers. Setting a wrapper sets the creating thread's
+  bit; dropping it (garbage collection) clears it via a `FinalizationRegistry`
+  callback. A defragmentation now reclaims a key's value block only when the
+  mask is zero — no thread can still be reading it — instead of dropping the
+  value whenever a wrapper is collected. Public API on `SharedMemory`:
+  `addHolder(index, shift)`, `removeHolder(index, shift)`, `holderMask(index)`,
+  `hasNoHolders(index)`, `clearAllHolders(index)`,
+  `clearWorkerHolders(workerId)`.
+- Tests for the holder-mask semantics and the drop-vs-held reclamation
+  behaviour (`test/holder.test.ts`).
+
+### Fixed
+
+- **The concurrent-defragmentation test dropped values under a precise GC.**
+  A wrapper that is written but never read again is considered dead by
+  JavaScriptCore's finite-liveness analysis and can be collected mid-run;
+  its collection then fired `dropKey` and cleared the main thread's holder bit
+  during the write, so the defragmentation reclaimed a value that was still in
+  use. The test now retains and references the wrappers it verifies through, so
+  they stay genuinely reachable for the whole run.
+
 ## [1.2.1] - 2026-11-13
 
 ### Fixed

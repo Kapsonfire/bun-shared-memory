@@ -1,5 +1,5 @@
 import { supportsWorkerEvents } from "./env.ts";
-import type { SharedMemory } from "./memory.ts";
+import { MAX_HOLDER_THREADS, type SharedMemory } from "./memory.ts";
 
 /** New chunk lists handed to workers after a defragmentation pass. */
 export interface ChunkLists {
@@ -49,6 +49,8 @@ export class MaintenanceCoordinator {
   ) => void;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private nextWorkerId = 1;
+  /** Ids of workers that closed; their ids may be handed out again. */
+  private readonly freeWorkerIds: number[] = [];
   /** Lock-owner thread id of each worker (see `setWorkerThreadId`). */
   private readonly threadIdByWorker = new Map<number, number>();
   /** workerId -> the worker object it belongs to. */
@@ -66,14 +68,32 @@ export class MaintenanceCoordinator {
   }
 
   /**
-   * Register a worker and release its locks when it closes. Returns the id
-   * assigned to the worker (pass it to `setWorkerThreadId`).
+   * Register a worker and release its locks and holder bits when it closes.
+   * Returns the id assigned to the worker, which doubles as its position in
+   * every key's holder mask (see `MAX_HOLDER_THREADS`). Pass it to
+   * `setWorkerThreadId`.
+   *
+   * A key's value block stays alive as long as at least one thread holds a
+   * wrapper for it, and each thread gets one bit of the 64-bit holder mask:
+   * bit 0 is the main thread, bits 1..63 the workers. Hence at most
+   * `MAX_HOLDER_THREADS - 1` workers may share one `SharedMemory` — going
+   * past that would overflow the mask and silently drop keys' holders.
    */
   registerWorker(worker: {
     onclose?: (() => void) | null;
     addEventListener?: (type: string, fn: () => void) => void;
   }): number {
-    const id = this.nextWorkerId++;
+    // Reuse the id of a worker that has since closed, so a long-running
+    // process that recycles workers never exhausts the 63 worker bits.
+    const id = this.freeWorkerIds.pop() ?? this.nextWorkerId++;
+    if (id >= MAX_HOLDER_THREADS) {
+      throw new Error(
+        `At most ${MAX_HOLDER_THREADS - 1} workers can share one SharedMemory: ` +
+          "each worker needs one bit of the 64-bit holder mask, and bit 0 is " +
+          "taken by the main thread. " +
+          "Register fewer workers, or use a separate SharedMemory per group.",
+      );
+    }
     this.workerById.set(id, worker);
     const release = () => this.unregisterWorker(id);
     if (typeof worker.addEventListener === "function") {
@@ -114,9 +134,9 @@ export class MaintenanceCoordinator {
 
   /**
    * Forget a worker (by id or by the object passed to `registerWorker`) and
-   * release any lock it still holds. Called automatically on `close`; call it
-   * yourself when you know a worker was terminated (Bun does not fire `close`
-   * for `worker.terminate()`).
+   * release any lock and every holder bit it still holds. Called automatically
+   * on `close`; call it yourself when you know a worker was terminated (Bun
+   * does not fire `close` for `worker.terminate()`).
    */
   unregisterWorker(worker: unknown): void {
     const id = typeof worker === "number" ? worker : this.idForWorker(worker);
@@ -124,6 +144,11 @@ export class MaintenanceCoordinator {
     this.workerById.delete(id);
     const threadId = this.threadIdByWorker.get(id);
     this.threadIdByWorker.delete(id);
+    // A worker that is gone can never hold a wrapper any more, so its bit in
+    // every holder mask is released — otherwise its keys would stay alive for
+    // the lifetime of the process.
+    this.mem.clearWorkerHolders(id);
+    this.freeWorkerIds.push(id);
     if (threadId !== undefined && this.mem.forceUnlockAll(threadId)) {
       this.onLockRecovered?.(id, threadId);
     }

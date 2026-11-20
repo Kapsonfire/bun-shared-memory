@@ -84,14 +84,21 @@ describe("per-key lock stripes", () => {
     const WORKERS = 4;
     const ROUNDS = 25000;
     const mem = new SharedMemory();
+    // The main thread holds the key (its bit 0 keeps the value block alive
+    // during the run); retain the wrappers so they are not collected and do
+    // not drop bit 0 mid-write.
+    const held: unknown[] = [];
     for (let i = 0; i < WORKERS; i++) {
-      Shared(`frag-${i}`, { s: "", list: [0], n: 0 }, { memory: mem });
+      held.push(Shared(`frag-${i}`, { s: "", list: [0], n: 0 }, { memory: mem }));
     }
     const code = `
       import { SharedMemory, Shared } from ${JSON.stringify(SRC)};
       self.onmessage = (e) => {
         const { buffers, id, rounds } = e.data;
-        const mem = SharedMemory.fromBuffers(buffers);
+        // Bit 0 belongs to the main thread; each worker needs its own holder
+        // bit (1..N) so dropping a wrapper here never clears a holder bit the
+        // main thread still holds.
+        const mem = SharedMemory.fromBuffers({ ...buffers, holderShift: id + 1 });
         const o = Shared("frag-" + id, { s: "", list: [0], n: 0 }, { memory: mem });
         for (let i = 1; i <= rounds; i++) {
           o.s = (id + ":" + i + ":").padEnd(60 + (i % 40), "x"); // churns the heap
@@ -121,12 +128,14 @@ describe("per-key lock stripes", () => {
     await done;
     // Make sure the compactions really overlapped with the writers.
     expect(passes).toBeGreaterThan(3);
+    // Verify through the wrappers that were held for the whole run. Reading
+    // them here is also what keeps them alive during the run: a wrapper that is
+    // never referenced again may be collected by a precise GC (finite
+    // liveness), which would fire dropKey and clear the main thread's holder
+    // bit mid-write. Referencing them after the run makes them genuinely
+    // reachable from the init loop onward, so the defrag never drops bit 0.
     for (let id = 0; id < WORKERS; id++) {
-      const o = Shared(
-        `frag-${id}`,
-        { s: "", list: [0], n: 0 },
-        { memory: mem },
-      );
+      const o = held[id] as any;
       expect(o.n).toBe(ROUNDS);
       expect(o.s).toBe(`${id}:${ROUNDS}:`.padEnd(60 + (ROUNDS % 40), "x"));
       expect([...o.list]).toEqual([ROUNDS, ROUNDS + 1, ROUNDS + 2]);

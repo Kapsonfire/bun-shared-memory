@@ -1,5 +1,9 @@
 import { isBun, isMainThread } from "./env.ts";
-import { SharedMemory, type SharedMemoryOptions } from "./memory.ts";
+import {
+  MAIN_THREAD_SHIFT,
+  SharedMemory,
+  type SharedMemoryOptions,
+} from "./memory.ts";
 import { getThreadId } from "./mutex.ts";
 import { MaintenanceCoordinator } from "./coordinator.ts";
 
@@ -125,17 +129,20 @@ let coordinator: MaintenanceCoordinator | null = null;
  *
  * Creates a `MaintenanceCoordinator` over the default memory: dead space is
  * defragmented when the tables fill up (new chunk lists are broadcast to the
- * workers), and the locks of a worker that closes are force-released.
+ * workers), the locks of a worker that dies are force-released, and the holder
+ * bits of a worker that closes are cleared so its keys can be reclaimed.
  *
  * Workers are registered per-handshake in `initMain()` (Bun) and
- * `acceptWorker()` (browser).
+ * `acceptWorker()` (browser); the id the coordinator hands out is also the
+ * worker's position in every key's 64-bit holder mask.
  */
-function startCoordinator(): void {
-  if (coordinator !== null) return;
+function startCoordinator(): MaintenanceCoordinator {
+  if (coordinator !== null) return coordinator;
   const mem = getDefaultMemory();
   coordinator = new MaintenanceCoordinator(mem, {
     onDefragment: (buffers) => broadcastChunkUpdate(buffers),
   });
+  return coordinator;
 }
 
 /** Stop the coordinator's maintenance timer. */
@@ -192,6 +199,11 @@ function registerHandshake(worker: HandshakeWorker): void {
       worker.postMessage({
         __sharedMemoryInit: true,
         buffers: mem.exportBuffers(),
+        // This worker's position in every key's 64-bit holder mask: bit 0 is
+        // the main thread, bit `workerId` this worker. Without it the worker
+        // would reconstruct the memory as the main thread (shift 0) and every
+        // wrapper it creates would be attributed to the wrong holder.
+        holderShift: workerId ?? MAIN_THREAD_SHIFT,
       });
     }
   };
@@ -357,6 +369,7 @@ function installMessageWrapper(): void {
       | {
           __sharedMemoryInit?: boolean;
           buffers?: Parameters<typeof SharedMemory.fromBuffers>[0];
+          holderShift?: number;
         }
       | {
           __chunkUpdate?: boolean;
@@ -374,7 +387,13 @@ function installMessageWrapper(): void {
       "__sharedMemoryInit" in msg &&
       msg.buffers
     ) {
-      const mem = SharedMemory.fromBuffers(msg.buffers);
+      // `holderShift` comes from the coordinator's worker id; without it this
+      // thread would share bit 0 with the main thread and holder bookkeeping
+      // would be wrong (see `SharedMemory#addHolder`).
+      const mem = SharedMemory.fromBuffers({
+        ...msg.buffers,
+        holderShift: msg.holderShift,
+      });
       setDefaultMemory(mem);
       pendingInitResolve?.();
       pendingInitResolve = null;

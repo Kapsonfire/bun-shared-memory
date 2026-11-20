@@ -44,11 +44,13 @@ import { Mutex, StripeLock } from "./mutex.ts";
  *   [12..15] reserved
  *   then propertyCount * (nameRef(8 bytes) + valueSlot(16 bytes))
  *
- * Index Table entry (16 bytes):
+ * Index Table entry (24 bytes):
  *   [0..3]   key string offset
  *   [4..7]   key string length
- *   [8..11]  data offset (into DataTable)
+ *   [8..11]  data offset (into DataTable; -1 = reclaimed tombstone)
  *   [12..15] key version
+ *   [16..19] holder mask, low 32 bits (bit i = thread i holds a wrapper)
+ *   [20..23] holder mask, high 32 bits
  */
 
 export const TYPE_NUMBER = 0;
@@ -84,10 +86,35 @@ export const TYPE_NULL = 11;
 const SLOT_SIZE = 16;
 const OBJECT_HEADER = 16;
 const NAME_REF_SIZE = 8;
-const INDEX_ENTRY_SIZE = 16;
+const INDEX_ENTRY_SIZE = 24;
 const INDEX_HEADER = 4;
 /** Byte offset of the version field within an index entry. */
 const INDEX_VERSION_OFFSET = 12;
+/** Byte offset of the holder mask's low half within an index entry. */
+const INDEX_HOLDER_LO_OFFSET = 16;
+/** Byte offset of the holder mask's high half within an index entry. */
+const INDEX_HOLDER_HI_OFFSET = 20;
+/**
+ * The reclaimed tombstone marker stored in an entry's data-offset field: the
+ * key keeps its index and its key string, its value block is freed.
+ */
+const TOMBSTONE = -1;
+/**
+ * Hard limit on threads sharing one `SharedMemory` via holder bits: bit 0 is
+ * the main thread, bits 1..63 are coordinator-registered workers — 64 in
+ * total. Exceeding it throws at worker registration.
+ */
+export const MAX_HOLDER_THREADS = 64;
+/** Holder shift of the main thread, and of any thread that reconstructed the
+ * memory with `fromBuffers()` without a coordinator handshake. */
+export const MAIN_THREAD_SHIFT = 0;
+
+/** Clamp a holder shift into the valid 0..63 range. */
+function clampHolderShift(shift: number): number {
+  if (!Number.isInteger(shift)) return MAIN_THREAD_SHIFT;
+  if (shift < 0) return MAIN_THREAD_SHIFT;
+  return Math.min(shift, MAX_HOLDER_THREADS - 1);
+}
 
 // The version cell doubles as a seqlock: the low bits carry the lock state
 // (WRITER / READLOCK), the high bits carry the object's version. A plain read
@@ -149,6 +176,16 @@ const DEFAULT_INTERN_MAX = 1 << 16; // 65536 entries
 /** Int32Array index of a key's version cell within the Index Table buffer. */
 function versionCellIndex(index: number): number {
   return (INDEX_HEADER + index * INDEX_ENTRY_SIZE + INDEX_VERSION_OFFSET) / 4;
+}
+
+/** Int32Array index of the holder mask's low half for a key index. */
+function holderLoCellIndex(index: number): number {
+  return (INDEX_HEADER + index * INDEX_ENTRY_SIZE + INDEX_HOLDER_LO_OFFSET) / 4;
+}
+
+/** Int32Array index of the holder mask's high half for a key index. */
+function holderHiCellIndex(index: number): number {
+  return (INDEX_HEADER + index * INDEX_ENTRY_SIZE + INDEX_HOLDER_HI_OFFSET) / 4;
 }
 
 /**
@@ -397,6 +434,12 @@ export interface SharedMemoryOptions {
   lock?: Mutex;
   internCapacity?: number;
   internMax?: number;
+  /**
+   * Bit position (0..63) this thread uses in every key's holder mask. 0 for
+   * the main thread; workers receive the id handed out by the coordinator's
+   * init handshake (1..63). See `MAX_HOLDER_THREADS`.
+   */
+  holderShift?: number;
   buffers?: {
     indexTable?: SharedArrayBuffer | SharedArrayBuffer[];
     dataTable?: SharedArrayBuffer | SharedArrayBuffer[];
@@ -467,6 +510,21 @@ export class SharedMemory {
    * invalidate their read caches cross-worker.
    */
   versionView: Int32Array;
+  /**
+   * Cached Int32Array view over the same Index Table buffer, used for the
+   * holder-mask cells (fields 5 and 6 of each entry). Rebuilt whenever the
+   * Index Table buffer is replaced. The holder mask of a key records which
+   * threads currently hold a live wrapper for it; when it reaches zero the key
+   * becomes a reclaimable tombstone in the next defragmentation pass.
+   */
+  holderView: Int32Array;
+  /**
+   * Position of this thread's bit in a key's holder mask: 0 for the main thread
+   * or a thread that reconstructed the memory without a coordinator handshake,
+   * otherwise the coordinator worker id (1..63) handed out by the init handshake
+   * in `src/worker.ts` (see `SharedMemory.fromBuffers`).
+   */
+  holderShift: number;
   /**
    * Global layout version cell. Bumped by the main thread after a
    * defragmentation pass so workers can invalidate cached offsets (indexCache,
@@ -588,7 +646,9 @@ export class SharedMemory {
       cursorBuffer: buffers?.cursors?.arrayTable,
       freeListBuffer: buffers?.freeLists?.arrayTable,
     });
+    this.holderShift = clampHolderShift(options?.holderShift ?? MAIN_THREAD_SHIFT);
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
+    this.holderView = this.versionView;
     this.layoutVersion = new Int32Array(
       buffers?.layoutVersion ??
         new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3),
@@ -1046,6 +1106,7 @@ export class SharedMemory {
     this.stringTable.applyChunks(buffers.stringTable);
     this.arrayTable.applyChunks(buffers.arrayTable);
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
+    this.holderView = this.versionView;
   }
 
   /**
@@ -1119,6 +1180,11 @@ export class SharedMemory {
     maxByteLength?: number;
     indexTableMaxByteLength?: number;
     maxTotalBytes?: number | null;
+    /**
+     * Holder shift of the receiving thread: the worker id assigned by the
+     * coordinator's init handshake (1..63), or omitted for 0 (no handshake).
+     */
+    holderShift?: number;
     budget?: SharedArrayBuffer | null;
     cursors?: {
       indexTable?: SharedArrayBuffer;
@@ -1143,6 +1209,7 @@ export class SharedMemory {
         indexBuffer?.byteLength ??
         DEFAULT_MAX,
       maxTotalBytes: buffers.maxTotalBytes ?? undefined,
+      holderShift: buffers.holderShift ?? MAIN_THREAD_SHIFT,
       buffers: {
         indexTable: buffers.indexTable,
         dataTable: buffers.dataTable,
@@ -1919,12 +1986,17 @@ export class SharedMemory {
     return this.lookupByIndex(index);
   }
 
-  /** Read the DataTable offset for a known stable index, or null if absent. */
+  /**
+   * Read the DataTable offset for a known stable index, or null if absent.
+   * A reclaimed key (holder mask zero) is a tombstone: it keeps its index and
+   * key string but has no value block, so it reads as absent.
+   */
   lookupByIndex(index: number): number | null {
     const count = this.indexTable.getInt32(0);
     if (index >= count) return null;
     const entryOffset = INDEX_HEADER + index * INDEX_ENTRY_SIZE;
-    return this.indexTable.getInt32(entryOffset + 8);
+    const dataOffset = this.indexTable.getInt32(entryOffset + 8);
+    return dataOffset === TOMBSTONE ? null : dataOffset;
   }
 
   /**
@@ -2008,8 +2080,70 @@ export class SharedMemory {
     Atomics.add(this.versionView, cell, VERSION_STEP);
   }
 
+  /**
+   * Add this thread's (or the given) holder bit to a key's holder mask. Called
+   * when a thread creates a wrapper for the key; the mask must be nonzero for
+   * the key's value block to stay alive. `shift` is 0 for the main thread and
+   * the coordinator worker id (1..63) for a worker.
+   */
+  addHolder(index: number, shift: number = this.holderShift): void {
+    Atomics.or(
+      this.holderView,
+      shift < 32 ? holderLoCellIndex(index) : holderHiCellIndex(index),
+      shift < 32 ? 1 << shift : 1 << (shift - 32),
+    );
+  }
+
+  /** Remove a holder bit from a key's mask (the thread dropped its wrapper). */
+  removeHolder(index: number, shift: number = this.holderShift): void {
+    Atomics.and(
+      this.holderView,
+      shift < 32 ? holderLoCellIndex(index) : holderHiCellIndex(index),
+      ~(shift < 32 ? 1 << shift : 1 << (shift - 32)),
+    );
+  }
+
+  /** The holder mask of a key as its two Int32 halves (for tests/debugging). */
+  holderMask(index: number): { lo: number; hi: number } {
+    return {
+      lo: Atomics.load(this.holderView, holderLoCellIndex(index)),
+      hi: Atomics.load(this.holderView, holderHiCellIndex(index)),
+    };
+  }
+
+  /** Whether no thread holds a wrapper for this key any more. */
+  hasNoHolders(index: number): boolean {
+    return (
+      Atomics.load(this.holderView, holderLoCellIndex(index)) === 0 &&
+      Atomics.load(this.holderView, holderHiCellIndex(index)) === 0
+    );
+  }
+
+  /** Clear every thread's bit for a key. */
+  clearAllHolders(index: number): void {
+    Atomics.store(this.holderView, holderLoCellIndex(index), 0);
+    Atomics.store(this.holderView, holderHiCellIndex(index), 0);
+  }
+
+  /**
+   * Release every key a dead worker (holder shift `workerId`) could still hold,
+   * so its keys become reclaimable. Mirrors `forceUnlockAll` for locks.
+   */
+  clearWorkerHolders(workerId: number): void {
+    const hi = workerId >= 32;
+    const bit = hi ? 1 << (workerId - 32) : 1 << workerId;
+    const count = this.indexTable.getInt32(0);
+    for (let i = 0; i < count; i++) {
+      Atomics.and(
+        this.holderView,
+        hi ? holderHiCellIndex(i) : holderLoCellIndex(i),
+        ~bit,
+      );
+    }
+  }
+
   /** Insert a key → dataOffset mapping into the Index Table. */
-  insert(key: string, dataOffset: number): void {
+  insert(key: string, dataOffset: number, holderShift?: number): void {
     const keyRef = this.storeString(key, false);
     // Inserts are serialized by the shared mutex (registerInitial/writeValue),
     // so the entry is fully written *before* the count is published. Readers
@@ -2017,19 +2151,54 @@ export class SharedMemory {
     // half-initialized entry or one beyond the buffer length.
     const view = new Int32Array(this.indexTable.buffers[0]!);
     const count = Atomics.load(view, 0);
-    const entryOffset = INDEX_HEADER + count * INDEX_ENTRY_SIZE;
+    // A key is never removed from the Index Table: a reclaimed key keeps its
+    // entry as a tombstone (data offset -1) so its stable index and key string
+    // stay valid. Re-inserting reactivates that entry instead of appending a
+    // second one, which would break the "one entry per key" invariant and leak
+    // the tombstone's key string forever.
+    const knownIndex =
+      this.keyIndex.get(key) ?? this.lookupIndex(key) ?? undefined;
+    const reactivated =
+      knownIndex !== undefined &&
+      knownIndex < count &&
+      this.indexTable.getInt32(
+        INDEX_HEADER + knownIndex * INDEX_ENTRY_SIZE + 8,
+      ) === TOMBSTONE;
+    const index = reactivated ? knownIndex! : count;
+    const entryOffset = INDEX_HEADER + index * INDEX_ENTRY_SIZE;
     this.indexTable.ensureCapacity(entryOffset + INDEX_ENTRY_SIZE);
     this.indexTable.setInt32(entryOffset, keyRef.offset);
     this.indexTable.setInt32(entryOffset + 4, keyRef.length);
     this.indexTable.setInt32(entryOffset + 8, dataOffset);
-    // The 4th field is the key's version cell, initialized to 0.
+    // The 4th field is the key's version cell, initialized to 0 (a reactivated
+    // tombstone has no older value any reader could confuse with this one).
     this.indexTable.setInt32(entryOffset + INDEX_VERSION_OFFSET, 0);
-    Atomics.store(new Int32Array(this.indexTable.buffers[0]!), 0, count + 1);
+    // Fields 5 and 6 are the holder mask. A fresh entry (a new SAB region) is
+    // zero-initialized and held only by the creating thread; a reactivated
+    // tombstone is empty by definition. OR the creating bit in rather than
+    // storing it, so a live re-insert (a thread races to claim a key another
+    // thread already holds) never wipes the bits of the threads that already
+    // hold a wrapper for the key.
+    const shift = holderShift ?? this.holderShift;
+    const maskView = new Int32Array(this.indexTable.buffers[0]!);
+    if (shift < 32) {
+      Atomics.or(maskView, holderLoCellIndex(index), 1 << shift);
+    } else {
+      Atomics.or(maskView, holderHiCellIndex(index), 1 << (shift - 32));
+    }
+    if (!reactivated) {
+      Atomics.store(
+        new Int32Array(this.indexTable.buffers[0]!),
+        0,
+        count + 1,
+      );
+    }
 
     // Rebuild the version view over the first chunk (the Index Table is small
     // and stays within the first chunk for typical workloads; version cells
     // beyond the first chunk are not addressable via the single Int32Array).
     this.versionView = new Int32Array(this.indexTable.buffers[0]!);
+    this.holderView = this.versionView;
   }
 
   // ---------------------------------------------------------------------------
@@ -2125,6 +2294,23 @@ export class SharedMemory {
     /** Offsets of live string-value blocks (no slots to remap). */
     const stringValueBlocks = new Set<number>();
 
+    // A key's value block survives this pass when at least one thread holds a
+    // wrapper for it (its holder mask is nonzero) or when another live key
+    // references it through a TYPE_KEY_REF slot — that reference is resolved
+    // back to the key on demand, so the block it points at must stay. A key
+    // whose mask is empty and which nothing references becomes a tombstone:
+    // it keeps its index and key string, only the value block is freed.
+    const indexCount = this.indexTable.getInt32(0);
+    /** 1 once a key index is known to be live (holder or reference). */
+    const held = new Int32Array(indexCount);
+    /** Live indexes whose value block was marked because of a reference. */
+    const referencedQueue: number[] = [];
+
+    const entryDataOffset = (index: number): number =>
+      this.indexTable.getInt32(
+        INDEX_HEADER + index * INDEX_ENTRY_SIZE + 8,
+      );
+
     const markValueSlot = (slot: ValueSlot) => {
       switch (slot.type) {
         case TYPE_STRING_REF:
@@ -2146,11 +2332,18 @@ export class SharedMemory {
           // Nested object block lives in the DataTable; mark it recursively.
           markObject(slot.a);
           break;
-        case TYPE_KEY_REF:
-          // A live reference to another shared key. The referenced key is
-          // marked separately when the Index Table is walked (Phase 1), so
-          // nothing to do here.
+        case TYPE_KEY_REF: {
+          // A live reference to another shared key, stored as its stable Index
+          // Table index. The referenced key must survive even when no thread
+          // holds a wrapper for it any more — otherwise this reference would
+          // dangle — so it is queued transitively (see Phase 1).
+          const refIndex = slot.a;
+          if (refIndex >= 0 && refIndex < indexCount && !held[refIndex]) {
+            held[refIndex] = 1;
+            referencedQueue.push(refIndex);
+          }
           break;
+        }
       }
     };
 
@@ -2193,7 +2386,6 @@ export class SharedMemory {
     };
 
     // Phase 1: Mark live data by walking the Index Table.
-    const indexCount = this.indexTable.getInt32(0);
     const indexEntries: Array<{ keyRef: StringRef; dataOffset: number }> = [];
     for (let i = 0; i < indexCount; i++) {
       const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
@@ -2203,8 +2395,22 @@ export class SharedMemory {
       };
       const dataOffset = this.indexTable.getInt32(entryOffset + 8);
       indexEntries.push({ keyRef, dataOffset });
+      // Keys are never removed from the Index Table, so every key string stays
+      // live even when its value block is reclaimed (a tombstone keeps its
+      // stable index, which the incremental key index and lookups rely on).
       liveStrings.add(keyRef.offset);
+      if (dataOffset === TOMBSTONE) continue;
+      if (this.hasNoHolders(i)) continue;
+      held[i] = 1;
       markValue(dataOffset);
+    }
+    // Drain the references transitively: a key that no thread holds any more
+    // but that a live key's TYPE_KEY_REF slot points at must keep its value
+    // block, and so must every key that block in turn references.
+    while (referencedQueue.length > 0) {
+      const index = referencedQueue.pop()!;
+      const dataOffset = entryDataOffset(index);
+      if (dataOffset !== TOMBSTONE) markValue(dataOffset);
     }
 
     // Phase 2: Compact the DataTable (objects and single value slots).
@@ -2249,12 +2455,18 @@ export class SharedMemory {
     this.stringTable.reset(newStringOffset);
 
     // Phase 5: Rewrite the Index Table with remapped key strings and offsets.
+    // A key with no holders and no references keeps its entry (its index and
+    // key string stay valid) but its value block is gone: the data offset
+    // becomes the tombstone, which every lookup treats as "no value".
     for (let i = 0; i < indexCount; i++) {
       const entryOffset = INDEX_HEADER + i * INDEX_ENTRY_SIZE;
       const { keyRef, dataOffset } = indexEntries[i]!;
       this.indexTable.setInt32(entryOffset, stringRemap.get(keyRef.offset)!);
       this.indexTable.setInt32(entryOffset + 4, keyRef.length);
-      this.indexTable.setInt32(entryOffset + 8, objectRemap.get(dataOffset)!);
+      this.indexTable.setInt32(
+        entryOffset + 8,
+        held[i] === 0 ? TOMBSTONE : objectRemap.get(dataOffset)!,
+      );
     }
 
     // Phase 6: Rewrite object property names and value slots, and array slots.

@@ -1221,19 +1221,39 @@ type Loader<T> = () => T | Promise<T>;
 const registry = new Map<string, WeakRef<SharedRef<unknown>>>();
 
 /**
+ * The held value handed back when a wrapper is collected: the key and the
+ * SharedMemory that owns it (so `dropKey` can release this thread's holder
+ * bit). Bound to the memory the wrapper was created against — the same buffers
+ * are seen by every thread, so releasing the bit liberates the key's value
+ * block for the next defragmentation once no thread holds it any more.
+ */
+interface HeldRef {
+  key: string;
+  mem: SharedMemory;
+}
+
+/**
  * When a wrapper is collected, drop the key's entries in the per-thread caches
- * as well. They are keyed by name and would otherwise grow with every key ever
- * touched; the read cache even holds the last decoded value of each.
+ * and release this thread's holder bit so the key's value block can be
+ * reclaimed by the next defragmentation. The caches are keyed by name and would
+ * otherwise grow with every key ever touched; the read cache even holds the
+ * last decoded value of each.
  */
 const reclaimKey =
   typeof FinalizationRegistry === "function"
-    ? new FinalizationRegistry<string>(dropKey)
+    ? new FinalizationRegistry<HeldRef>(dropKey)
     : null;
 
-function dropKey(key: string): void {
+function dropKey({ key, mem }: HeldRef): void {
   // A newer wrapper for the same key took over: its caches are in use.
   if (registry.get(key)?.deref() !== undefined) return;
   registry.delete(key);
+  const index = mem.lookupIndex(key);
+  // The key may already be a tombstone (its bit was cleared by a defrag), in
+  // which case lookupIndex returns null and there is nothing to release.
+  if (index !== null) {
+    mem.removeHolder(index);
+  }
   readCache.delete(key);
   indexCache.delete(key);
   offsetCache.delete(key);
@@ -1246,9 +1266,17 @@ function liveRef(key: string): SharedRef<unknown> | undefined {
   return registry.get(key)?.deref();
 }
 
-function rememberRef(key: string, ref: SharedRef<unknown>): void {
+/**
+ * Register `ref` as the wrapper of `key` and mark this thread as a holder of
+ * the key, so the shared defragmentation keeps its value block alive as long
+ * as this wrapper does. Called *after* the key's index entry exists (the
+ * create paths insert the key before this runs); `addHolder` is an idempotent
+ * `Atomics.or` of this thread's bit.
+ */
+function rememberRef(mem: SharedMemory, key: string, ref: SharedRef<unknown>): void {
   registry.set(key, new WeakRef(ref));
-  reclaimKey?.register(ref as object, key);
+  reclaimKey?.register(ref as object, { key, mem });
+  mem.addHolder(getIndex(mem, key));
 }
 
 /** Number of wrappers and cache entries this thread holds (for tests). */
@@ -1343,8 +1371,11 @@ export function Shared<T>(
     initialOrLoader as T,
     options.arrayCapacity,
   );
-  rememberRef(key, ref as SharedRef<unknown>);
+  // Register the initial value before the holder bit: `registerInitial` is
+  // what creates the index entry this thread will mark itself as holding, and
+  // `rememberRef` (which calls `addHolder` on that entry) must run after it.
   registerInitial(mem, key, ref, initialOrLoader as T);
+  rememberRef(mem, key, ref as SharedRef<unknown>);
   return ref;
 }
 
@@ -1367,7 +1398,7 @@ async function loadShared<T>(
   const value = exists ? undefined : await loader();
   const ref = createSharedRef<T>(mem, key, value, arrayCapacity);
   if (!exists) registerInitial(mem, key, ref, value);
-  rememberRef(key, ref as SharedRef<unknown>);
+  rememberRef(mem, key, ref as SharedRef<unknown>);
   return ref;
 }
 
@@ -2650,7 +2681,7 @@ function getNestedSharedRef<T = unknown>(
   const existing = liveRef(key);
   if (existing) return existing as SharedRef<T>;
   const ref = createSharedRef<T>(mem, key, undefined) as SharedRef<T>;
-  rememberRef(key, ref as SharedRef<unknown>);
+  rememberRef(mem, key, ref as SharedRef<unknown>);
   return ref;
 }
 
