@@ -113,7 +113,7 @@ export const MAIN_THREAD_SHIFT = 0;
 function clampHolderShift(shift: number): number {
   if (!Number.isInteger(shift)) return MAIN_THREAD_SHIFT;
   if (shift < 0) return MAIN_THREAD_SHIFT;
-  return shift > MAX_HOLDER_THREADS - 1 ? MAX_HOLDER_THREADS - 1 : shift;
+  return Math.min(shift, MAX_HOLDER_THREADS - 1);
 }
 
 // The version cell doubles as a seqlock: the low bits carry the lock state
