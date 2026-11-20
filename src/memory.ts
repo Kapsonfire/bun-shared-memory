@@ -425,7 +425,7 @@ export function dateSlot(timestamp: number): ValueSlot {
  * timestamp; `TYPE_INVALID_DATE` carries no payload and yields `new Date(NaN)`.
  */
 export function decodeDateSlot(slot: ValueSlot): Date {
-  if (slot.type === TYPE_INVALID_DATE) return new Date(NaN);
+  if (slot.type === TYPE_INVALID_DATE) return new Date(Number.NaN);
   slotView.setInt32(0, slot.a, true);
   slotView.setInt32(4, slot.b, true);
   return new Date(slotView.getFloat64(0, true));
